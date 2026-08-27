@@ -33,7 +33,9 @@ import numpy as np
 import MetaTrader5 as mt5
 
 import config as cfg
+import tp_engine
 from csv_logger import CsvLogger
+from runtime_settings import RuntimeSettings, TP_MODE_LABELS
 
 # ===========================================================================
 # CONFIGURATION (loaded from .env - values identical to the original source)
@@ -99,6 +101,65 @@ CSV = CsvLogger(
 def log(msg):
     now = datetime.now().strftime("%H:%M:%S")
     print(f"[{now}] {msg}", flush=True)
+
+
+def _on_setting_changed(key, old_value, new_value):
+    """Record every Telegram settings change in events.csv."""
+    if key == "*":
+        log("♻️ Settings reset to the original configuration")
+        CSV.log_event("SETTINGS_RESET", "Restored original configuration",
+                      symbol=SYMBOL)
+        return
+    log(f"⚙️ Setting changed: {key} {old_value} → {new_value}")
+    CSV.log_event("SETTINGS_CHANGED", f"{key}: {old_value} -> {new_value}",
+                  symbol=SYMBOL)
+
+
+SETTINGS = RuntimeSettings(
+    defaults=cfg.runtime_defaults(),
+    path=cfg.DATA_PATH / cfg.RUNTIME_SETTINGS_FILE,
+    on_change=_on_setting_changed,
+)
+
+
+def apply_runtime_globals(snap):
+    """
+    Push one settings snapshot into the module globals the (unchanged) strategy
+    functions read. Called once at the top of each trading cycle, so a whole
+    cycle always runs on a single consistent configuration.
+
+    Breakeven / partial close are switched off by zeroing their trigger, which
+    is exactly what the existing `if MOVE_TO_BREAKEVEN_AT_R and sl_dist:` guard
+    already tests - the algorithms themselves are untouched.
+    """
+    global MAX_OPEN_POSITIONS, SL_POINTS_MIN, SL_POINTS_MAX, RR
+    global MAX_SPREAD_POINTS, USE_RISK_PERCENT, RISK_PERCENT, FIXED_LOT
+    global MOVE_TO_BREAKEVEN_AT_R, PARTIAL_CLOSE_AT_R, PARTIAL_CLOSE_FRACTION
+
+    MAX_OPEN_POSITIONS = snap["max_open_positions"]
+    SL_POINTS_MIN = snap["sl_points_min"]
+    SL_POINTS_MAX = snap["sl_points_max"]
+    RR = snap["custom_rr"]
+    MAX_SPREAD_POINTS = snap["max_spread_points"]
+    USE_RISK_PERCENT = snap["lot_mode"] == "risk_percent"
+    RISK_PERCENT = snap["risk_percent"]
+    FIXED_LOT = snap["fixed_lot"]
+    MOVE_TO_BREAKEVEN_AT_R = snap["breakeven_r"] if snap["breakeven_enabled"] else 0.0
+    PARTIAL_CLOSE_AT_R = snap["partial_close_r"] if snap["partial_close_enabled"] else 0.0
+    PARTIAL_CLOSE_FRACTION = snap["partial_close_fraction"]
+
+
+def set_effective_rr(value):
+    """RR of the trade being placed - keeps place_order's console line honest."""
+    global RR
+    RR = value
+
+
+def tp_mode_label(snap):
+    label = TP_MODE_LABELS.get(snap["tp_mode"], snap["tp_mode"])
+    if snap["tp_mode"] == "custom_rr":
+        label = f"{label} ({snap['custom_rr']}R)"
+    return label
 
 
 def log_event(event_type, message="", symbol="", ticket="", status="OK",
@@ -633,6 +694,7 @@ class TradingEngine:
         self._connected = False
 
         self.trades_today = 0
+        self.rejected_today = 0
         self._trades_day = datetime.now().strftime("%Y-%m-%d")
         self.started_at = None
         self.last_signal_reason = ""
@@ -680,6 +742,7 @@ class TradingEngine:
         if today != self._trades_day:
             self._trades_day = today
             self.trades_today = 0
+            self.rejected_today = 0
 
     # ------------------------------------------------------- MT5 connection
     def connect(self):
@@ -834,6 +897,7 @@ class TradingEngine:
         positions = get_open_positions(SYMBOL) if self._mt5_ready else []
         connected = terminal_connected()
         state = self.state
+        snap = SETTINGS.snapshot()
         with self._lock:
             error = self._last_error
         uptime = ""
@@ -849,17 +913,30 @@ class TradingEngine:
             "mt5_connected": connected,
             "account": account,
             "open_positions": len(positions),
-            "max_positions": MAX_OPEN_POSITIONS,
+            # live settings, so STATUS is right even before the loop starts
+            "max_positions": snap["max_open_positions"],
             "trades_today": self.trades_today,
-            "risk_percent": RISK_PERCENT,
-            "use_risk_percent": USE_RISK_PERCENT,
-            "fixed_lot": FIXED_LOT,
-            "rr": RR,
+            "rejected_today": self.rejected_today,
+            "settings": snap,
+            "tp_mode_label": tp_mode_label(snap),
+            "min_rr": snap["min_rr"],
+            "risk_percent": snap["risk_percent"],
+            "use_risk_percent": snap["lot_mode"] == "risk_percent",
+            "fixed_lot": snap["fixed_lot"],
+            "rr": snap["custom_rr"],
             "last_reason": self.last_signal_reason,
             "uptime": uptime,
             "error": error,
             "last_loop_at": self.last_loop_at,
         }
+
+    @property
+    def symbol(self):
+        return SYMBOL
+
+    def symbol_info_live(self):
+        """Live symbol info (used by the settings panel to resolve pip size)."""
+        return symbol_info(SYMBOL)
 
     def positions(self):
         return get_open_positions(SYMBOL)
@@ -890,6 +967,12 @@ class TradingEngine:
             log(f"Filling mode: {filling}")
             if info is not None:
                 log(f"Point size: {info.point} | Digits: {info.digits}")
+                snap = SETTINGS.snapshot()
+                pip_size, pip_pts = tp_engine.get_pip_size(info, snap["pip_points"])
+                log(f"Pip size: {pip_size} ({pip_pts} points"
+                    f"{', pinned in settings' if snap['pip_points'] else ', auto'})")
+                log(f"TP mode: {tp_mode_label(snap)} | Min RR: {snap['min_rr']}R "
+                    f"| SL: {snap['sl_mode']}")
 
             last_m1_time = None
             start_time = datetime.now()
@@ -899,6 +982,10 @@ class TradingEngine:
                 try:
                     self.last_loop_at = datetime.now()
                     self._roll_day()
+
+                    # One consistent settings snapshot for this whole cycle
+                    snap = SETTINGS.snapshot()
+                    apply_runtime_globals(snap)
 
                     info = symbol_info(SYMBOL)
                     if info is None:
@@ -985,35 +1072,54 @@ class TradingEngine:
                     self.last_signal_reason = reason
 
                     if signal:
-                        account = account_info()
-                        lots = compute_lot(info, signal["sl_points"], account)
+                        is_buy = signal["type"] == mt5.ORDER_TYPE_BUY
+                        side = "BUY" if is_buy else "SELL"
 
-                        side = "BUY" if signal["type"] == mt5.ORDER_TYPE_BUY else "SELL"
+                        # --- TP / RR engine: decides the target and vets the RR
+                        plan = tp_engine.build_trade_plan(
+                            signal, info, snap, is_buy, signal_rr=snap["custom_rr"]
+                        )
+                        mode_label = tp_mode_label(snap)
+                        for line in tp_engine.plan_report(
+                                plan, SYMBOL, mode_label).splitlines():
+                            log(line)
+
                         log_event(
                             "SIGNAL_LONG" if reason == "long" else "SIGNAL_SHORT",
-                            f"{side} setup | SL {int(signal['sl_points'])} pts | "
-                            f"lots {lots}",
+                            f"{side} setup | SL {plan['sl_points']:.0f} pts "
+                            f"({plan['sl_pips']:.2f} pips) | TP {mode_label} "
+                            f"{plan['tp_points']:.0f} pts | RR {plan['rr']:.2f}",
                             symbol=SYMBOL,
                         )
 
-                        res = place_order(
-                            SYMBOL,
-                            signal["type"],
-                            lots,
-                            signal["sl"],
-                            signal["tp"],
-                            DEVIATION_POINTS
-                        )
+                        if not plan["accepted"]:
+                            # Valid signal, unsuitable TP/risk configuration
+                            self._reject_signal(plan, mode_label)
+                        else:
+                            account = account_info()
+                            lots = compute_lot(info, plan["sl_points"], account)
+                            if snap["lot_mode"] == "fixed_lot":
+                                lots = tp_engine.normalize_volume(info, lots)
 
-                        if res:
-                            self.trades_today += 1
-                            runtime = (datetime.now() - start_time).total_seconds() / 3600
-                            log(f"Trade #{self.trades_today} | Bal: ${account.balance:.0f} | Runtime: {runtime:.1f}h")
-                            self._record_open(res, signal, lots, side, info)
+                            set_effective_rr(plan["rr"])
+                            res = place_order(
+                                SYMBOL,
+                                signal["type"],
+                                lots,
+                                plan["sl"],
+                                plan["tp"],
+                                DEVIATION_POINTS
+                            )
 
-                            # Stats every 5 trades
-                            if self.trades_today % 5 == 0:
-                                log(f"📊 Used margin: ${account.margin:.0f} | Free: ${account.margin_free:.0f} | Level: {account.margin_level:.0f}%")
+                            if res:
+                                self.trades_today += 1
+                                runtime = (datetime.now() - start_time).total_seconds() / 3600
+                                log(f"Trade #{self.trades_today} | Bal: ${account.balance:.0f} | Runtime: {runtime:.1f}h")
+                                self._record_open(res, plan, lots, side, info, snap)
+
+                                # Stats every 5 trades
+                                if self.trades_today % 5 == 0:
+                                    log(f"📊 Used margin: ${account.margin:.0f} | Free: ${account.margin_free:.0f} | Level: {account.margin_level:.0f}%")
                     else:
                         if DIAGNOSTICS:
                             log(f"Skip: {reason}")
@@ -1040,14 +1146,42 @@ class TradingEngine:
         if self.state != BotState.ERROR:
             self._set_state(BotState.STOPPED)
 
+    # ---------------------------------------------------- signal rejection
+    def _reject_signal(self, plan, mode_label):
+        """
+        The strategy found a valid setup but the configured TP/RR makes it a
+        bad trade. No order is placed; the signal and the reason are recorded.
+        """
+        log("⚠️ TRADE BLOCKED - RR below minimum, no order placed")
+        log_event(
+            "TRADE_REJECTED_RR",
+            f"{plan['direction']} rejected | TP {mode_label} "
+            f"{plan['tp_pips']:.2f} pips | SL {plan['sl_pips']:.2f} pips | "
+            f"RR {plan['rr']:.2f} < min {plan['min_rr']:.2f}",
+            symbol=SYMBOL,
+            status="REJECTED",
+        )
+        self.rejected_today += 1
+        self.notify(
+            f"⚠️ <b>SIGNAL REJECTED</b>\n\n"
+            f"{plan['direction']} {SYMBOL}\n\n"
+            f"Signal detected successfully.\n\n"
+            f"TP Mode: {mode_label}\n"
+            f"SL: {plan['sl_pips']:.2f} pips ({plan['sl_points']:.0f} pts)\n"
+            f"TP: {plan['tp_pips']:.2f} pips ({plan['tp_points']:.0f} pts)\n"
+            f"Calculated RR: {plan['rr']:.2f}\n"
+            f"Minimum RR: {plan['min_rr']:.2f}R\n\n"
+            f"No order placed."
+        )
+
     # ------------------------------------------------------- trade recording
-    def _record_open(self, result, signal, lots, side, info):
+    def _record_open(self, result, plan, lots, side, info, snap):
         """Write the freshly opened trade to trades.csv (fields known so far)."""
         try:
             ticket = getattr(result, "order", None)
             price = getattr(result, "price", None)
-            sl = signal["sl"]
-            tp = signal["tp"]
+            sl = plan["sl"]
+            tp = plan["tp"]
             volume = getattr(result, "volume", None) or lots
 
             with MT5_LOCK:
@@ -1060,6 +1194,7 @@ class TradingEngine:
                 tp = p.tp
                 volume = p.volume
 
+            mode_label = tp_mode_label(snap)
             self.csv.log_trade(
                 symbol=SYMBOL,
                 ticket=ticket,
@@ -1071,13 +1206,35 @@ class TradingEngine:
                 take_profit=tp,
                 magic=MAGIC,
                 digits=info.digits if info else 2,
+                tp_mode=snap["tp_mode"],
+                tp_distance=plan["tp_distance"],
+                sl_distance=plan["sl_distance"],
+                rr=plan["rr"],
+                risk_mode=snap["lot_mode"],
+                risk_percent=snap["risk_percent"],
+                fixed_lot=snap["fixed_lot"],
+                min_rr=snap["min_rr"],
             )
             log_event("TRADE_OPENED",
-                      f"{side} {volume} @ {price} SL {sl} TP {tp}",
+                      f"{side} {volume} @ {price} SL {sl} TP {tp} | "
+                      f"TP mode {mode_label} | RR {plan['rr']:.2f}",
                       symbol=SYMBOL, ticket=ticket)
+            risk_txt = (f"Risk: {snap['risk_percent']}%"
+                        if snap["lot_mode"] == "risk_percent"
+                        else f"Fixed lot: {snap['fixed_lot']}")
             self.notify(
-                f"✅ <b>{side} {volume} {SYMBOL}</b>\n"
-                f"Entry: {price}\nSL: {sl}\nTP: {tp}\nTicket: {ticket}"
+                f"🟢 <b>TRADE OPENED</b>\n\n"
+                f"{side} {SYMBOL}\n\n"
+                f"Entry: {price}\n"
+                f"SL: {sl}\n"
+                f"TP: {tp}\n\n"
+                f"TP Mode: {mode_label}\n"
+                f"SL: {plan['sl_pips']:.2f} pips ({plan['sl_points']:.0f} pts)\n"
+                f"TP: {plan['tp_pips']:.2f} pips ({plan['tp_points']:.0f} pts)\n"
+                f"RR: {plan['rr']:.2f}\n\n"
+                f"Lot: {volume}\n"
+                f"{risk_txt}\n"
+                f"Ticket: {ticket}"
             )
         except Exception as exc:
             log(f"⚠ Trade record failed: {exc}")
@@ -1241,7 +1398,13 @@ class Application:
         else:
             log("MT5 Account: (not connected)")
         log(f"Symbol: {SYMBOL}")
+        snap = SETTINGS.snapshot()
+        log(f"TP mode: {tp_mode_label(snap)} | Min RR: {snap['min_rr']}R")
+        log(f"Risk: {snap['risk_percent']}% ({snap['lot_mode']}) | "
+            f"Max positions: {snap['max_open_positions']}")
+        log(f"SL: {snap['sl_mode']} {snap['sl_points_min']}-{snap['sl_points_max']} pts")
         log(f"Data directory: {cfg.DATA_PATH}")
+        log(f"Runtime settings: {cfg.DATA_PATH / cfg.RUNTIME_SETTINGS_FILE}")
         log(f"Telegram control: {'ENABLED' if cfg.TELEGRAM_ENABLED else 'DISABLED'}")
         log("=" * 70)
 
@@ -1273,13 +1436,16 @@ class Application:
             log(f"✗ MT5 connection failed: {exc}")
             log_event("ERROR", f"MT5 connection failed: {exc}", status="ERROR")
 
+        for problem in SETTINGS.load():
+            log(f"⚠ SETTINGS: {problem}")
+
         self.banner()
         self.monitor.start()
 
         if cfg.TELEGRAM_ENABLED:
             try:
                 from telegram_controller import TelegramController
-                self.telegram = TelegramController(self.engine, CSV)
+                self.telegram = TelegramController(self.engine, CSV, SETTINGS)
                 self.telegram.start()
                 self.engine.set_notifier(self.telegram.notify)
                 log("✓ Telegram controller started - send /start to your bot")

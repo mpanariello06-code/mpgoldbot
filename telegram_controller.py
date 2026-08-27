@@ -23,9 +23,12 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 import config as cfg
+from telegram_settings import SettingsPanel
 
 UNAUTHORIZED = "Unauthorized."
 # Seconds to wait before re-polling after a Telegram network failure
@@ -44,9 +47,10 @@ def _money(value):
 
 
 class TelegramController:
-    def __init__(self, engine, csv_logger):
+    def __init__(self, engine, csv_logger, settings=None):
         self.engine = engine
         self.csv = csv_logger
+        self.panel = SettingsPanel(engine, settings, csv_logger)
 
         self._app = None
         self._loop = None
@@ -143,7 +147,11 @@ class TelegramController:
         app.add_handler(CommandHandler("pause", self.cmd_pause))
         app.add_handler(CommandHandler("resume", self.cmd_resume))
         app.add_handler(CommandHandler("stopbot", self.cmd_stop))
+        app.add_handler(CommandHandler("settings", self.cmd_settings))
         app.add_handler(CallbackQueryHandler(self.on_button))
+        # typed CUSTOM values for the settings panel
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                       self.on_text))
         app.add_error_handler(self.on_error)
 
     # ========================================================= NOTIFICATIONS
@@ -228,6 +236,7 @@ class TelegramController:
                 InlineKeyboardButton("📋 TODAY'S STATS", callback_data="stats"),
             ],
             [
+                InlineKeyboardButton("⚙️ SETTINGS", callback_data="settings"),
                 InlineKeyboardButton("🔄 REFRESH", callback_data="refresh"),
             ],
         ])
@@ -246,6 +255,10 @@ class TelegramController:
             "",
             f"Open Positions: {s['open_positions']}/{s['max_positions']}",
             f"Trades Today: {s['trades_today']}",
+            f"Rejected (low RR): {s.get('rejected_today', 0)}",
+            "",
+            f"TP Mode: {s.get('tp_mode_label', '')}",
+            f"Minimum RR: {s.get('min_rr', '')}R",
         ]
         if account:
             lines.append(f"Balance: {_money(account.balance)} | Equity: {_money(account.equity)}")
@@ -348,6 +361,8 @@ class TelegramController:
             f"Positions: {s['open_positions']}/{s['max_positions']}",
             f"Trades Today: {s['trades_today']}",
             "",
+            f"TP: {s.get('tp_mode_label', '')} | Min RR: {s.get('min_rr', '')}R",
+            "",
             "Use the buttons below to control the bot.",
             f"\n<i>Updated {_now()}</i>",
         ])
@@ -376,6 +391,7 @@ class TelegramController:
                 "/pause - stop opening new trades",
                 "/resume - allow new trades again",
                 "/stopbot - stop the trading loop (positions stay open)",
+                "/settings - TP, risk, SL and management settings",
             ]),
             parse_mode=ParseMode.HTML,
         )
@@ -408,6 +424,39 @@ class TelegramController:
             await self._stats_text(), parse_mode=ParseMode.HTML,
             reply_markup=self.keyboard())
 
+    async def cmd_settings(self, update, context):
+        if not await self._guard(update):
+            return
+        text, markup = await asyncio.to_thread(
+            self.panel.render, "settings", update.effective_chat.id
+        )
+        await update.effective_message.reply_text(
+            text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+    async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Free-text CUSTOM values. Plain chatter is ignored, never answered."""
+        chat = update.effective_chat
+        message = update.effective_message
+        if not (chat and message and message.text):
+            return
+        if not self.is_authorized(chat.id):
+            return  # silence, not a reply - unauthorized chats get nothing
+        if not self.panel.awaiting_input(chat.id):
+            return
+        try:
+            result = await asyncio.to_thread(
+                self.panel.handle_text, chat.id, message.text
+            )
+        except Exception as exc:
+            self._log_error(f"Custom value failed: {exc}")
+            await message.reply_text(f"⚠ Could not apply that value: {exc}")
+            return
+        if result is None:
+            return
+        text, markup = result
+        await message.reply_text(text, parse_mode=ParseMode.HTML,
+                                 reply_markup=markup)
+
     async def cmd_pause(self, update, context):
         if not await self._guard(update):
             return
@@ -439,9 +488,15 @@ class TelegramController:
 
         action = query.data
         await query.answer()
+        markup = None
 
         try:
-            if action in ("start", "pause", "resume", "stop"):
+            if self.panel.handles(action):
+                # settings menus render (and persist) off the event loop
+                text, markup = await asyncio.to_thread(
+                    self.panel.render, action, chat.id
+                )
+            elif action in ("start", "pause", "resume", "stop"):
                 text = await self._action_text(action)
             elif action == "status":
                 text = await self._status_text()
@@ -451,26 +506,27 @@ class TelegramController:
                 text = await self._positions_text()
             elif action == "stats":
                 text = await self._stats_text()
-            else:  # refresh / unknown
+            else:  # refresh / panel / unknown
                 text = await self._panel_text()
         except Exception as exc:
             self._log_error(f"Button '{action}' failed: {exc}")
             text = f"⚠ Command failed: {exc}\n\n<i>Updated {_now()}</i>"
 
-        await self._edit(query, text)
+        await self._edit(query, text, markup)
 
-    async def _edit(self, query, text):
+    async def _edit(self, query, text, markup=None):
         """Prefer editing the existing panel message over spamming new ones."""
+        markup = markup or self.keyboard()
         try:
             await query.edit_message_text(
-                text, parse_mode=ParseMode.HTML, reply_markup=self.keyboard()
+                text, parse_mode=ParseMode.HTML, reply_markup=markup
             )
         except BadRequest as exc:
             if "not modified" in str(exc).lower():
                 return
             try:
                 await query.message.reply_text(
-                    text, parse_mode=ParseMode.HTML, reply_markup=self.keyboard()
+                    text, parse_mode=ParseMode.HTML, reply_markup=markup
                 )
             except Exception as inner:
                 self._log_error(f"Telegram edit/reply failed: {inner}")

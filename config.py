@@ -135,6 +135,19 @@ SL_POINTS_MAX = _get_int("SL_POINTS_MAX", 1000)
 RR = _get_float("RR", 3.0)
 
 # ---------------------------------------------------------------------------
+# TP / RR EXECUTION LAYER (applied after the unchanged signal detection)
+# ---------------------------------------------------------------------------
+# "custom_rr" + CUSTOM_RR = RR reproduces the original take-profit exactly.
+TP_MODE = _get_str("TP_MODE", "custom_rr")
+CUSTOM_RR = _get_float("CUSTOM_RR", RR)
+MIN_RR = _get_float("MIN_RR", 1.0)
+# 1 pip = N points; 0 = derive from the symbol's digits/point
+PIP_POINTS = _get_int("PIP_POINTS", 0)
+# Stop loss distance used when SL_MODE is "fixed" (structural is the default)
+SL_MODE = _get_str("SL_MODE", "structural" if USE_STRUCTURAL_SL else "fixed")
+SL_FIXED_POINTS = _get_int("SL_FIXED_POINTS", SL_POINTS_MIN)
+
+# ---------------------------------------------------------------------------
 # FILTERS (AGGRESSIVE)
 # ---------------------------------------------------------------------------
 MAX_SPREAD_POINTS = _get_int("MAX_SPREAD_POINTS", 500)
@@ -205,6 +218,9 @@ ACCOUNT_SNAPSHOT_INTERVAL = _get_int("ACCOUNT_SNAPSHOT_INTERVAL", 300)
 # Seconds between MT5 deal-history syncs used to record closed trades
 HISTORY_SYNC_SECONDS = _get_int("HISTORY_SYNC_SECONDS", 15)
 
+# Telegram-controlled runtime settings (never contains secrets)
+RUNTIME_SETTINGS_FILE = _get_str("RUNTIME_SETTINGS_FILE", "runtime_settings.json")
+
 DATA_PATH = Path(DATA_DIRECTORY)
 if not DATA_PATH.is_absolute():
     DATA_PATH = BASE_DIR / DATA_PATH
@@ -221,6 +237,33 @@ MT5_RECONNECT_SECONDS = _get_int("MT5_RECONNECT_SECONDS", 30)
 # ---------------------------------------------------------------------------
 # Validation & safe reporting
 # ---------------------------------------------------------------------------
+def runtime_defaults():
+    """
+    Starting point for the Telegram-controlled settings, and the target of
+    "RESET SETTINGS" - i.e. the original configuration, not arbitrary values.
+    """
+    return {
+        "tp_mode": TP_MODE,
+        "custom_rr": CUSTOM_RR,
+        "min_rr": MIN_RR,
+        "lot_mode": "risk_percent" if USE_RISK_PERCENT else "fixed_lot",
+        "risk_percent": RISK_PERCENT,
+        "fixed_lot": FIXED_LOT,
+        "max_open_positions": MAX_OPEN_POSITIONS,
+        "sl_mode": SL_MODE,
+        "sl_points_min": SL_POINTS_MIN,
+        "sl_points_max": SL_POINTS_MAX,
+        "sl_fixed_points": SL_FIXED_POINTS,
+        "breakeven_enabled": bool(MOVE_TO_BREAKEVEN_AT_R),
+        "breakeven_r": MOVE_TO_BREAKEVEN_AT_R or 0.5,
+        "partial_close_enabled": bool(PARTIAL_CLOSE_AT_R),
+        "partial_close_r": PARTIAL_CLOSE_AT_R or 1.5,
+        "partial_close_fraction": PARTIAL_CLOSE_FRACTION,
+        "max_spread_points": MAX_SPREAD_POINTS,
+        "pip_points": PIP_POINTS,
+    }
+
+
 def validate():
     """Return (errors, warnings). Errors are fatal, warnings are informational."""
     errors = []
@@ -250,6 +293,18 @@ def validate():
         errors.append("POLL_SECONDS must be greater than 0")
     if not 0 < PARTIAL_CLOSE_FRACTION <= 1:
         errors.append("PARTIAL_CLOSE_FRACTION must be between 0 and 1")
+    if TP_MODE not in ("1_pip", "2_pips", "3_pips", "4_pips", "5_pips", "custom_rr"):
+        errors.append(
+            "TP_MODE must be one of 1_pip, 2_pips, 3_pips, 4_pips, 5_pips, custom_rr"
+        )
+    if CUSTOM_RR <= 0:
+        errors.append("CUSTOM_RR must be greater than 0")
+    if MIN_RR < 0:
+        errors.append("MIN_RR cannot be negative")
+    if SL_MODE not in ("structural", "fixed"):
+        errors.append("SL_MODE must be 'structural' or 'fixed'")
+    if PIP_POINTS < 0:
+        errors.append("PIP_POINTS cannot be negative")
     if ACCOUNT_SNAPSHOT_INTERVAL < 30:
         warnings.append(
             "ACCOUNT_SNAPSHOT_INTERVAL below 30s will grow account_snapshots.csv quickly"
@@ -278,6 +333,8 @@ def strategy_summary():
         "Max Positions": MAX_OPEN_POSITIONS,
         "SL Points": f"{SL_POINTS_MIN}-{SL_POINTS_MAX}",
         "RR": RR,
+        "TP Mode": TP_MODE,
+        "Min RR": MIN_RR,
         "Breakeven At": f"{MOVE_TO_BREAKEVEN_AT_R}R",
         "Partial At": f"{PARTIAL_CLOSE_AT_R}R ({PARTIAL_CLOSE_FRACTION:.0%})",
         "Magic": MAGIC,

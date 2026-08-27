@@ -1,9 +1,10 @@
 # Secrets / local configuration
 .env
 
-# Runtime data (CSV records stay on the machine that produced them)
+# Runtime data (records and live settings stay on the machine that produced them)
 data/
 *.csv
+runtime_settings.json
 
 # Python
 __pycache__/

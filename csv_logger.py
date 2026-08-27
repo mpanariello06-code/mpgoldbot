@@ -14,6 +14,7 @@ never meaningfully delayed.
 """
 
 import csv
+import os
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +35,15 @@ TRADE_HEADER = [
     "magic",
     "reason",
     "deal_id",
+    # execution-layer settings actually used for the trade (for later analysis)
+    "tp_mode",
+    "tp_distance",
+    "sl_distance",
+    "rr",
+    "risk_mode",
+    "risk_percent",
+    "fixed_lot",
+    "min_rr",
 ]
 
 EVENT_HEADER = [
@@ -97,9 +107,44 @@ class CsvLogger:
     def _ensure_file(path, header):
         """Create the file with its header if missing/empty. Never truncates."""
         if path.exists() and path.stat().st_size > 0:
+            CsvLogger._migrate_header(path, header)
             return
         with open(path, "a", newline="", encoding="utf-8") as fh:
             csv.writer(fh).writerow(header)
+
+    @staticmethod
+    def _migrate_header(path, header):
+        """
+        Bring a file written by an older version up to the current columns.
+
+        Existing rows are preserved and re-keyed by column name; new columns
+        are left empty. Written to a temp file and swapped in atomically, so an
+        interrupted migration cannot lose history.
+        """
+        try:
+            with open(path, "r", newline="", encoding="utf-8") as fh:
+                reader = csv.reader(fh)
+                existing = next(reader, None)
+                if existing is None or existing == header:
+                    return
+                rows = [dict(zip(existing, row)) for row in reader]
+        except Exception as exc:
+            print(f"[csv_logger] header check failed for {path}: {exc}")
+            return
+
+        try:
+            tmp = path.with_suffix(".migrating")
+            with open(tmp, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(header)
+                for row in rows:
+                    writer.writerow([row.get(col, "") for col in header])
+            os.replace(tmp, path)
+            added = [c for c in header if c not in existing]
+            print(f"[csv_logger] {path.name}: added columns {added} "
+                  f"({len(rows)} rows preserved)")
+        except Exception as exc:
+            print(f"[csv_logger] header migration failed for {path}: {exc}")
 
     def _load_trade_keys(self):
         """Rebuild the de-duplication index from the existing trades.csv."""
@@ -151,7 +196,9 @@ class CsvLogger:
     def log_trade(self, symbol, ticket, direction, volume, reason,
                   entry_price=None, stop_loss=None, take_profit=None,
                   close_price=None, profit=None, commission=None, swap=None,
-                  magic=None, deal_id=None, digits=2):
+                  magic=None, deal_id=None, digits=2, tp_mode=None,
+                  tp_distance=None, sl_distance=None, rr=None, risk_mode=None,
+                  risk_percent=None, fixed_lot=None, min_rr=None):
         """
         Append a trade row, skipping anything already recorded.
 
@@ -179,6 +226,14 @@ class CsvLogger:
                     _fmt(magic),
                     _fmt(reason),
                     _fmt(deal_id),
+                    _fmt(tp_mode),
+                    _fmt(tp_distance, digits),
+                    _fmt(sl_distance, digits),
+                    _fmt(rr, 3),
+                    _fmt(risk_mode),
+                    _fmt(risk_percent),
+                    _fmt(fixed_lot),
+                    _fmt(min_rr),
                 ]
                 with open(self.trade_path, "a", newline="", encoding="utf-8") as fh:
                     csv.writer(fh).writerow(row)
