@@ -14,7 +14,6 @@ import asyncio
 import threading
 from datetime import datetime
 
-import MetaTrader5 as mt5
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, InvalidToken
@@ -37,6 +36,13 @@ RETRY_SECONDS = 30
 
 def _now():
     return datetime.now().strftime("%H:%M:%S")
+
+
+def _num(value, digits=2):
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "n/a"
 
 
 def _money(value):
@@ -148,6 +154,7 @@ class TelegramController:
         app.add_handler(CommandHandler("resume", self.cmd_resume))
         app.add_handler(CommandHandler("stopbot", self.cmd_stop))
         app.add_handler(CommandHandler("settings", self.cmd_settings))
+        app.add_handler(CommandHandler("ladder", self.cmd_ladder))
         app.add_handler(CallbackQueryHandler(self.on_button))
         # typed CUSTOM values for the settings panel
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
@@ -236,7 +243,10 @@ class TelegramController:
                 InlineKeyboardButton("📋 TODAY'S STATS", callback_data="stats"),
             ],
             [
+                InlineKeyboardButton("🪜 LADDER", callback_data="ladder"),
                 InlineKeyboardButton("⚙️ SETTINGS", callback_data="settings"),
+            ],
+            [
                 InlineKeyboardButton("🔄 REFRESH", callback_data="refresh"),
             ],
         ])
@@ -244,74 +254,120 @@ class TelegramController:
     # ================================================================= VIEWS
     async def _status_text(self):
         s = await asyncio.to_thread(self.engine.status)
-        account = s["account"]
+        account = s.get("account")
+        d = 2
+        price = (f"{s['bid']:.{d}f} / {s['ask']:.{d}f}"
+                 if s.get("bid") and s.get("ask") else "n/a")
+        spread = f"{s['spread']:.{d}f}" if s.get("spread") is not None else "n/a"
+        updated = s.get("last_update")
         lines = [
-            "📊 <b>BOT STATUS</b>",
-            "",
-            f"Status: {s['icon']} {s['state']}",
-            f"Symbol: {s['symbol']}",
+            "📊 <b>BOT STATUS</b>", "",
+            f"Status: {s['icon']} {s['state']}"
+            + (f" ({s.get('engine_state')})" if s.get("engine_state") else ""),
+            f"Mode: {s.get('mode', '?')}",
+            f"Symbol: {s['symbol']}   Timeframe: {s.get('timeframe', '')}",
             f"MT5: {'Connected' if s['mt5_connected'] else 'Disconnected'}",
-            f"Trading: {'PAUSED (no new entries)' if s['paused'] else 'ENABLED' if s['state'] == 'RUNNING' else 'DISABLED'}",
+            f"Price: {price}   Spread: {spread}",
             "",
-            f"Open Positions: {s['open_positions']}/{s['max_positions']}",
-            f"Trades Today: {s['trades_today']}",
-            f"Rejected (low RR): {s.get('rejected_today', 0)}",
+            f"Ladder spacing: {s.get('spacing')}",
+            f"Depth: {s.get('depth')} per side",
+            f"TP: {s.get('tp_mode')} ({_num(s.get('tp_distance'))})",
+            f"Lot: {s.get('lot')}",
             "",
-            f"TP Mode: {s.get('tp_mode_label', '')}",
-            f"Minimum RR: {s.get('min_rr', '')}R",
+            f"Open positions: {s.get('positions', 0)}",
+            f"Pending orders: {s.get('orders', 0)}",
+            "",
+            f"Cycle: #{s.get('cycle_id', 0)}",
+            f"Successful TPs: {s.get('tp_count', 0)}/{s.get('cycle_target', 0)}",
+            f"Cycle P/L: {_money(s.get('cycle_profit', 0))}",
+            f"Daily P/L: {_money(s.get('daily_profit', 0))}",
+            f"Total TPs: {s.get('total_tp', 0)} / {s.get('total_trades', 0)} trades",
+            "",
+            f"Last ladder update: "
+            f"{updated.strftime('%H:%M:%S') if updated else 'n/a'}",
         ]
         if account:
-            lines.append(f"Balance: {_money(account.balance)} | Equity: {_money(account.equity)}")
-        lines += [
-            "",
-            f"Risk/Trade: {s['risk_percent']}%" if s["use_risk_percent"]
-            else f"Fixed Lot: {s['fixed_lot']}",
-            f"RR: {s['rr']}",
-        ]
-        if s["uptime"]:
-            lines.append(f"Uptime: {s['uptime']}")
-        if s["last_reason"]:
-            lines.append(f"Last check: {s['last_reason']}")
-        if s["error"]:
+            lines.append(f"Balance: {_money(account.balance)} | "
+                         f"Equity: {_money(account.equity)}")
+        if s.get("spread_blocked"):
+            lines.append("\n⚠️ Spread too wide - new entries paused")
+        if s.get("block_reason"):
+            lines.append(f"\n⛔ Risk block: {s['block_reason']}")
+        if s.get("error"):
             lines.append(f"\n⚠ Last error: {s['error']}")
+        lines.append(f"\n<i>Updated {_now()}</i>")
+        return "\n".join(lines)
+
+    async def _ladder_text(self):
+        """Live ladder: pending levels above and below, plus open positions."""
+        s = await asyncio.to_thread(self.engine.status)
+        orders = await asyncio.to_thread(self.engine.orders)
+        positions = await asyncio.to_thread(self.engine.positions)
+        d = 2
+        buys = sorted([o for o in orders if o.side == "BUY_STOP"],
+                      key=lambda o: o.price, reverse=True)
+        sells = sorted([o for o in orders if o.side == "SELL_STOP"],
+                       key=lambda o: o.price, reverse=True)
+
+        lines = ["🪜 <b>ROLLING LADDER</b>", "",
+                 f"Cycle #{s.get('cycle_id', 0)}   "
+                 f"anchor {_num(s.get('anchor'))}   spacing {s.get('spacing')}",
+                 f"State: {s.get('engine_state', '')}", ""]
+        if buys:
+            lines.append("<b>BUY STOPS</b>")
+            lines += [f"  {o.price:.{d}f}  →  TP {o.tp:.{d}f}  ({o.volume})"
+                      for o in buys]
+        if s.get("bid"):
+            lines.append(f"— price {s['bid']:.{d}f} / {s['ask']:.{d}f} —")
+        if sells:
+            lines.append("<b>SELL STOPS</b>")
+            lines += [f"  {o.price:.{d}f}  →  TP {o.tp:.{d}f}  ({o.volume})"
+                      for o in sells]
+        if not orders:
+            lines.append("No pending levels right now.")
+        if positions:
+            lines.append("")
+            lines.append("<b>OPEN</b>")
+            lines += [f"  {p.side} {p.volume} @ {p.price_open:.{d}f} "
+                      f"→ TP {p.tp:.{d}f}  {_money(p.profit)}" for p in positions]
         lines.append(f"\n<i>Updated {_now()}</i>")
         return "\n".join(lines)
 
     async def _account_text(self):
         account = await asyncio.to_thread(self.engine.account)
         if not account:
-            return ("💰 <b>ACCOUNT</b>\n\nMT5 account information is unavailable "
+            return ("💰 <b>ACCOUNT</b>\n\nAccount information is unavailable "
                     f"(terminal not connected).\n\n<i>Updated {_now()}</i>")
         return "\n".join([
-            "💰 <b>ACCOUNT</b>",
-            "",
-            f"Login: {account.login}",
+            "💰 <b>ACCOUNT</b>", "",
+            f"Login: {getattr(account, 'login', '')}",
             f"Server: {getattr(account, 'server', 'n/a')}",
             f"Currency: {getattr(account, 'currency', '')}",
             "",
             f"Balance: {_money(account.balance)}",
             f"Equity: {_money(account.equity)}",
-            f"Margin: {_money(account.margin)}",
-            f"Free Margin: {_money(account.margin_free)}",
-            f"Margin Level: {account.margin_level:.2f}%",
-            f"Floating P/L: {_money(account.profit)}",
+            f"Margin: {_money(getattr(account, 'margin', 0))}",
+            f"Free Margin: {_money(getattr(account, 'margin_free', 0))}",
+            f"Margin Level: {getattr(account, 'margin_level', 0):.2f}%",
+            f"Floating P/L: {_money(getattr(account, 'profit', 0))}",
             "",
             f"<i>Updated {_now()}</i>",
         ])
 
     async def _positions_text(self):
         positions = await asyncio.to_thread(self.engine.positions)
-        if not positions:
-            return f"📈 <b>OPEN POSITIONS</b>\n\nNo open positions.\n\n<i>Updated {_now()}</i>"
+        orders = await asyncio.to_thread(self.engine.orders)
+        if not positions and not orders:
+            return ("📈 <b>OPEN POSITIONS</b>\n\nNo open positions."
+                    f"\n\n<i>Updated {_now()}</i>")
 
         blocks = ["📈 <b>OPEN POSITIONS</b>", ""]
         total = 0.0
         for p in positions:
-            direction = "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL"
             total += p.profit
             blocks += [
                 f"Symbol: {p.symbol}",
-                f"Direction: {direction}",
+                f"Direction: {p.side}",
                 f"Volume: {p.volume}",
                 f"Entry: {p.price_open}",
                 f"SL: {p.sl if p.sl else '-'}",
@@ -320,48 +376,58 @@ class TelegramController:
                 f"Ticket: {p.ticket}",
                 "",
             ]
+        if not positions:
+            blocks.append("No open positions.")
+            blocks.append("")
         blocks.append(f"Total floating P/L: {_money(total)}")
+        blocks.append(f"Pending ladder orders: {len(orders)}")
         blocks.append(f"\n<i>Updated {_now()}</i>")
         return "\n".join(blocks)
 
     async def _stats_text(self):
         stats = await asyncio.to_thread(self.engine.today_stats)
         if not stats.get("available"):
-            return ("📋 <b>TODAY'S STATS</b>\n\nTrade history is unavailable: "
-                    f"{stats.get('error', 'unknown error')}.\n\n<i>Updated {_now()}</i>")
+            return ("📋 <b>TODAY'S STATS</b>\n\nLadder history is unavailable: "
+                    f"{stats.get('error', 'unknown error')}."
+                    f"\n\n<i>Updated {_now()}</i>")
 
         lines = [
-            "📋 <b>TODAY'S STATS</b>",
-            "",
+            "📋 <b>TODAY'S STATS</b>", "",
             f"Date: {stats['day']}",
-            f"Trades Opened: {stats['opened']}",
-            f"Closes Recorded: {stats['closed']}",
+            f"Orders placed: {stats.get('orders_placed', 0)}",
+            f"Levels triggered: {stats.get('entries', 0)}",
+            f"TP hits: {stats.get('tp_hits', 0)}",
+            f"SL hits: {stats.get('sl_hits', 0)}",
+            f"Cycles completed: {stats.get('cycles_completed', 0)}",
+            f"Realized P/L: {_money(stats.get('realized', 0))}",
         ]
-        if stats["closed"]:
-            lines += [
-                f"Wins: {stats['wins']}",
-                f"Losses: {stats['losses']}",
-                f"Breakeven: {stats['breakeven']}",
-                f"Win Rate: {stats['win_rate']:.1f}%",
-                f"Realized P/L: {_money(stats['realized'])}",
-            ]
-        else:
-            lines.append("\nNo closed trades recorded yet today.")
+        if stats.get("closed"):
+            lines += ["",
+                      f"Closed trades: {stats['closed']}",
+                      f"Wins: {stats.get('wins', 0)}  Losses: {stats.get('losses', 0)}"]
+            if stats.get("win_rate") is not None:
+                lines.append(f"Win rate: {stats['win_rate']:.1f}%")
+        if not stats.get("entries") and not stats.get("orders_placed"):
+            lines.append("\nNo ladder activity recorded yet today.")
         lines.append(f"\n<i>Updated {_now()}</i>")
         return "\n".join(lines)
 
     async def _panel_text(self):
         s = await asyncio.to_thread(self.engine.status)
+        price = f"{s['bid']:.2f}" if s.get("bid") else "n/a"
         return "\n".join([
-            "🤖 <b>XAUUSD SCALPER CONTROL PANEL</b>",
-            "",
-            f"State: {s['icon']} {s['state']}",
-            f"Symbol: {s['symbol']}",
+            "🤖 <b>XAUUSD ROLLING LADDER</b>", "",
+            f"State: {s['icon']} {s['state']}   [{s.get('mode', '?')}]",
+            f"Symbol: {s['symbol']} {s.get('timeframe', '')}   Price: {price}",
             f"MT5: {'Connected' if s['mt5_connected'] else 'Disconnected'}",
-            f"Positions: {s['open_positions']}/{s['max_positions']}",
-            f"Trades Today: {s['trades_today']}",
             "",
-            f"TP: {s.get('tp_mode_label', '')} | Min RR: {s.get('min_rr', '')}R",
+            f"Cycle #{s.get('cycle_id', 0)}  ·  TPs "
+            f"{s.get('tp_count', 0)}/{s.get('cycle_target', 0)}  ·  "
+            f"P/L {_money(s.get('cycle_profit', 0))}",
+            f"Positions: {s.get('positions', 0)}   "
+            f"Pending: {s.get('orders', 0)}",
+            f"Spacing {s.get('spacing')} · TP {_num(s.get('tp_distance'))} · "
+            f"Lot {s.get('lot')}",
             "",
             "Use the buttons below to control the bot.",
             f"\n<i>Updated {_now()}</i>",
@@ -391,7 +457,8 @@ class TelegramController:
                 "/pause - stop opening new trades",
                 "/resume - allow new trades again",
                 "/stopbot - stop the trading loop (positions stay open)",
-                "/settings - TP, risk, SL and management settings",
+                "/ladder - live ladder levels",
+                "/settings - TP, lot, ladder and risk settings",
             ]),
             parse_mode=ParseMode.HTML,
         )
@@ -422,6 +489,13 @@ class TelegramController:
             return
         await update.effective_message.reply_text(
             await self._stats_text(), parse_mode=ParseMode.HTML,
+            reply_markup=self.keyboard())
+
+    async def cmd_ladder(self, update, context):
+        if not await self._guard(update):
+            return
+        await update.effective_message.reply_text(
+            await self._ladder_text(), parse_mode=ParseMode.HTML,
             reply_markup=self.keyboard())
 
     async def cmd_settings(self, update, context):
@@ -506,6 +580,8 @@ class TelegramController:
                 text = await self._positions_text()
             elif action == "stats":
                 text = await self._stats_text()
+            elif action == "ladder":
+                text = await self._ladder_text()
             else:  # refresh / panel / unknown
                 text = await self._panel_text()
         except Exception as exc:
@@ -557,7 +633,7 @@ class TelegramController:
                 head,
                 "",
                 msg,
-                "New trades: DISABLED",
+                "New ladder levels: DISABLED (pending orders cancelled)",
                 "Existing positions: STILL MANAGED",
                 f"\n<i>Updated {_now()}</i>",
             ])
@@ -569,7 +645,7 @@ class TelegramController:
                 head,
                 "",
                 msg,
-                "New trades: ENABLED",
+                "New ladder levels: ENABLED",
                 f"\n<i>Updated {_now()}</i>",
             ])
 
@@ -582,7 +658,8 @@ class TelegramController:
                 "",
                 msg,
                 "New trades: DISABLED",
-                f"Open positions left untouched: {s['open_positions']}",
+                f"Open positions left untouched: {s.get('positions', 0)}",
+                "Pending ladder orders were cancelled.",
                 "Press 🟢 START TRADING to run again.",
                 f"\n<i>Updated {_now()}</i>",
             ])

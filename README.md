@@ -1,31 +1,46 @@
-# XAUUSD M1 Scalper — MT5 + Telegram Control
+# XAUUSD M5 Rolling Ladder Scalper
 
-The original single-file bot (`main.py`) refactored into a configurable,
-remotely controllable, CSV-logging application. **The trading strategy is
-unchanged** — same entries, same SL/TP maths, same lot sizing, same margin
-checks, same position management, same 0.5s polling.
-
-```
-optimized.py            trading engine + strategy + lifecycle manager (entry point)
-config.py               .env loading, typed parsing, defaults, validation
-runtime_settings.py     thread-safe, JSON-persisted settings changed from Telegram
-tp_engine.py            TP / RR execution layer (pip targets, RR validation, pip size)
-telegram_controller.py  Telegram control panel (own thread, own event loop)
-telegram_settings.py    the ⚙️ SETTINGS menu tree, confirmations, custom input
-csv_logger.py           thread-safe CSV persistence
-requirements.txt
-.env.example            copy to .env and fill in
-data/                   trades.csv, events.csv, account_snapshots.csv,
-                        runtime_settings.json (all auto-created)
-```
-
-The signal engine is untouched: sweep detection, candle/wick logic, M5 bias,
-candle-range and spread filtering and the SL calculation are byte-identical to
-the original. Everything new happens *after* a signal is found:
+A price-driven rolling ladder for gold on MT5, with Telegram control, CSV
+persistence and a paper mode. There is **no signal engine and no indicators** —
+the ladder itself is the entry mechanism:
 
 ```
-signal detected -> strategy SL -> TP/RR engine -> RR validation -> lot sizing
-                -> margin safety -> existing MT5 order -> Telegram + CSV
+price moves → a ladder level is reached → trade enters → small TP →
+trade closes → ladder rolls forward → new level created → repeat
+```
+
+```
+MT5 market data
+      ↓
+ROLLING LADDER ENGINE      ladder_engine.py
+      ↓
+level calculation          grid anchored per cycle, window rolls with price
+      ↓
+risk / spread check
+      ↓
+pending order manager      BUY STOP above, SELL STOP below, idempotent
+      ↓
+execution                  broker.py — Mt5Broker (LIVE) | PaperBroker (PAPER)
+      ↓
+TP management → roll ladder → profit cycle
+      ↓
+Telegram + CSV
+```
+
+## Files
+
+```
+optimized.py            entry point: MT5 connection, lifecycle, threads, hooks
+ladder_engine.py        RollingLadderEngine — levels, cycles, reconciliation, state machine
+broker.py               execution adapters: live MT5 and the paper simulator
+price_utils.py          symbol-aware price/pip/point/volume conversions
+config.py               .env loading, typed parsing, validation
+runtime_settings.py     Telegram-controlled settings, persisted as JSON
+telegram_controller.py  control panel (own thread, own event loop)
+telegram_settings.py    the ⚙️ SETTINGS menu tree
+csv_logger.py           trades.csv, events.csv, account_snapshots.csv, ladder.csv
+tests/                  442 offline checks — python tests/run_all.py
+data/                   CSVs + runtime_settings.json + state files (auto-created)
 ```
 
 ## Setup
@@ -38,132 +53,138 @@ python optimized.py
 
 `.env` is git-ignored — credentials never live in source.
 
-### Minimum configuration
+**It starts in PAPER mode.** The ladder is calculated and filled against live
+ticks, but nothing is sent to the broker. Switch to `TRADING_MODE=LIVE` only
+after watching a paper session behave. The startup banner always prints the
+account, the symbol and the mode in force.
 
-| Variable | Meaning |
-| --- | --- |
-| `MT5_LOGIN` | `0` = trade the account already logged into the running MT5 terminal |
-| `MT5_PASSWORD` / `MT5_SERVER` | only needed when `MT5_LOGIN > 0` |
-| `SYMBOL` | trading symbol (default `XAUUSDm`) |
-| `TELEGRAM_BOT_TOKEN` | from @BotFather; empty = remote control disabled |
-| `TELEGRAM_CHAT_ID` | your chat id — only listed ids may control the bot |
-| `TELEGRAM_ALLOWED_CHAT_IDS` | optional extra ids, comma separated |
-| `AUTO_START_TRADING` | `true` (default) starts trading on launch, like the original script |
+## How the ladder works
 
-Every strategy setting (`RISK_PERCENT`, `RR`, `SL_POINTS_MIN`, `MAX_OPEN_POSITIONS`, …)
-can also be set in `.env`. **Their defaults are exactly the values hard-coded in
-the original bot**, so a missing variable can never change trading behaviour.
+* Levels sit on a **grid anchored when the cycle starts** (`anchor + n × spacing`),
+  so their prices are stable — price wiggling inside a level never re-places
+  orders. What rolls is the *window*: as price advances, further-out grid points
+  enter the live set and consumed ones drop out.
+* The nearest level is at least `FIRST_LEVEL_OFFSET` away, and never closer than
+  the broker's own minimum stop distance.
+* Each level carries a stable identity in the order comment —
+  `RL<cycle><B|S><level>`, e.g. `RL127B3` — which is what makes the engine
+  idempotent. Every pass compares the ladder it *wants* against the orders and
+  positions MT5 actually reports and places or cancels only the difference.
+* An order is replaced when its price, TP or SL no longer matches the settings,
+  when it belongs to an older cycle, when it duplicates a level, or when it
+  exceeds `ORDER_MAX_AGE`.
+* On startup, reconnect or crash recovery the state is rebuilt **from the
+  broker**, not from memory: live comments decide the cycle id and the grid
+  anchor, so a restart continues the existing ladder instead of stacking a
+  second one on top of it.
 
-## Telegram control panel
+`ROLL_MODE=extend` (default) keeps a full ladder ahead of price.
+`ROLL_MODE=static` pins the grid where the cycle started and lets price consume
+it — the behaviour visible in the reference recording.
 
-Send `/start` to your bot:
+## Profit cycle
+
+A cycle ends when `PROFIT_CYCLE_TARGET` trades have closed in profit (default 4).
+Then: pending orders are cancelled, remaining positions are closed
+(`CYCLE_CLOSE_POSITIONS`), the result is recorded, and a fresh ladder is anchored
+at the new price. `CYCLE_TAKE_PROFIT_MONEY` optionally ends a cycle on a net
+basket profit instead — the "close everything at once, re-anchor" pattern the
+recording shows. `MAX_CYCLE_LOSS` closes a cycle out the other way and starts
+the cooldown.
+
+## Telegram
+
+`/start` opens the control panel:
 
 | Button | Effect |
 | --- | --- |
-| 🟢 START TRADING | verifies MT5 + symbol, starts the single trading loop (pressing twice never starts a second one) |
-| ⏸ PAUSE TRADING | stops **new** entries only — breakeven, partial closes and position monitoring keep running |
-| ▶️ RESUME TRADING | allows new entries again |
-| 🛑 STOP BOT | stops the loop cleanly; **open positions are left untouched** and the process stays alive |
-| 📊 STATUS | state, symbol, MT5 link, positions, trades today, risk/RR |
-| 💰 ACCOUNT | live `mt5.account_info()` — balance, equity, margin, free margin, margin level |
-| 📈 POSITIONS | live open positions with entry/SL/TP/profit/ticket |
-| 📋 TODAY'S STATS | wins, losses, win rate and realized P/L from `data/trades.csv` |
-| ⚙️ SETTINGS | TP mode, minimum RR, lot/risk, positions, SL, breakeven, partial, spread, pip size, reset |
-| 🔄 REFRESH | re-renders the panel in place (edits the existing message) |
+| 🟢 START | verifies MT5 and the symbol, rebuilds state from the broker, starts the single ladder loop |
+| ⏸ PAUSE | cancels pending levels, opens nothing new — open positions keep being managed |
+| ▶️ RESUME | rebuilds the ladder |
+| 🛑 STOP | stops the loop and cancels pending orders; **open positions are left untouched** |
+| 📊 STATUS | state, mode, price, spread, spacing, TP, lot, positions, pendings, cycle, TPs, cycle P/L, daily P/L, last update |
+| 💰 ACCOUNT | live balance/equity/margin |
+| 📈 POSITIONS | open positions + pending count |
+| 📋 TODAY'S STATS | from `ladder.csv`: orders placed, levels triggered, TP/SL hits, cycles, realised P/L |
+| 🪜 LADDER | the live ladder — buy stops, market price, sell stops, open trades |
+| ⚙️ SETTINGS | TP, lot, ladder and risk settings |
+| 🔄 REFRESH | re-renders in place |
 
-Commands: `/start` `/status` `/account` `/positions` `/stats` `/settings`
-`/pause` `/resume` `/stopbot` `/help`.
+Commands: `/start` `/status` `/account` `/positions` `/stats` `/ladder`
+`/settings` `/pause` `/resume` `/stopbot` `/help`.
 
-## ⚙️ Settings (TP / risk control)
+Only chat ids in `TELEGRAM_CHAT_ID` / `TELEGRAM_ALLOWED_CHAT_IDS` may do
+anything; everyone else gets `Unauthorized.` Secrets are never sent to Telegram.
 
-Everything below is changed from Telegram, applies to the **next** trade
-immediately (no restart), never touches open positions, and is stored in
-`data/runtime_settings.json` so it survives a restart. High-impact changes
-(TP, RR, risk, lot, positions, SL) ask for confirmation first; ♻️ RESET
-restores the original configuration.
+### Settings
 
-| Menu | What it controls | Options |
-| --- | --- | --- |
-| 🎯 TP MODE | where the take profit goes | 1–5 PIPS, or CUSTOM RR (1R–3R, or typed) |
-| ⚖️ MIN RR | reject threshold | 0.5 / 0.75 / 1.0 / 1.25 / 1.5 / 2.0 / custom |
-| 💰 LOT / RISK | sizing mode and values | RISK % (0.5–2.0/custom) or FIXED LOT (0.01–0.10/custom) |
-| 📈 MAX POSITIONS | concurrent positions | 1–5, or custom |
-| 🛑 STOP LOSS | SL mode and bounds | STRUCTURAL (default) / FIXED, SL min, SL max, fixed distance |
-| 🔒 BREAKEVEN | on/off + trigger | 0.25R / 0.5R / 0.75R / 1.0R |
-| 📉 PARTIAL CLOSE | on/off, trigger, size | 1.0R/1.5R/2.0R, 20%/30%/50% |
-| 📏 MAX SPREAD | spread filter threshold | 300 / 400 / 500 / 600 / custom |
-| 📐 PIP SIZE | what "1 pip" means | AUTO, or pin 1 / 10 / 100 points |
+Everything below is changed from Telegram, applies to the **next** levels
+immediately (no restart), never modifies open positions, and is stored in
+`data/runtime_settings.json`. High-impact changes ask for confirmation;
+♻️ RESET restores the original configuration.
 
-### TP modes and RR validation
+| Menu | Controls |
+| --- | --- |
+| 🎯 TP SETTINGS | DISTANCE (any value) or 1–5 PIPS, stop loss, pip size |
+| 💰 LOT SIZE | 0.01–0.10 or custom, plus the hard MAX LOT cap |
+| 🪜 LADDER SETTINGS | spacing, depth, first-level offset, roll mode, profit cycle, basket TP |
+| 🛡 RISK SETTINGS | max open, max pending, max spread, daily loss, cycle loss, losing-cycle streak, cooldown, order age |
+| 🧭 DIRECTION | OFF / BOTH / BUY ONLY / SELL ONLY / NO ENTRIES |
 
-A pip target is never sent blindly. For every signal the bot computes
+**Pips are never hardcoded.** `price_utils.get_pip_size()` derives the pip from
+the symbol's `digits`/`point` (10 points on a 3/5-digit feed, 1 point otherwise),
+prints it at startup and shows it in the panel. Pin it under 📐 PIP SIZE if your
+broker quotes gold differently — that one setting rescales all five pip targets.
 
-```
-risk   = |entry - SL|        (the strategy's own SL, unchanged)
-reward = |TP - entry|        (from the selected TP mode)
-RR     = reward / risk
-```
+## Risk
 
-and **rejects the trade** when `RR < MIN_RR` — the setup was valid, the chosen
-target just makes it a bad trade. The rejection is logged to `events.csv`
-(`TRADE_REJECTED_RR`), counted on the STATUS screen and pushed to Telegram:
+Fixed lots only — **no martingale, no size increase after a loss, no recovery
+doubling.** `MAX_OPEN_POSITIONS`, `MAX_PENDING_ORDERS`, `MAX_LOT_SIZE`,
+`MAX_DAILY_LOSS`, `MAX_CYCLE_LOSS`, `MAX_CONSECUTIVE_LOSING_CYCLES`,
+`MAX_SPREAD`, `MAX_SLIPPAGE` and `COOLDOWN_AFTER_LOSS` are all enforced. When a
+limit trips: new entries stop and pending orders are cancelled (they would breach
+the limit the moment they trigger); **open positions keep running** under their
+own TP/SL. The bot resumes by itself once the condition clears — the spread
+filter in particular blocks and un-blocks automatically.
 
-```
-⚠️ SIGNAL REJECTED
-BUY XAUUSDm
-Signal detected successfully.
-TP Mode: 2 PIPS
-SL: 4.00 pips (400 pts)
-TP: 2.00 pips (2 pts)
-Calculated RR: 0.01
-Minimum RR: 1.00R
-No order placed.
-```
+## Data
 
-### Pip size
-
-Nothing about gold is hardcoded. `get_pip_size()` derives the pip from the
-symbol's `digits`/`point`: a 3- or 5-digit feed quotes tenths of a pip
-(1 pip = 10 points), a 2- or 4-digit feed quotes whole pips (1 pip = 1 point).
-The resolved value is printed at startup and shown in the settings panel
-(`1 pip = 0.01 (1 points, auto)`). If your broker quotes gold on a different
-convention, pin it under 📐 PIP SIZE — that one setting rescales all five pip
-targets.
-
-**Defaults keep the original behaviour**: TP MODE = CUSTOM RR at 3.0R with
-MIN RR 1.0, so until you pick a pip target the bot trades exactly as before.
-
-Any chat id not in `TELEGRAM_CHAT_ID` / `TELEGRAM_ALLOWED_CHAT_IDS` gets
-`Unauthorized.` and can do nothing. Tokens, passwords and other secrets are
-never sent to Telegram.
-
-## Data files
-
-* `data/trades.csv` — one row per open, partial close and close (deal-id
-  de-duplicated, so restarts never duplicate or lose records). Each row also
-  records the execution settings actually used — `tp_mode`, `tp_distance`,
-  `sl_distance`, `rr`, `risk_mode`, `risk_percent`, `fixed_lot`, `min_rr` —
-  so TP configurations can be compared later. Files written by an earlier
-  version are migrated to the new columns automatically, keeping every row.
-* `data/events.csv` — meaningful events only (`BOT_STARTED`, `SIGNAL_LONG`,
-  `TRADE_OPENED`, `BREAKEVEN`, `PARTIAL_CLOSE`, `MT5_DISCONNECTED`, `ERROR`, …)
-* `data/account_snapshots.csv` — written every `ACCOUNT_SNAPSHOT_INTERVAL`
-  seconds (default 300) by a background thread
-* `data/runtime_settings.json` — Telegram-controlled settings (never secrets)
+* `data/ladder.csv` — one row per ladder event: `LADDER_CREATED`, `ORDER_PLACED`,
+  `ORDER_CANCELLED`, `ORDER_TRIGGERED`, `TP_HIT`, `SL_HIT`, `LEVEL_ROLLED`,
+  `CYCLE_STARTED`, `CYCLE_COMPLETED`, `CYCLE_LOSS`, `RISK_BLOCK`,
+  `SPREAD_BLOCK`, `ERROR` — with cycle, level, prices, lot, spread, tickets and
+  running P/L
+* `data/trades.csv` — one row per open and close, with cycle and level context
+* `data/events.csv` — bot events (start/stop/pause/settings/errors)
+* `data/account_snapshots.csv` — periodic balance/equity/margin
+* `data/runtime_settings.json`, `ladder_state.json`, `paper_state.json` — state
 
 ## Threading
 
 ```
 main thread        lifecycle + shutdown signals
-trading-engine     the one and only strategy loop (0.5s)
-monitor            account snapshots + closed-trade sync (seconds, not ms)
-telegram           asyncio polling loop; API calls never touch the trading loop
+ladder-engine      the one and only ladder loop (POLL_SECONDS, default 0.5s)
+monitor            account snapshots
+telegram           asyncio polling; API calls never touch the ladder loop
 ```
 
-All MT5 calls are serialised through one re-entrant lock, CSV writes through one
-file lock, and settings through their own lock — the loop takes a single
-`SETTINGS.snapshot()` at the top of each cycle, so a change landing mid-cycle
-can never produce a half-updated order. Telegram notifications are fire-and-forget, so a slow or
-broken Telegram connection can never delay or stop trading.
+MT5 calls are serialised through one re-entrant lock, CSV writes through one file
+lock, settings through their own lock — the engine takes a single
+`SETTINGS.snapshot()` per pass, so a change landing mid-pass can never produce a
+half-updated ladder.
 
-> HIGH RISK strategy — 1.5% risk per trade with 400–1000 point stops. Demo only.
+## Tests
+
+```bash
+python tests/run_all.py        # 442 checks, no MT5 or network needed
+```
+
+Covers: pip/point conversion, the paper and live execution adapters, settings
+validation and persistence, ladder creation, both-sided stop placement,
+triggering, TP, rolling, a full 4-TP cycle and reset, duplicate prevention,
+restart and reconnect recovery, spread blocking, daily-loss, cycle-loss and
+position caps, pause/resume/stop, every Telegram button and settings screen, and
+a paper-mode run end to end.
+
+> Ladder scalping on gold is high risk. Start in PAPER, and keep the risk limits
+> switched on.

@@ -5,13 +5,13 @@ Responsibilities
 ----------------
 * Load the .env file (python-dotenv)
 * Parse environment variables into proper Python types
-* Apply defaults that EXACTLY match the original main.py source values
+* Apply defaults
 * Validate the configuration
 * Expose configuration to the rest of the application
 
-IMPORTANT: every default below is identical to the value hard-coded in the
-original bot, so a missing environment variable can never change trading
-behaviour.
+Secrets (MT5 credentials, Telegram token) live only here / in .env. The
+Telegram-adjustable trading parameters start from `runtime_defaults()` and are
+then owned by runtime_settings.py.
 """
 
 import os
@@ -38,9 +38,7 @@ _FALSE = {"0", "false", "no", "n", "off"}
 
 def _raw(name, default=""):
     value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip()
+    return default if value is None else value.strip()
 
 
 def _get_str(name, default=""):
@@ -80,7 +78,6 @@ def _get_bool(name, default):
 
 
 def _get_int_list(name, default=None):
-    """Parse a comma/space separated list of integer chat ids."""
     value = _raw(name, "")
     if value == "":
         return list(default or [])
@@ -104,7 +101,6 @@ PASSWORD = _get_str("MT5_PASSWORD", "")   # Only used if LOGIN > 0
 SERVER = _get_str("MT5_SERVER", "")       # Exact server name from MT5
 MT5_PATH = _get_str("MT5_PATH", "")       # Optional explicit terminal64.exe path
 
-# Fallback paths probed when auto-detect fails (unchanged from original)
 POSSIBLE_MT5_PATHS = [
     "C:\\Program Files\\MetaTrader 5\\terminal64.exe",
     "C:\\Program Files\\Exness MetaTrader 5\\terminal64.exe",
@@ -113,74 +109,82 @@ POSSIBLE_MT5_PATHS = [
 ]
 
 # ---------------------------------------------------------------------------
-# TRADING SYMBOL
+# MARKET
 # ---------------------------------------------------------------------------
-SYMBOL = _get_str("SYMBOL", "XAUUSDm")
+SYMBOL = _get_str("SYMBOL", "XAUUSD")
+TIMEFRAME = _get_str("TIMEFRAME", "M5").upper()
 
 # ---------------------------------------------------------------------------
-# AGGRESSIVE RISK SETTINGS (MARGIN-SAFE) - defaults identical to original
+# TRADING MODE
 # ---------------------------------------------------------------------------
-USE_RISK_PERCENT = _get_bool("USE_RISK_PERCENT", True)
-RISK_PERCENT = _get_float("RISK_PERCENT", 1.5)   # 1.5% per trade
-FIXED_LOT = _get_float("FIXED_LOT", 0.05)        # Fallback if risk calc unused
-
-MAX_OPEN_POSITIONS = _get_int("MAX_OPEN_POSITIONS", 4)
-
-# ---------------------------------------------------------------------------
-# TIGHT SCALPING STOPS
-# ---------------------------------------------------------------------------
-USE_STRUCTURAL_SL = _get_bool("USE_STRUCTURAL_SL", True)
-SL_POINTS_MIN = _get_int("SL_POINTS_MIN", 400)
-SL_POINTS_MAX = _get_int("SL_POINTS_MAX", 1000)
-RR = _get_float("RR", 3.0)
+# PAPER (default) simulates fills from live ticks and sends nothing to the
+# broker. Switch to LIVE only after watching PAPER behave.
+TRADING_MODE = _get_str("TRADING_MODE", "PAPER").upper()
+PAPER_START_BALANCE = _get_float("PAPER_START_BALANCE", 10000.0)
 
 # ---------------------------------------------------------------------------
-# TP / RR EXECUTION LAYER (applied after the unchanged signal detection)
+# ROLLING LADDER
 # ---------------------------------------------------------------------------
-# "custom_rr" + CUSTOM_RR = RR reproduces the original take-profit exactly.
-TP_MODE = _get_str("TP_MODE", "custom_rr")
-CUSTOM_RR = _get_float("CUSTOM_RR", RR)
-MIN_RR = _get_float("MIN_RR", 1.0)
+LADDER_SPACING = _get_float("LADDER_SPACING", 0.30)     # price units
+LADDER_DEPTH = _get_int("LADDER_DEPTH", 5)              # levels per side
+# Nearest level distance from price; the broker's minimum stop distance always
+# wins when it is larger.
+FIRST_LEVEL_OFFSET = _get_float("FIRST_LEVEL_OFFSET", LADDER_SPACING)
+# extend = the ladder rolls with price (levels re-created ahead of the market)
+# static = the grid is fixed for the cycle and consumed as price crosses it
+ROLL_MODE = _get_str("ROLL_MODE", "extend").lower()
+REARM_LEVELS = _get_bool("REARM_LEVELS", True)
+
+# ---------------------------------------------------------------------------
+# TAKE PROFIT
+# ---------------------------------------------------------------------------
+# distance = TP_DISTANCE price units; 1_pip..5_pips = symbol-aware pips
+TP_MODE = _get_str("TP_MODE", "distance").lower()
+TP_DISTANCE = _get_float("TP_DISTANCE", 0.30)
+STOP_LOSS_DISTANCE = _get_float("STOP_LOSS_DISTANCE", 0.0)   # 0 = no SL
 # 1 pip = N points; 0 = derive from the symbol's digits/point
 PIP_POINTS = _get_int("PIP_POINTS", 0)
-# Stop loss distance used when SL_MODE is "fixed" (structural is the default)
-SL_MODE = _get_str("SL_MODE", "structural" if USE_STRUCTURAL_SL else "fixed")
-SL_FIXED_POINTS = _get_int("SL_FIXED_POINTS", SL_POINTS_MIN)
 
 # ---------------------------------------------------------------------------
-# FILTERS (AGGRESSIVE)
+# PROFIT CYCLE
 # ---------------------------------------------------------------------------
-MAX_SPREAD_POINTS = _get_int("MAX_SPREAD_POINTS", 500)
-SESSION_FILTER = _get_bool("SESSION_FILTER", False)
-VOLUME_FILTER = _get_bool("VOLUME_FILTER", False)
-MIN_CANDLE_RANGE_POINTS = _get_int("MIN_CANDLE_RANGE_POINTS", 25)
+PROFIT_CYCLE_TARGET = _get_int("PROFIT_CYCLE_TARGET", 4)     # successful TPs
+CYCLE_CLOSE_POSITIONS = _get_bool("CYCLE_CLOSE_POSITIONS", True)
+# Optional basket target in account currency (0 = off). This is the behaviour
+# the reference recording shows: everything closes together on a net profit.
+CYCLE_TAKE_PROFIT_MONEY = _get_float("CYCLE_TAKE_PROFIT_MONEY", 0.0)
 
 # ---------------------------------------------------------------------------
-# TRADE MANAGEMENT
+# RISK
 # ---------------------------------------------------------------------------
-MOVE_TO_BREAKEVEN_AT_R = _get_float("MOVE_TO_BREAKEVEN_AT_R", 0.5)
-PARTIAL_CLOSE_AT_R = _get_float("PARTIAL_CLOSE_AT_R", 1.5)
-PARTIAL_CLOSE_FRACTION = _get_float("PARTIAL_CLOSE_FRACTION", 0.3)
-COOLDOWN_MINUTES = _get_int("COOLDOWN_MINUTES", 0)
+LOT_SIZE = _get_float("LOT_SIZE", 0.01)                 # fixed lots, no martingale
+MAX_LOT_SIZE = _get_float("MAX_LOT_SIZE", 0.10)
+MAX_OPEN_POSITIONS = _get_int("MAX_OPEN_POSITIONS", 4)
+MAX_PENDING_ORDERS = _get_int("MAX_PENDING_ORDERS", 10)
+MAX_SPREAD = _get_float("MAX_SPREAD", 0.50)             # price units, 0 = off
+MAX_SLIPPAGE = _get_int("MAX_SLIPPAGE", 20)             # deviation points
+MAX_DAILY_LOSS = _get_float("MAX_DAILY_LOSS", 50.0)     # account currency, 0 = off
+MAX_CYCLE_LOSS = _get_float("MAX_CYCLE_LOSS", 20.0)     # account currency, 0 = off
+MAX_CONSECUTIVE_LOSING_CYCLES = _get_int("MAX_CONSECUTIVE_LOSING_CYCLES", 3)
+COOLDOWN_AFTER_LOSS = _get_float("COOLDOWN_AFTER_LOSS", 15.0)   # minutes
+
+# ---------------------------------------------------------------------------
+# ORDER HYGIENE
+# ---------------------------------------------------------------------------
+ORDER_MAX_AGE = _get_float("ORDER_MAX_AGE", 900.0)      # seconds, 0 = off
+M5_CANDLE_RESET = _get_bool("M5_CANDLE_RESET", False)   # re-anchor each M5 close
+
+# ---------------------------------------------------------------------------
+# DIRECTION FILTER (optional, disabled by default)
+# ---------------------------------------------------------------------------
+# off | both | buy_bias | sell_bias | none
+DIRECTION_FILTER = _get_str("DIRECTION_FILTER", "off").lower()
 
 # ---------------------------------------------------------------------------
 # ENGINE
 # ---------------------------------------------------------------------------
 MAGIC = _get_int("MAGIC", 88001199)
-DEVIATION_POINTS = _get_int("DEVIATION_POINTS", 150)
-M1_BARS = _get_int("M1_BARS", 600)
-M5_BARS = _get_int("M5_BARS", 300)
 POLL_SECONDS = _get_float("POLL_SECONDS", 0.5)
-
-# ---------------------------------------------------------------------------
-# PATTERN DETECTION (LOOSE)
-# ---------------------------------------------------------------------------
-SWEEP_LOOKBACK = _get_int("SWEEP_LOOKBACK", 6)
-SWEEP_BUFFER_POINTS = _get_int("SWEEP_BUFFER_POINTS", 3)
-REJECTION_MIN_WICK_FRAC = _get_float("REJECTION_MIN_WICK_FRAC", 0.15)
-M5_BIAS_STRICT = _get_bool("M5_BIAS_STRICT", False)
-REQUIRE_ENGULF = _get_bool("REQUIRE_ENGULF", False)
-
 DIAGNOSTICS = _get_bool("DIAGNOSTICS", True)
 
 # ---------------------------------------------------------------------------
@@ -190,7 +194,6 @@ TELEGRAM_BOT_TOKEN = _get_str("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = _get_str("TELEGRAM_CHAT_ID", "")
 TELEGRAM_ALLOWED_CHAT_IDS = _get_int_list("TELEGRAM_ALLOWED_CHAT_IDS", [])
 
-# Every chat id allowed to control the bot (primary + extras, de-duplicated)
 AUTHORIZED_CHAT_IDS = []
 if TELEGRAM_CHAT_ID:
     try:
@@ -202,8 +205,9 @@ for _cid in TELEGRAM_ALLOWED_CHAT_IDS:
         AUTHORIZED_CHAT_IDS.append(_cid)
 
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN)
-# Send trade / error notifications to the primary chat id
 TELEGRAM_NOTIFICATIONS = _get_bool("TELEGRAM_NOTIFICATIONS", True)
+# Ladder entries are frequent; keep per-entry pings optional.
+TELEGRAM_ENTRY_NOTIFICATIONS = _get_bool("TELEGRAM_ENTRY_NOTIFICATIONS", True)
 
 # ---------------------------------------------------------------------------
 # DATA / CSV PERSISTENCE
@@ -212,14 +216,13 @@ DATA_DIRECTORY = _get_str("DATA_DIRECTORY", "data")
 TRADE_LOG_FILE = _get_str("TRADE_LOG_FILE", "trades.csv")
 EVENT_LOG_FILE = _get_str("EVENT_LOG_FILE", "events.csv")
 ACCOUNT_LOG_FILE = _get_str("ACCOUNT_LOG_FILE", "account_snapshots.csv")
+LADDER_LOG_FILE = _get_str("LADDER_LOG_FILE", "ladder.csv")
 
-# Seconds between account_snapshots.csv rows (background thread, never the loop)
-ACCOUNT_SNAPSHOT_INTERVAL = _get_int("ACCOUNT_SNAPSHOT_INTERVAL", 300)
-# Seconds between MT5 deal-history syncs used to record closed trades
-HISTORY_SYNC_SECONDS = _get_int("HISTORY_SYNC_SECONDS", 15)
-
-# Telegram-controlled runtime settings (never contains secrets)
 RUNTIME_SETTINGS_FILE = _get_str("RUNTIME_SETTINGS_FILE", "runtime_settings.json")
+LADDER_STATE_FILE = _get_str("LADDER_STATE_FILE", "ladder_state.json")
+PAPER_STATE_FILE = _get_str("PAPER_STATE_FILE", "paper_state.json")
+
+ACCOUNT_SNAPSHOT_INTERVAL = _get_int("ACCOUNT_SNAPSHOT_INTERVAL", 300)
 
 DATA_PATH = Path(DATA_DIRECTORY)
 if not DATA_PATH.is_absolute():
@@ -228,42 +231,57 @@ if not DATA_PATH.is_absolute():
 # ---------------------------------------------------------------------------
 # RUNTIME / LIFECYCLE
 # ---------------------------------------------------------------------------
-# True keeps the original behaviour: `python optimized.py` starts trading.
 AUTO_START_TRADING = _get_bool("AUTO_START_TRADING", True)
-# Minimum seconds between MT5 reconnection attempts
 MT5_RECONNECT_SECONDS = _get_int("MT5_RECONNECT_SECONDS", 30)
+
+
+# ---------------------------------------------------------------------------
+# Runtime (Telegram-adjustable) defaults
+# ---------------------------------------------------------------------------
+def runtime_defaults():
+    """
+    Starting point for the Telegram-controlled settings, and the target of
+    RESET SETTINGS.
+    """
+    return {
+        "timeframe": TIMEFRAME,
+        # ladder
+        "ladder_spacing": LADDER_SPACING,
+        "ladder_depth": LADDER_DEPTH,
+        "first_level_offset": FIRST_LEVEL_OFFSET,
+        "roll_mode": ROLL_MODE,
+        "rearm_levels": REARM_LEVELS,
+        # take profit
+        "tp_mode": TP_MODE,
+        "tp_distance": TP_DISTANCE,
+        "stop_loss_distance": STOP_LOSS_DISTANCE,
+        "pip_points": PIP_POINTS,
+        # cycle
+        "profit_cycle_target": PROFIT_CYCLE_TARGET,
+        "cycle_close_positions": CYCLE_CLOSE_POSITIONS,
+        "cycle_take_profit_money": CYCLE_TAKE_PROFIT_MONEY,
+        # risk
+        "lot_size": LOT_SIZE,
+        "max_lot_size": MAX_LOT_SIZE,
+        "max_open_positions": MAX_OPEN_POSITIONS,
+        "max_pending_orders": MAX_PENDING_ORDERS,
+        "max_spread": MAX_SPREAD,
+        "max_slippage": MAX_SLIPPAGE,
+        "max_daily_loss": MAX_DAILY_LOSS,
+        "max_cycle_loss": MAX_CYCLE_LOSS,
+        "max_consecutive_losing_cycles": MAX_CONSECUTIVE_LOSING_CYCLES,
+        "cooldown_after_loss_minutes": COOLDOWN_AFTER_LOSS,
+        # hygiene
+        "order_max_age_seconds": ORDER_MAX_AGE,
+        "m5_candle_reset": M5_CANDLE_RESET,
+        # direction
+        "direction_filter": DIRECTION_FILTER,
+    }
 
 
 # ---------------------------------------------------------------------------
 # Validation & safe reporting
 # ---------------------------------------------------------------------------
-def runtime_defaults():
-    """
-    Starting point for the Telegram-controlled settings, and the target of
-    "RESET SETTINGS" - i.e. the original configuration, not arbitrary values.
-    """
-    return {
-        "tp_mode": TP_MODE,
-        "custom_rr": CUSTOM_RR,
-        "min_rr": MIN_RR,
-        "lot_mode": "risk_percent" if USE_RISK_PERCENT else "fixed_lot",
-        "risk_percent": RISK_PERCENT,
-        "fixed_lot": FIXED_LOT,
-        "max_open_positions": MAX_OPEN_POSITIONS,
-        "sl_mode": SL_MODE,
-        "sl_points_min": SL_POINTS_MIN,
-        "sl_points_max": SL_POINTS_MAX,
-        "sl_fixed_points": SL_FIXED_POINTS,
-        "breakeven_enabled": bool(MOVE_TO_BREAKEVEN_AT_R),
-        "breakeven_r": MOVE_TO_BREAKEVEN_AT_R or 0.5,
-        "partial_close_enabled": bool(PARTIAL_CLOSE_AT_R),
-        "partial_close_r": PARTIAL_CLOSE_AT_R or 1.5,
-        "partial_close_fraction": PARTIAL_CLOSE_FRACTION,
-        "max_spread_points": MAX_SPREAD_POINTS,
-        "pip_points": PIP_POINTS,
-    }
-
-
 def validate():
     """Return (errors, warnings). Errors are fatal, warnings are informational."""
     errors = []
@@ -283,31 +301,42 @@ def validate():
             "the running MetaTrader 5 terminal"
         )
 
-    if RISK_PERCENT <= 0:
-        errors.append("RISK_PERCENT must be greater than 0")
+    if TRADING_MODE not in ("PAPER", "LIVE"):
+        errors.append("TRADING_MODE must be PAPER or LIVE")
+    elif TRADING_MODE == "LIVE":
+        warnings.append("TRADING_MODE=LIVE - real orders will be sent to the broker")
+
+    if LADDER_SPACING <= 0:
+        errors.append("LADDER_SPACING must be greater than 0")
+    if LADDER_DEPTH < 1:
+        errors.append("LADDER_DEPTH must be at least 1")
+    if TP_MODE not in ("distance", "1_pip", "2_pips", "3_pips", "4_pips", "5_pips"):
+        errors.append("TP_MODE must be distance or 1_pip..5_pips")
+    if TP_MODE == "distance" and TP_DISTANCE <= 0:
+        errors.append("TP_DISTANCE must be greater than 0")
+    if LOT_SIZE <= 0:
+        errors.append("LOT_SIZE must be greater than 0")
+    if LOT_SIZE > MAX_LOT_SIZE:
+        errors.append(f"LOT_SIZE ({LOT_SIZE}) is above MAX_LOT_SIZE ({MAX_LOT_SIZE})")
     if MAX_OPEN_POSITIONS < 1:
         errors.append("MAX_OPEN_POSITIONS must be at least 1")
-    if SL_POINTS_MIN > SL_POINTS_MAX:
-        errors.append("SL_POINTS_MIN must be <= SL_POINTS_MAX")
+    if MAX_PENDING_ORDERS < 1:
+        errors.append("MAX_PENDING_ORDERS must be at least 1")
     if POLL_SECONDS <= 0:
         errors.append("POLL_SECONDS must be greater than 0")
-    if not 0 < PARTIAL_CLOSE_FRACTION <= 1:
-        errors.append("PARTIAL_CLOSE_FRACTION must be between 0 and 1")
-    if TP_MODE not in ("1_pip", "2_pips", "3_pips", "4_pips", "5_pips", "custom_rr"):
-        errors.append(
-            "TP_MODE must be one of 1_pip, 2_pips, 3_pips, 4_pips, 5_pips, custom_rr"
-        )
-    if CUSTOM_RR <= 0:
-        errors.append("CUSTOM_RR must be greater than 0")
-    if MIN_RR < 0:
-        errors.append("MIN_RR cannot be negative")
-    if SL_MODE not in ("structural", "fixed"):
-        errors.append("SL_MODE must be 'structural' or 'fixed'")
-    if PIP_POINTS < 0:
-        errors.append("PIP_POINTS cannot be negative")
-    if ACCOUNT_SNAPSHOT_INTERVAL < 30:
+    if ROLL_MODE not in ("extend", "static"):
+        errors.append("ROLL_MODE must be 'extend' or 'static'")
+    if DIRECTION_FILTER not in ("off", "both", "buy_bias", "sell_bias", "none"):
+        errors.append("DIRECTION_FILTER must be off, both, buy_bias, sell_bias or none")
+
+    if MAX_SPREAD <= 0:
+        warnings.append("MAX_SPREAD is 0 - the spread filter is disabled")
+    if MAX_DAILY_LOSS <= 0:
+        warnings.append("MAX_DAILY_LOSS is 0 - the daily loss guard is disabled")
+    if PROFIT_CYCLE_TARGET <= 0 and CYCLE_TAKE_PROFIT_MONEY <= 0:
         warnings.append(
-            "ACCOUNT_SNAPSHOT_INTERVAL below 30s will grow account_snapshots.csv quickly"
+            "PROFIT_CYCLE_TARGET and CYCLE_TAKE_PROFIT_MONEY are both 0 - "
+            "cycles will only end on a loss limit"
         )
 
     if not TELEGRAM_BOT_TOKEN:
@@ -326,17 +355,19 @@ def validate():
 
 
 def strategy_summary():
-    """Human readable strategy configuration. Never contains secrets."""
+    """Human readable configuration. Never contains secrets."""
     return {
         "Symbol": SYMBOL,
-        "Risk/Trade": f"{RISK_PERCENT}%" if USE_RISK_PERCENT else f"{FIXED_LOT} lots",
+        "Timeframe": TIMEFRAME,
+        "Mode": TRADING_MODE,
+        "Spacing": LADDER_SPACING,
+        "Depth": LADDER_DEPTH,
+        "TP": TP_DISTANCE if TP_MODE == "distance" else TP_MODE,
+        "Lot": LOT_SIZE,
+        "Cycle Target": PROFIT_CYCLE_TARGET,
         "Max Positions": MAX_OPEN_POSITIONS,
-        "SL Points": f"{SL_POINTS_MIN}-{SL_POINTS_MAX}",
-        "RR": RR,
-        "TP Mode": TP_MODE,
-        "Min RR": MIN_RR,
-        "Breakeven At": f"{MOVE_TO_BREAKEVEN_AT_R}R",
-        "Partial At": f"{PARTIAL_CLOSE_AT_R}R ({PARTIAL_CLOSE_FRACTION:.0%})",
+        "Max Pendings": MAX_PENDING_ORDERS,
+        "Max Spread": MAX_SPREAD,
         "Magic": MAGIC,
         "Poll": f"{POLL_SECONDS}s",
     }

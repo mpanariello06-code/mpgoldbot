@@ -5,6 +5,8 @@
 data/
 *.csv
 runtime_settings.json
+ladder_state.json
+paper_state.json
 
 # Python
 __pycache__/

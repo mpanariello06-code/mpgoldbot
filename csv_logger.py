@@ -35,15 +35,12 @@ TRADE_HEADER = [
     "magic",
     "reason",
     "deal_id",
-    # execution-layer settings actually used for the trade (for later analysis)
+    # ladder context for later analysis
+    "cycle_id",
+    "level",
     "tp_mode",
     "tp_distance",
-    "sl_distance",
-    "rr",
-    "risk_mode",
-    "risk_percent",
-    "fixed_lot",
-    "min_rr",
+    "spread",
 ]
 
 EVENT_HEADER = [
@@ -53,6 +50,27 @@ EVENT_HEADER = [
     "symbol",
     "ticket",
     "status",
+]
+
+LADDER_HEADER = [
+    "timestamp",
+    "cycle_id",
+    "ladder_id",
+    "symbol",
+    "direction",
+    "level",
+    "entry_price",
+    "exit_price",
+    "tp",
+    "sl_if_used",
+    "lot_size",
+    "spread",
+    "order_ticket",
+    "position_ticket",
+    "event",
+    "profit",
+    "cycle_profit",
+    "daily_profit",
 ]
 
 ACCOUNT_HEADER = [
@@ -83,11 +101,13 @@ def _fmt(value, digits=None):
 
 
 class CsvLogger:
-    def __init__(self, data_dir, trade_file, event_file, account_file):
+    def __init__(self, data_dir, trade_file, event_file, account_file,
+                 ladder_file="ladder.csv"):
         self.dir = Path(data_dir)
         self.trade_path = self.dir / trade_file
         self.event_path = self.dir / event_file
         self.account_path = self.dir / account_file
+        self.ladder_path = self.dir / ladder_file
 
         self._lock = threading.Lock()
         # Keys of trade rows already written -> prevents duplicates across restarts
@@ -101,6 +121,7 @@ class CsvLogger:
         self._ensure_file(self.trade_path, TRADE_HEADER)
         self._ensure_file(self.event_path, EVENT_HEADER)
         self._ensure_file(self.account_path, ACCOUNT_HEADER)
+        self._ensure_file(self.ladder_path, LADDER_HEADER)
         self._load_trade_keys()
 
     @staticmethod
@@ -196,9 +217,8 @@ class CsvLogger:
     def log_trade(self, symbol, ticket, direction, volume, reason,
                   entry_price=None, stop_loss=None, take_profit=None,
                   close_price=None, profit=None, commission=None, swap=None,
-                  magic=None, deal_id=None, digits=2, tp_mode=None,
-                  tp_distance=None, sl_distance=None, rr=None, risk_mode=None,
-                  risk_percent=None, fixed_lot=None, min_rr=None):
+                  magic=None, deal_id=None, digits=2, cycle_id=None, level=None,
+                  tp_mode=None, tp_distance=None, spread=None):
         """
         Append a trade row, skipping anything already recorded.
 
@@ -226,14 +246,11 @@ class CsvLogger:
                     _fmt(magic),
                     _fmt(reason),
                     _fmt(deal_id),
+                    _fmt(cycle_id),
+                    _fmt(level),
                     _fmt(tp_mode),
                     _fmt(tp_distance, digits),
-                    _fmt(sl_distance, digits),
-                    _fmt(rr, 3),
-                    _fmt(risk_mode),
-                    _fmt(risk_percent),
-                    _fmt(fixed_lot),
-                    _fmt(min_rr),
+                    _fmt(spread, digits),
                 ]
                 with open(self.trade_path, "a", newline="", encoding="utf-8") as fh:
                     csv.writer(fh).writerow(row)
@@ -250,6 +267,76 @@ class CsvLogger:
             return False
         with self._lock:
             return key in self._trade_keys
+
+    # ------------------------------------------------------------ ladder log
+    def log_ladder(self, event, cycle_id="", ladder_id="", symbol="", direction="",
+                   level="", entry_price=None, exit_price=None, tp=None,
+                   sl_if_used=None, lot_size=None, spread=None, order_ticket="",
+                   position_ticket="", profit=None, cycle_profit=None,
+                   daily_profit=None, digits=2):
+        """One row per ladder event (see LADDER_HEADER)."""
+        try:
+            self._append(self.ladder_path, [
+                _now(),
+                _fmt(cycle_id),
+                _fmt(ladder_id),
+                _fmt(symbol),
+                _fmt(direction),
+                _fmt(level),
+                _fmt(entry_price, digits),
+                _fmt(exit_price, digits),
+                _fmt(tp, digits),
+                _fmt(sl_if_used, digits),
+                _fmt(lot_size),
+                _fmt(spread, digits),
+                _fmt(order_ticket),
+                _fmt(position_ticket),
+                _fmt(event),
+                _fmt(profit, 2),
+                _fmt(cycle_profit, 2),
+                _fmt(daily_profit, 2),
+            ])
+        except Exception as exc:
+            print(f"[csv_logger] ladder write failed: {exc}")
+
+    def ladder_stats(self, day=None):
+        """Today's ladder activity, straight from ladder.csv."""
+        day = day or datetime.now().strftime("%Y-%m-%d")
+        counts = {}
+        realized = 0.0
+        cycles = set()
+        with self._lock:
+            try:
+                with open(self.ladder_path, "r", newline="", encoding="utf-8") as fh:
+                    rows = list(csv.DictReader(fh))
+            except FileNotFoundError:
+                return {"available": False, "error": "ladder.csv missing"}
+            except Exception as exc:
+                return {"available": False, "error": str(exc)}
+        for row in rows:
+            if not (row.get("timestamp") or "").startswith(day):
+                continue
+            event = (row.get("event") or "").upper()
+            counts[event] = counts.get(event, 0) + 1
+            if row.get("cycle_id"):
+                cycles.add(row["cycle_id"])
+            if event in ("TP_HIT", "SL_HIT", "POSITION_CLOSED"):
+                try:
+                    realized += float(row.get("profit") or 0.0)
+                except ValueError:
+                    pass
+        return {
+            "available": True,
+            "day": day,
+            "events": counts,
+            "tp_hits": counts.get("TP_HIT", 0),
+            "sl_hits": counts.get("SL_HIT", 0),
+            "entries": counts.get("ORDER_TRIGGERED", 0),
+            "orders_placed": counts.get("ORDER_PLACED", 0),
+            "cycles_completed": counts.get("CYCLE_COMPLETED", 0),
+            "cycles_seen": len(cycles),
+            "realized": realized,
+        }
 
     # ------------------------------------------------------- account snapshot
     def log_account(self, balance, equity, margin, free_margin, margin_level,
@@ -295,7 +382,7 @@ class CsvLogger:
         closed = 0
         wins = 0
         losses = 0
-        breakeven = 0
+        flat = 0
         realized = 0.0
 
         for row in rows:
@@ -306,7 +393,7 @@ class CsvLogger:
             if reason == "OPEN":
                 opened += 1
                 continue
-            if reason not in ("CLOSE", "PARTIAL_CLOSE"):
+            if reason != "CLOSE":
                 continue
             closed += 1
             try:
@@ -321,7 +408,7 @@ class CsvLogger:
             elif pl < 0:
                 losses += 1
             else:
-                breakeven += 1
+                flat += 1
 
         win_rate = (wins / closed * 100.0) if closed else None
         return {
@@ -331,7 +418,7 @@ class CsvLogger:
             "closed": closed,
             "wins": wins,
             "losses": losses,
-            "breakeven": breakeven,
+            "flat": flat,
             "win_rate": win_rate,
             "realized": realized,
         }

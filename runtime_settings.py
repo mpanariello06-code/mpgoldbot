@@ -5,9 +5,9 @@ Telegram-controlled settings live here (and in DATA_DIRECTORY/runtime_settings.j
 so they survive a restart. Secrets never enter this file - MT5 credentials and
 the Telegram token stay in .env.
 
-The trading engine takes a consistent snapshot() before processing a cycle, so
-a Telegram change that lands mid-calculation can never produce a half-updated
-configuration for an order.
+The ladder engine takes a consistent snapshot() at the start of every
+reconciliation pass, so a Telegram change landing mid-pass can never produce a
+half-updated ladder.
 """
 
 import json
@@ -16,24 +16,27 @@ import threading
 from pathlib import Path
 
 # --- allowed values -------------------------------------------------------
-TP_MODES = ("1_pip", "2_pips", "3_pips", "4_pips", "5_pips", "custom_rr")
-LOT_MODES = ("risk_percent", "fixed_lot")
-SL_MODES = ("structural", "fixed")
+TP_MODES = ("distance", "1_pip", "2_pips", "3_pips", "4_pips", "5_pips")
+ROLL_MODES = ("extend", "static")
+DIRECTION_MODES = ("off", "both", "buy_bias", "sell_bias", "none")
+TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1")
 
 TP_MODE_LABELS = {
+    "distance": "DISTANCE",
     "1_pip": "1 PIP",
     "2_pips": "2 PIPS",
     "3_pips": "3 PIPS",
     "4_pips": "4 PIPS",
     "5_pips": "5 PIPS",
-    "custom_rr": "CUSTOM RR",
 }
-LOT_MODE_LABELS = {"risk_percent": "RISK %", "fixed_lot": "FIXED LOT"}
-SL_MODE_LABELS = {"structural": "STRUCTURAL", "fixed": "FIXED"}
-
-# How many pips each TP mode targets
-TP_MODE_PIPS = {"1_pip": 1.0, "2_pips": 2.0, "3_pips": 3.0, "4_pips": 4.0,
-                "5_pips": 5.0}
+ROLL_MODE_LABELS = {"extend": "ROLLING", "static": "STATIC GRID"}
+DIRECTION_LABELS = {
+    "off": "OFF (both sides)",
+    "both": "BOTH",
+    "buy_bias": "BUY ONLY",
+    "sell_bias": "SELL ONLY",
+    "none": "NO NEW ENTRIES",
+}
 
 
 class SettingError(ValueError):
@@ -59,6 +62,13 @@ def _choice(value, options, name):
     return value
 
 
+def _upper_choice(value, options, name):
+    value = str(value).strip().upper()
+    if value not in options:
+        raise SettingError(f"{name}: must be one of {', '.join(options)}")
+    return value
+
+
 def _flag(value, name):
     if isinstance(value, bool):
         return value
@@ -72,25 +82,43 @@ def _flag(value, name):
 
 # key -> (validator, human label, needs confirmation before applying)
 VALIDATORS = {
-    "tp_mode":               (lambda v: _choice(v, TP_MODES, "TP mode"), "TP Mode", True),
-    "custom_rr":             (lambda v: _num(v, float, "Custom RR", 0.1, 20.0), "Custom RR", True),
-    "min_rr":                (lambda v: _num(v, float, "Minimum RR", 0.0, 20.0), "Minimum RR", True),
-    "lot_mode":              (lambda v: _choice(v, LOT_MODES, "Lot mode"), "Lot Mode", True),
-    "risk_percent":          (lambda v: _num(v, float, "Risk percent", 0.01, 10.0), "Risk %", True),
-    "fixed_lot":             (lambda v: _num(v, float, "Fixed lot", 0.01, 100.0), "Fixed Lot", True),
-    "max_open_positions":    (lambda v: _num(v, int, "Max positions", 1, 20), "Max Positions", True),
-    "sl_mode":               (lambda v: _choice(v, SL_MODES, "SL mode"), "SL Mode", True),
-    "sl_points_min":         (lambda v: _num(v, int, "SL min", 10, 100000), "SL Min", True),
-    "sl_points_max":         (lambda v: _num(v, int, "SL max", 10, 100000), "SL Max", True),
-    "sl_fixed_points":       (lambda v: _num(v, int, "Fixed SL", 10, 100000), "Fixed SL", True),
-    "breakeven_enabled":     (lambda v: _flag(v, "Breakeven"), "Breakeven", False),
-    "breakeven_r":           (lambda v: _num(v, float, "Breakeven trigger", 0.05, 10.0), "BE Trigger", False),
-    "partial_close_enabled": (lambda v: _flag(v, "Partial close"), "Partial Close", False),
-    "partial_close_r":       (lambda v: _num(v, float, "Partial trigger", 0.05, 20.0), "Partial Trigger", False),
-    "partial_close_fraction": (lambda v: _num(v, float, "Partial fraction", 0.01, 0.95), "Partial Fraction", False),
-    "max_spread_points":     (lambda v: _num(v, int, "Max spread", 1, 100000), "Max Spread", False),
-    "pip_points":            (lambda v: _num(v, int, "Pip size", 0, 10000), "Pip Size", False),
+    # --- ladder ---
+    "ladder_spacing":      (lambda v: _num(v, float, "Ladder spacing", 0.01, 1000.0), "Spacing", True),
+    "ladder_depth":        (lambda v: _num(v, int, "Ladder depth", 1, 50), "Depth", True),
+    "first_level_offset":  (lambda v: _num(v, float, "First level offset", 0.0, 1000.0), "First Level Offset", False),
+    "roll_mode":           (lambda v: _choice(v, ROLL_MODES, "Roll mode"), "Roll Mode", True),
+    "rearm_levels":        (lambda v: _flag(v, "Re-arm levels"), "Re-arm Levels", False),
+    # --- take profit ---
+    "tp_mode":             (lambda v: _choice(v, TP_MODES, "TP mode"), "TP Mode", True),
+    "tp_distance":         (lambda v: _num(v, float, "TP distance", 0.01, 1000.0), "TP Distance", True),
+    "stop_loss_distance":  (lambda v: _num(v, float, "Stop loss distance", 0.0, 10000.0), "Stop Loss", True),
+    "pip_points":          (lambda v: _num(v, int, "Pip size", 0, 10000), "Pip Size", False),
+    # --- cycle ---
+    "profit_cycle_target": (lambda v: _num(v, int, "Profit cycle target", 0, 100), "Profit Cycle", True),
+    "cycle_close_positions": (lambda v: _flag(v, "Close positions on cycle end"), "Close On Cycle End", True),
+    "cycle_take_profit_money": (lambda v: _num(v, float, "Cycle basket target", 0.0, 1e6), "Cycle Basket TP", False),
+    # --- risk ---
+    "lot_size":            (lambda v: _num(v, float, "Lot size", 0.001, 100.0), "Lot Size", True),
+    "max_lot_size":        (lambda v: _num(v, float, "Max lot size", 0.001, 100.0), "Max Lot", True),
+    "max_open_positions":  (lambda v: _num(v, int, "Max open positions", 1, 200), "Max Open", True),
+    "max_pending_orders":  (lambda v: _num(v, int, "Max pending orders", 1, 200), "Max Pending", True),
+    "max_spread":          (lambda v: _num(v, float, "Max spread", 0.0, 100.0), "Max Spread", False),
+    "max_slippage":        (lambda v: _num(v, int, "Max slippage", 0, 10000), "Max Slippage", False),
+    "max_daily_loss":      (lambda v: _num(v, float, "Max daily loss", 0.0, 1e6), "Daily Loss", True),
+    "max_cycle_loss":      (lambda v: _num(v, float, "Max cycle loss", 0.0, 1e6), "Cycle Loss", True),
+    "max_consecutive_losing_cycles": (lambda v: _num(v, int, "Max losing cycles", 0, 100), "Losing Cycles", False),
+    "cooldown_after_loss_minutes": (lambda v: _num(v, float, "Cooldown after loss", 0.0, 1440.0), "Cooldown", False),
+    # --- hygiene ---
+    "order_max_age_seconds": (lambda v: _num(v, float, "Order max age", 0.0, 86400.0), "Order Max Age", False),
+    "m5_candle_reset":     (lambda v: _flag(v, "Candle reset"), "Candle Reset", False),
+    # --- context / direction ---
+    "timeframe":           (lambda v: _upper_choice(v, TIMEFRAMES, "Timeframe"), "Timeframe", False),
+    "direction_filter":    (lambda v: _choice(v, DIRECTION_MODES, "Direction filter"), "Direction", True),
 }
+
+PRICE_KEYS = ("ladder_spacing", "tp_distance", "first_level_offset",
+              "stop_loss_distance", "max_spread")
+MONEY_KEYS = ("max_daily_loss", "max_cycle_loss", "cycle_take_profit_money")
 
 
 class RuntimeSettings:
@@ -150,13 +178,13 @@ class RuntimeSettings:
     def _repair(self):
         """Keep cross-field invariants true (caller holds the lock)."""
         problems = []
-        if self._values["sl_points_min"] >= self._values["sl_points_max"]:
+        if self._values["lot_size"] > self._values["max_lot_size"]:
             problems.append(
-                f"SL min ({self._values['sl_points_min']}) >= SL max "
-                f"({self._values['sl_points_max']}) - restored defaults"
+                f"lot_size ({self._values['lot_size']}) above max_lot_size "
+                f"({self._values['max_lot_size']}) - restored defaults"
             )
-            self._values["sl_points_min"] = self._defaults["sl_points_min"]
-            self._values["sl_points_max"] = self._defaults["sl_points_max"]
+            self._values["lot_size"] = self._defaults["lot_size"]
+            self._values["max_lot_size"] = self._defaults["max_lot_size"]
         return problems
 
     # -------------------------------------------------------------- accessors
@@ -194,23 +222,22 @@ class RuntimeSettings:
         """Format a value the way the Telegram panel shows it."""
         if key == "tp_mode":
             return TP_MODE_LABELS.get(value, str(value))
-        if key == "lot_mode":
-            return LOT_MODE_LABELS.get(value, str(value))
-        if key == "sl_mode":
-            return SL_MODE_LABELS.get(value, str(value))
-        if key in ("breakeven_enabled", "partial_close_enabled"):
+        if key == "roll_mode":
+            return ROLL_MODE_LABELS.get(value, str(value))
+        if key == "direction_filter":
+            return DIRECTION_LABELS.get(value, str(value))
+        if isinstance(value, bool):
             return "ON" if value else "OFF"
-        if key == "partial_close_fraction":
-            return f"{float(value) * 100:.0f}%"
-        if key == "risk_percent":
-            return f"{value}%"
-        if key in ("min_rr", "custom_rr", "breakeven_r", "partial_close_r"):
-            return f"{float(value)}R"
-        if key in ("sl_points_min", "sl_points_max", "sl_fixed_points",
-                   "max_spread_points"):
-            return f"{value} pts"
+        if key in PRICE_KEYS:
+            return "OFF" if not value else f"{float(value):g}"
+        if key in MONEY_KEYS:
+            return "OFF" if not value else f"${float(value):,.2f}"
         if key == "pip_points":
             return "AUTO" if not value else f"{value} pts"
+        if key == "cooldown_after_loss_minutes":
+            return "OFF" if not value else f"{float(value):g} min"
+        if key == "order_max_age_seconds":
+            return "OFF" if not value else f"{float(value):g}s"
         return str(value)
 
     # ---------------------------------------------------------------- mutation
@@ -223,15 +250,15 @@ class RuntimeSettings:
         """
         new = self.coerce(key, value)
         with self._lock:
-            if key == "sl_points_min" and new >= self._values["sl_points_max"]:
+            if key == "lot_size" and new > self._values["max_lot_size"]:
                 raise SettingError(
-                    f"SL min ({new}) must be below SL max "
-                    f"({self._values['sl_points_max']})"
+                    f"Lot size ({new}) must not exceed MAX LOT "
+                    f"({self._values['max_lot_size']})"
                 )
-            if key == "sl_points_max" and new <= self._values["sl_points_min"]:
+            if key == "max_lot_size" and new < self._values["lot_size"]:
                 raise SettingError(
-                    f"SL max ({new}) must be above SL min "
-                    f"({self._values['sl_points_min']})"
+                    f"Max lot ({new}) must not be below the lot size "
+                    f"({self._values['lot_size']})"
                 )
         return new
 
