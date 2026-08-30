@@ -16,12 +16,13 @@ import threading
 from pathlib import Path
 
 # --- allowed values -------------------------------------------------------
-TP_MODES = ("distance", "1_pip", "2_pips", "3_pips", "4_pips", "5_pips")
+TP_MODES = ("levels", "distance", "1_pip", "2_pips", "3_pips", "4_pips", "5_pips")
 ROLL_MODES = ("extend", "static")
 DIRECTION_MODES = ("off", "both", "buy_bias", "sell_bias", "none")
 TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1")
 
 TP_MODE_LABELS = {
+    "levels": "LEVELS",
     "distance": "DISTANCE",
     "1_pip": "1 PIP",
     "2_pips": "2 PIPS",
@@ -90,22 +91,22 @@ VALIDATORS = {
     "rearm_levels":        (lambda v: _flag(v, "Re-arm levels"), "Re-arm Levels", False),
     # --- take profit ---
     "tp_mode":             (lambda v: _choice(v, TP_MODES, "TP mode"), "TP Mode", True),
+    "tp_levels":           (lambda v: _num(v, int, "TP levels", 1, 20), "TP Levels", True),
     "tp_distance":         (lambda v: _num(v, float, "TP distance", 0.01, 1000.0), "TP Distance", True),
     "stop_loss_distance":  (lambda v: _num(v, float, "Stop loss distance", 0.0, 10000.0), "Stop Loss", True),
     "pip_points":          (lambda v: _num(v, int, "Pip size", 0, 10000), "Pip Size", False),
     # --- cycle ---
-    "profit_cycle_target": (lambda v: _num(v, int, "Profit cycle target", 0, 100), "Profit Cycle", True),
     "cycle_close_positions": (lambda v: _flag(v, "Close positions on cycle end"), "Close On Cycle End", True),
-    "cycle_take_profit_money": (lambda v: _num(v, float, "Cycle basket target", 0.0, 1e6), "Cycle Basket TP", False),
     # --- risk ---
     "lot_size":            (lambda v: _num(v, float, "Lot size", 0.001, 100.0), "Lot Size", True),
     "max_lot_size":        (lambda v: _num(v, float, "Max lot size", 0.001, 100.0), "Max Lot", True),
     "max_open_positions":  (lambda v: _num(v, int, "Max open positions", 1, 200), "Max Open", True),
     "max_pending_orders":  (lambda v: _num(v, int, "Max pending orders", 1, 200), "Max Pending", True),
+    "max_ladder_depth":    (lambda v: _num(v, int, "Max ladder depth", 1, 200), "Max Depth", True),
     "max_spread":          (lambda v: _num(v, float, "Max spread", 0.0, 100.0), "Max Spread", False),
     "max_slippage":        (lambda v: _num(v, int, "Max slippage", 0, 10000), "Max Slippage", False),
-    "max_daily_loss":      (lambda v: _num(v, float, "Max daily loss", 0.0, 1e6), "Daily Loss", True),
-    "max_cycle_loss":      (lambda v: _num(v, float, "Max cycle loss", 0.0, 1e6), "Cycle Loss", True),
+    "max_daily_drawdown":  (lambda v: _num(v, float, "Max daily drawdown", 0.0, 1e6), "Daily Drawdown", True),
+    "max_cycle_drawdown":  (lambda v: _num(v, float, "Max cycle drawdown", 0.0, 1e6), "Cycle Drawdown", True),
     "max_consecutive_losing_cycles": (lambda v: _num(v, int, "Max losing cycles", 0, 100), "Losing Cycles", False),
     "cooldown_after_loss_minutes": (lambda v: _num(v, float, "Cooldown after loss", 0.0, 1440.0), "Cooldown", False),
     # --- hygiene ---
@@ -114,11 +115,29 @@ VALIDATORS = {
     # --- context / direction ---
     "timeframe":           (lambda v: _upper_choice(v, TIMEFRAMES, "Timeframe"), "Timeframe", False),
     "direction_filter":    (lambda v: _choice(v, DIRECTION_MODES, "Direction filter"), "Direction", True),
+
+    # --- adaptive exit engine (all fittable against historical data) ---
+    "exit_threshold_exit":    (lambda v: _num(v, float, "Exit threshold", 1.0, 100.0), "Exit Score", True),
+    "exit_threshold_monitor": (lambda v: _num(v, float, "Monitor threshold", 0.0, 99.0), "Monitor Score", False),
+    "exit_w_reversal":     (lambda v: _num(v, float, "Reversal weight", 0.0, 3.0), "Reversal Weight", False),
+    "exit_w_exhaustion":   (lambda v: _num(v, float, "Exhaustion weight", 0.0, 3.0), "Exhaustion Weight", False),
+    "exit_w_continuation": (lambda v: _num(v, float, "Continuation weight", 0.0, 3.0), "Continuation Weight", False),
+    "exit_w_depth":        (lambda v: _num(v, float, "Depth weight", 0.0, 3.0), "Depth Weight", False),
+    "exit_w_drawdown":     (lambda v: _num(v, float, "Drawdown weight", 0.0, 3.0), "Drawdown Weight", False),
+    "exit_w_harvest":      (lambda v: _num(v, float, "Harvest weight", 0.0, 3.0), "Harvest Weight", False),
+    "exit_w_loss_hold":    (lambda v: _num(v, float, "Loss hold weight", 0.0, 3.0), "Loss Hold Weight", False),
+    "exit_recent_window":  (lambda v: _num(v, int, "Recent window", 1, 50), "Recent Window", False),
+    "exit_progress_intervals": (lambda v: _num(v, int, "Progress intervals", 1, 20), "Progress Intervals", False),
+    "exit_consecutive_norm": (lambda v: _num(v, float, "Consecutive norm", 1.0, 50.0), "Consecutive Norm", False),
+    "exit_depth_norm":     (lambda v: _num(v, float, "Depth norm", 1.0, 50.0), "Depth Norm", False),
+    "exit_gap_reference":  (lambda v: _num(v, float, "Gap reference", 1.0, 3600.0), "Gap Reference", False),
+    "exit_min_triggers_for_exhaustion": (lambda v: _num(v, int, "Min triggers (exhaustion)", 1, 50), "Min Exhaustion Triggers", False),
+    "exit_min_triggers_for_reversal": (lambda v: _num(v, int, "Min triggers (reversal)", 1, 50), "Min Reversal Triggers", False),
 }
 
 PRICE_KEYS = ("ladder_spacing", "tp_distance", "first_level_offset",
               "stop_loss_distance", "max_spread")
-MONEY_KEYS = ("max_daily_loss", "max_cycle_loss", "cycle_take_profit_money")
+MONEY_KEYS = ("max_daily_drawdown", "max_cycle_drawdown")
 
 
 class RuntimeSettings:
@@ -259,6 +278,18 @@ class RuntimeSettings:
                 raise SettingError(
                     f"Max lot ({new}) must not be below the lot size "
                     f"({self._values['lot_size']})"
+                )
+            if key == "exit_threshold_exit" and \
+                    new <= self._values["exit_threshold_monitor"]:
+                raise SettingError(
+                    f"Exit score ({new:g}) must be above the monitor score "
+                    f"({self._values['exit_threshold_monitor']:g})"
+                )
+            if key == "exit_threshold_monitor" and \
+                    new >= self._values["exit_threshold_exit"]:
+                raise SettingError(
+                    f"Monitor score ({new:g}) must be below the exit score "
+                    f"({self._values['exit_threshold_exit']:g})"
                 )
         return new
 

@@ -66,20 +66,31 @@ class FakeEngine:
         if self.explode:
             raise RuntimeError("mt5 exploded")
         snap = S.snapshot()
-        return {"state": self.state_name, "icon": "🟢",
-                "paused": self.state_name == "PAUSED", "symbol": "XAUUSD",
-                "mt5_connected": True, "account": mt5.account_info(),
-                "mode": "PAPER", "engine_state": "LADDER_ACTIVE",
-                "timeframe": snap["timeframe"], "bid": 4010.06, "ask": 4010.14,
-                "spread": 0.08, "spacing": snap["ladder_spacing"],
-                "depth": snap["ladder_depth"], "tp_distance": snap["tp_distance"],
-                "tp_mode": snap["tp_mode"], "lot": snap["lot_size"],
-                "positions": 1, "orders": 9, "cycle_id": 127, "tp_count": 3,
-                "cycle_target": snap["profit_cycle_target"], "cycle_profit": 1.36,
-                "daily_profit": 2.10, "total_tp": 12, "total_trades": 15,
-                "anchor": 4010.04, "block_reason": "", "spread_blocked": False,
-                "losing_streak": 0, "last_update": datetime.now(),
-                "uptime": "1h 2m", "error": "", "last_loop_at": None}
+        return {
+            "lifecycle": self.state_name, "icon": "🟢",
+            "paused": self.state_name == "PAUSED", "symbol": "XAUUSD",
+            "mt5_connected": True, "account": mt5.account_info(), "mode": "PAPER",
+            "engine_state": "LADDER_ACTIVE", "timeframe": snap["timeframe"],
+            "bid": 4010.06, "ask": 4010.14, "spread": 0.08,
+            "spacing": snap["ladder_spacing"], "depth": snap["ladder_depth"],
+            "tp_distance": snap["tp_levels"] * snap["ladder_spacing"],
+            "tp_mode": snap["tp_mode"], "lot": snap["lot_size"],
+            "positions": 5, "orders": 6, "cycle_id": 183, "tp_count": 3,
+            "cycle_profit": 1.36, "daily_profit": 2.10, "total_tp": 12,
+            "total_trades": 15, "anchor": 4010.04, "block_reason": "",
+            "spread_blocked": False, "losing_streak": 0,
+            "last_update": datetime.now(), "uptime": "1h 2m", "error": "",
+            "last_loop_at": None, "settings": snap,
+            # sequence + exit engine
+            "buy_triggers": 2, "sell_triggers": 5, "last_side": "SELL",
+            "previous_side": "BUY", "imbalance": 2.5, "direction_changes": 1,
+            "ladder_depth_used": 5, "basket_drawdown": 0.42,
+            "efficiency": 0.62, "state": "REVERSAL_DETECTED",
+            "decision": "EXIT", "exit_score": 81.0, "momentum_score": 0.72,
+            "continuation_score": 0.0, "reversal_score": 0.78,
+            "exhaustion_score": 0.31,
+            "reason": "reversal: 2B/5S imbalance 2.50x eff 0.62",
+        }
 
     def account(self):
         self._rec("account"); return mt5.account_info()
@@ -176,7 +187,8 @@ async def run():
             data == ["start", "pause", "resume", "stop", "status", "account",
                      "positions", "stats", "ladder", "settings", "refresh"],
             str(data))
-    t.check("panel shows the cycle", "Cycle #127" in text)
+    t.check("panel shows the cycle", "Cycle #183" in text)
+    t.check("panel shows the sequence", "2B/5S" in text)
     t.check("panel shows the mode", "[PAPER]" in text)
 
     t.section("LIFECYCLE BUTTONS")
@@ -189,13 +201,18 @@ async def run():
     t.check("stop reports the cancelled pendings",
             "pending orders cancelled" in (await press("stop"))[0])
 
-    t.section("STATUS SCREEN")
+    t.section("STATUS SCREEN (spec section 24)")
     text, _, _ = await press("status")
-    for label in ["Symbol: XAUUSD", "Timeframe", "Price:", "Spread:",
-                  "Ladder spacing", "TP:", "Lot:", "Open positions: 1",
-                  "Pending orders: 9", "Cycle: #127", "Successful TPs: 3/4",
-                  "Cycle P/L", "Daily P/L", "Last ladder update"]:
-        t.check(f"status shows {label!r}", label in text)
+    for label in ["ROLLING LADDER SCALPER", "Symbol: XAUUSD", "Timeframe: M5",
+                  "Ladder spacing: 0.3", "Cycle: #183", "BUY triggers: 2",
+                  "SELL triggers: 5", "Last direction: SELL",
+                  "Directional imbalance: 2.50x", "Open positions: 5",
+                  "Pending orders: 6", "Basket P/L", "Basket drawdown",
+                  "Momentum: STRONG", "Reversal: DETECTED", "Exit score: 81",
+                  "State: REVERSAL DETECTED", "Last ladder update"]:
+        t.check(f"status shows {label!r}", label in text,
+                "" if label in text else text.replace("\n", " | ")[:200])
+    t.check("status explains the decision", "Why: reversal" in text)
     t.check("status never leaks the token", "TESTTOKEN" not in text)
 
     t.section("LADDER VIEW")
@@ -204,7 +221,7 @@ async def run():
     t.check("ladder view lists SELL STOPS", "SELL STOPS" in text and "4009.44" in text)
     t.check("ladder view marks the market price", "price 4010.06" in text)
     t.check("ladder view shows open positions", "OPEN" in text and "4010.64" in text)
-    t.check("ladder view names the cycle", "Cycle #127" in text)
+    t.check("ladder view names the cycle", "Cycle #183" in text)
 
     t.section("ACCOUNT / POSITIONS / STATS")
     text, _, _ = await press("account")
@@ -228,7 +245,8 @@ async def run():
     menus = ["settings", "settings_tp", "settings_sl", "settings_pip", "settings_lot",
              "settings_maxlot", "settings_ladder", "settings_spacing",
              "settings_depth", "settings_offset", "settings_roll", "settings_cycle",
-             "settings_basket", "settings_risk", "settings_open", "settings_pending",
+             "settings_exit", "settings_exitweights", "settings_maxdepth",
+             "settings_risk", "settings_open", "settings_pending",
              "settings_spread", "settings_daily", "settings_cycleloss",
              "settings_streak", "settings_cooldown", "settings_age",
              "settings_direction"]
@@ -257,8 +275,8 @@ async def run():
 
     t.section("SETTINGS SCREEN CONTENT")
     text, _ = panel.render("settings", 111)
-    for label in ["TP:", "Spacing:", "Depth:", "Lot:", "Profit cycle:",
-                  "Max open:", "Max spread:", "Daily loss:", "Direction:"]:
+    for label in ["TP:", "Spacing:", "Depth:", "Lot:", "Exit at score:",
+                  "Max open:", "Max spread:", "Daily drawdown:", "Direction:"]:
         t.check(f"settings screen shows {label!r}", label in text)
     t.check("pip size resolved from the live symbol", "1 pip = 0.01" in text,
             [l for l in text.splitlines() if "pip" in l])
@@ -280,7 +298,8 @@ async def run():
                           ("confirm:lot_size:0.02", "lot_size", 0.02),
                           ("confirm:ladder_depth:8", "ladder_depth", 8),
                           ("confirm:max_open_positions:2", "max_open_positions", 2),
-                          ("confirm:profit_cycle_target:6", "profit_cycle_target", 6),
+                          ("confirm:tp_levels:2", "tp_levels", 2),
+                          ("confirm:exit_threshold_exit:60", "exit_threshold_exit", 60.0),
                           ("confirm:direction_filter:buy_bias", "direction_filter",
                            "buy_bias")]:
         before = S.get(key)
@@ -329,7 +348,7 @@ async def run():
     t.check("cancel clears the pending prompt", panel.awaiting_input(111) is None)
 
     t.section("TYPED VALUES THROUGH THE CONTROLLER")
-    panel.render("custom:max_daily_loss", 111)
+    panel.render("custom:max_daily_drawdown", 111)
     u = upd(111, text="25")
     await tc.on_text(u, None)
     t.check("controller handles typed values",

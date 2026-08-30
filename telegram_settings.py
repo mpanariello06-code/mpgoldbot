@@ -48,24 +48,31 @@ class SettingsPanel:
     """Renders the settings menus and applies changes to RuntimeSettings."""
 
     KEY_MENU = {
-        "tp_mode": "tp", "tp_distance": "tp", "stop_loss_distance": "sl",
+        "tp_mode": "tp", "tp_levels": "tp", "tp_distance": "tp",
+        "stop_loss_distance": "sl",
         "pip_points": "pip",
         "lot_size": "lot", "max_lot_size": "maxlot",
         "ladder_spacing": "spacing", "ladder_depth": "depth",
         "first_level_offset": "offset", "roll_mode": "roll",
         "rearm_levels": "roll", "m5_candle_reset": "roll",
-        "profit_cycle_target": "cycle", "cycle_close_positions": "cycle",
-        "cycle_take_profit_money": "basket",
+        "cycle_close_positions": "cycle",
         "max_open_positions": "open", "max_pending_orders": "pending",
         "max_spread": "spread", "max_slippage": "risk",
-        "max_daily_loss": "daily", "max_cycle_loss": "cycleloss",
+        "max_ladder_depth": "maxdepth",
+        "max_daily_drawdown": "daily", "max_cycle_drawdown": "cycleloss",
         "max_consecutive_losing_cycles": "streak",
         "cooldown_after_loss_minutes": "cooldown",
         "order_max_age_seconds": "age",
         "direction_filter": "direction", "timeframe": "settings",
+        "exit_threshold_exit": "exit", "exit_threshold_monitor": "exit",
+        "exit_w_reversal": "exitweights", "exit_w_exhaustion": "exitweights",
+        "exit_w_continuation": "exitweights", "exit_w_depth": "exitweights",
+        "exit_w_drawdown": "exitweights", "exit_w_harvest": "exitweights",
+        "exit_w_loss_hold": "exitweights",
     }
 
     PROMPTS = {
+        "tp_levels": "Send the TP size in ladder levels (1 = the next rung).",
         "tp_distance": "Send the TP distance in price units (e.g. 0.30).",
         "stop_loss_distance": "Send the SL distance in price units (0 = no stop loss).",
         "pip_points": "Send how many points make 1 pip (0 = auto-detect).",
@@ -75,15 +82,24 @@ class SettingsPanel:
         "ladder_depth": "Send the number of levels per side (1 - 50).",
         "first_level_offset": "Send the distance from price to the first level "
                               "(price units). The broker minimum always wins.",
-        "profit_cycle_target": "Send how many successful TPs complete a cycle "
-                               "(0 = never).",
-        "cycle_take_profit_money": "Send the basket profit that closes the cycle "
-                                   "(account currency, 0 = off).",
+        "max_ladder_depth": "Send the maximum ladder depth used per cycle.",
+        "exit_threshold_exit": "Send the exit score that closes a cycle (1-100).",
+        "exit_threshold_monitor": "Send the score where the cycle moves to "
+                                  "MONITOR (below the exit score).",
+        "exit_w_reversal": "Weight for the reversal reading (0 removes it).",
+        "exit_w_exhaustion": "Weight for the exhaustion reading (0 removes it).",
+        "exit_w_continuation": "How strongly momentum holds a cycle open.",
+        "exit_w_depth": "Weight for how far the ladder has extended.",
+        "exit_w_drawdown": "Weight for give-back from the cycle peak.",
+        "exit_w_harvest": "How much banked profit sharpens an exit signal.",
+        "exit_w_loss_hold": "How strongly an open loss holds a cycle open.",
         "max_open_positions": "Send the maximum open positions (1 - 200).",
         "max_pending_orders": "Send the maximum pending orders (1 - 200).",
         "max_spread": "Send the maximum spread in price units (e.g. 0.50, 0 = off).",
-        "max_daily_loss": "Send the daily loss limit in account currency (0 = off).",
-        "max_cycle_loss": "Send the cycle loss limit in account currency (0 = off).",
+        "max_daily_drawdown": "Send the daily drawdown limit in account currency "
+                              "(0 = off).",
+        "max_cycle_drawdown": "Send the cycle drawdown limit in account currency "
+                              "(0 = off).",
         "max_consecutive_losing_cycles": "Send how many losing cycles in a row stop "
                                          "the bot (0 = off).",
         "cooldown_after_loss_minutes": "Send the cooldown after a losing cycle, in "
@@ -187,9 +203,10 @@ class SettingsPanel:
                 "Restore the original configuration?", "",
                 f"Spacing {d['ladder_spacing']} × depth {d['ladder_depth']}",
                 f"TP {d['tp_mode']} {d['tp_distance']} | Lot {d['lot_size']}",
-                f"Cycle {d['profit_cycle_target']} TPs | "
-                f"Max {d['max_open_positions']} pos / {d['max_pending_orders']} pend",
-                f"Spread {d['max_spread']} | Daily loss {d['max_daily_loss']}",
+                f"Max {d['max_open_positions']} pos / "
+                f"{d['max_pending_orders']} pend / depth {d['max_ladder_depth']}",
+                f"Exit score {d['exit_threshold_exit']:g} | "
+                f"Spread {d['max_spread']} | Daily {d['max_daily_drawdown']}",
                 "", "Open positions and orders are not touched.",
             ]), _rows([_btn("✅ CONFIRM", "apply:reset:1")],
                       [_btn("❌ CANCEL", "settings_cancel:main")]))
@@ -210,6 +227,8 @@ class SettingsPanel:
 
     def _apply(self, payload):
         key, _, value = payload.partition(":")
+        if key == "tp_levels":
+            self.settings.set("tp_mode", "levels")
         if key == "reset":
             changed = self.settings.reset()
             return self.menu("main", banner=f"♻️ Settings reset to the original "
@@ -249,6 +268,10 @@ class SettingsPanel:
 
     def _tp_line(self):
         snap = self.settings.snapshot()
+        if snap["tp_mode"] == "levels":
+            n = snap["tp_levels"]
+            return (f"{n} level{'s' if n > 1 else ''} "
+                    f"({n * snap['ladder_spacing']:g})")
         if snap["tp_mode"] == "distance":
             return f"{snap['tp_distance']:g} price units"
         return f"{TP_MODE_LABELS[snap['tp_mode']]} ({self._pip_line().split('=')[1].strip()})"
@@ -270,16 +293,15 @@ class SettingsPanel:
             f"🪜 Roll mode: {ROLL_MODE_LABELS[s['roll_mode']]}",
             "",
             f"💰 Lot: {s['lot_size']} (max {s['max_lot_size']})",
-            f"🔁 Profit cycle: {s['profit_cycle_target']} TPs"
-            + (f" | basket {self._d('cycle_take_profit_money')}"
-               if s["cycle_take_profit_money"] else ""),
+            f"⚖️ Exit at score: {s['exit_threshold_exit']:g} "
+            f"(monitor {s['exit_threshold_monitor']:g})",
             f"🔁 Close on cycle end: {'ON' if s['cycle_close_positions'] else 'OFF'}",
             "",
             f"🛡 Max open: {s['max_open_positions']} | "
             f"Max pending: {s['max_pending_orders']}",
             f"🛡 Max spread: {self._d('max_spread')}",
-            f"🛡 Daily loss: {self._d('max_daily_loss')} | "
-            f"Cycle loss: {self._d('max_cycle_loss')}",
+            f"🛡 Daily drawdown: {self._d('max_daily_drawdown')} | "
+            f"Cycle drawdown: {self._d('max_cycle_drawdown')}",
             "",
             f"🧭 Direction: {DIRECTION_LABELS[s['direction_filter']]}",
             "",
@@ -289,8 +311,9 @@ class SettingsPanel:
             [_btn("🎯 TP SETTINGS", "settings_tp"), _btn("💰 LOT SIZE", "settings_lot")],
             [_btn("🪜 LADDER SETTINGS", "settings_ladder"),
              _btn("🛡 RISK SETTINGS", "settings_risk")],
-            [_btn("🧭 DIRECTION", "settings_direction"),
-             _btn("♻️ RESET SETTINGS", "confirm:reset:1")],
+            [_btn("⚖️ EXIT ENGINE", "settings_exit"),
+             _btn("🧭 DIRECTION", "settings_direction")],
+            [_btn("♻️ RESET SETTINGS", "confirm:reset:1")],
             [_btn("🔙 MAIN MENU", "panel")],
         )
         return text, markup
@@ -299,25 +322,29 @@ class SettingsPanel:
     def _menu_tp(self):
         s = self.settings.snapshot()
         mode = s["tp_mode"]
+        levels = s["tp_levels"]
         text = "\n".join([
             "🎯 <b>TP SETTINGS</b>", "",
             f"Current: {self._tp_line()}",
             f"Ladder spacing: {self._d('ladder_spacing')}",
             f"{self._pip_line()}", "",
-            "Every ladder order carries this take profit. Pip targets are",
-            "converted with the symbol's own point size, never a hardcoded",
-            "gold pip.",
+            "A TP of 1 level targets the next rung of the ladder. Pip and",
+            "absolute-distance modes are there for testing other targets.",
         ])
+        level_buttons = [
+            _btn(f"{self._mark(mode == 'levels' and levels == n)}{n} LEVEL"
+                 f"{'S' if n > 1 else ''}", f"confirm:tp_levels:{n}")
+            for n in (1, 2, 3, 4, 5)
+        ]
         return text, _rows(
-            [_btn(f"{self._mark(mode == 'distance')}DISTANCE "
-                  f"({s['tp_distance']:g})", "confirm:tp_mode:distance"),
-             _btn("✏️ SET DISTANCE", "custom:tp_distance")],
-            [_btn(f"{self._mark(mode == '1_pip')}1 PIP", "confirm:tp_mode:1_pip"),
-             _btn(f"{self._mark(mode == '2_pips')}2 PIPS", "confirm:tp_mode:2_pips"),
-             _btn(f"{self._mark(mode == '3_pips')}3 PIPS", "confirm:tp_mode:3_pips")],
-            [_btn(f"{self._mark(mode == '4_pips')}4 PIPS", "confirm:tp_mode:4_pips"),
-             _btn(f"{self._mark(mode == '5_pips')}5 PIPS", "confirm:tp_mode:5_pips")],
-            [_btn("🛑 STOP LOSS", "settings_sl"), _btn("📐 PIP SIZE", "settings_pip")],
+            level_buttons[:3], level_buttons[3:],
+            [_btn(f"{self._mark(mode == 'levels')}MODE: LEVELS",
+                  "confirm:tp_mode:levels"),
+             _btn(f"{self._mark(mode == 'distance')}MODE: DISTANCE",
+                  "confirm:tp_mode:distance")],
+            [_btn("✏️ SET DISTANCE", "custom:tp_distance"),
+             _btn("📐 PIP SIZE", "settings_pip")],
+            [_btn("🛑 STOP LOSS", "settings_sl")],
             [_btn(BACK, "settings")],
         )
 
@@ -393,7 +420,7 @@ class SettingsPanel:
             f"Depth: {s['ladder_depth']} levels per side",
             f"First level: {self._d('first_level_offset')} from price",
             f"Roll mode: {ROLL_MODE_LABELS[s['roll_mode']]}",
-            f"Profit cycle: {s['profit_cycle_target']} TPs", "",
+            f"Exit at score: {s['exit_threshold_exit']:g}", "",
             "BUY STOPs sit above the market, SELL STOPs below, on a grid",
             "anchored when the cycle started.",
         ])
@@ -413,8 +440,8 @@ class SettingsPanel:
             "Distance between neighbouring ladder levels.",
         ])
         row = [_btn(f"{self._mark(current == v)}{v:g}", f"confirm:ladder_spacing:{v:g}")
-               for v in (0.15, 0.20, 0.30, 0.50)]
-        return text, _rows(row[:2], row[2:],
+               for v in (0.10, 0.20, 0.30, 0.40, 0.50)]
+        return text, _rows(row[:3], row[3:],
                            [_btn("✏️ CUSTOM", "custom:ladder_spacing")],
                            [_btn(BACK, "settings_ladder")])
 
@@ -474,53 +501,93 @@ class SettingsPanel:
     def _menu_cycle(self):
         s = self.settings.snapshot()
         text = "\n".join([
-            "🔁 <b>PROFIT CYCLE</b>", "",
-            f"Target: {s['profit_cycle_target']} successful TPs",
-            f"Basket target: {self._d('cycle_take_profit_money')}",
+            "🔁 <b>CYCLE</b>", "",
             f"Close positions on cycle end: "
-            f"{'ON' if s['cycle_close_positions'] else 'OFF'}", "",
-            "When the target is reached the cycle closes out, pending orders",
-            "are cancelled and a fresh ladder is anchored at the new price.",
+            f"{'ON' if s['cycle_close_positions'] else 'OFF'}",
+            f"Exit score to close: {s['exit_threshold_exit']:g}",
+            f"Max ladder depth: {s['max_ladder_depth']}", "",
+            "A cycle ends when the exit engine reads a reversal or exhaustion,",
+            "or when a risk limit forces it - never on a trade count and never",
+            "on a dollar target. Then pending orders are cancelled and a fresh",
+            "ladder is anchored at the new price.",
         ])
-        row = [_btn(f"{self._mark(s['profit_cycle_target'] == v)}{v}",
-                    f"confirm:profit_cycle_target:{v}") for v in (2, 3, 4, 6)]
         return text, _rows(
-            row[:2], row[2:],
-            [_btn("✏️ CUSTOM", "custom:profit_cycle_target"),
-             _btn("💵 BASKET TP", "settings_basket")],
             [_btn(f"CLOSE ON END: {'ON' if s['cycle_close_positions'] else 'OFF'}",
                   f"confirm:cycle_close_positions:"
                   f"{'false' if s['cycle_close_positions'] else 'true'}")],
+            [_btn("⚖️ EXIT ENGINE", "settings_exit"),
+             _btn("📐 MAX DEPTH", "settings_maxdepth")],
             [_btn(BACK, "settings_ladder")],
         )
 
-    def _menu_basket(self):
-        current = self.settings.get("cycle_take_profit_money")
+    def _menu_exit(self):
+        s = self.settings.snapshot()
         text = "\n".join([
-            "💵 <b>CYCLE BASKET TP</b>", "",
-            f"Current: {self._d('cycle_take_profit_money')}", "",
-            "Optional: close the whole cycle - winners and losers together -",
-            "once its net profit reaches this amount. OFF leaves the TP count",
-            "as the only cycle trigger.",
+            "⚖️ <b>EXIT ENGINE</b>", "",
+            f"Exit at score: {s['exit_threshold_exit']:g}",
+            f"Monitor from: {s['exit_threshold_monitor']:g}", "",
+            "The score blends reversal, exhaustion, ladder depth and basket",
+            "drawdown, minus the momentum still carrying the move. Banked",
+            "profit sharpens a signal that is already there; an open loss",
+            "holds the cycle open unless a reversal is real.", "",
+            "Lower it to leave sooner, raise it to ride longer. These are",
+            "starting values - fit them on historical data.",
         ])
-        row = [_btn(f"{self._mark(current == v)}{'OFF' if v == 0 else f'${v:g}'}",
-                    f"apply:cycle_take_profit_money:{v:g}")
-               for v in (0, 1, 2, 5)]
-        return text, _rows(row[:2], row[2:],
-                           [_btn("✏️ CUSTOM", "custom:cycle_take_profit_money")],
-                           [_btn(BACK, "settings_cycle")])
+        row = [_btn(f"{self._mark(s['exit_threshold_exit'] == v)}{v:g}",
+                    f"confirm:exit_threshold_exit:{v:g}")
+               for v in (50, 60, 70, 80)]
+        return text, _rows(
+            row[:2], row[2:],
+            [_btn("✏️ EXIT SCORE", "custom:exit_threshold_exit"),
+             _btn("✏️ MONITOR SCORE", "custom:exit_threshold_monitor")],
+            [_btn("🎚 WEIGHTS", "settings_exitweights")],
+            [_btn(BACK, "settings_cycle")],
+        )
 
-    # ---- risk -------------------------------------------------------------
+    def _menu_exitweights(self):
+        s = self.settings.snapshot()
+        text = "\n".join([
+            "🎚 <b>EXIT WEIGHTS</b>", "",
+            f"Reversal: {s['exit_w_reversal']:g}",
+            f"Exhaustion: {s['exit_w_exhaustion']:g}",
+            f"Continuation (holds the cycle): {s['exit_w_continuation']:g}",
+            f"Depth: {s['exit_w_depth']:g}",
+            f"Drawdown: {s['exit_w_drawdown']:g}",
+            f"Harvest: {s['exit_w_harvest']:g}",
+            f"Loss hold: {s['exit_w_loss_hold']:g}", "",
+            "Each weight scales one input of the exit score. Set any of them",
+            "to 0 to take that input out of the decision entirely.",
+        ])
+        return text, _rows(
+            [_btn("REVERSAL", "custom:exit_w_reversal"),
+             _btn("EXHAUSTION", "custom:exit_w_exhaustion")],
+            [_btn("CONTINUATION", "custom:exit_w_continuation"),
+             _btn("DEPTH", "custom:exit_w_depth")],
+            [_btn("DRAWDOWN", "custom:exit_w_drawdown"),
+             _btn("HARVEST", "custom:exit_w_harvest")],
+            [_btn("LOSS HOLD", "custom:exit_w_loss_hold")],
+            [_btn(BACK, "settings_exit")],
+        )
+
+    def _menu_maxdepth(self):
+        return self._simple_menu(
+            "max_ladder_depth", "📐 <b>MAX LADDER DEPTH</b>", (6, 12, 20, 40),
+            "settings_cycle",
+            "Levels a single cycle may use before new entries stop.\n"
+            "The cycle can still close normally through the exit engine.")
+
+    # ---- risk ---    # ---- risk -------------------------------------------------------------
     def _menu_risk(self):
         s = self.settings.snapshot()
         text = "\n".join([
             "🛡 <b>RISK SETTINGS</b>", "",
             f"Max open positions: {s['max_open_positions']}",
             f"Max pending orders: {s['max_pending_orders']}",
+            f"Max ladder depth: {s['max_ladder_depth']}",
             f"Max spread: {self._d('max_spread')}",
             f"Max slippage: {s['max_slippage']} points",
-            f"Daily loss limit: {self._d('max_daily_loss')}",
-            f"Cycle loss limit: {self._d('max_cycle_loss')}",
+            f"Daily drawdown limit: {self._d('max_daily_drawdown')}",
+            f"Cycle drawdown limit: {self._d('max_cycle_drawdown')}",
             f"Losing cycles allowed: {s['max_consecutive_losing_cycles']}",
             f"Cooldown after loss: {self._d('cooldown_after_loss_minutes')}",
             f"Order max age: {self._d('order_max_age_seconds')}", "",
@@ -531,8 +598,8 @@ class SettingsPanel:
             [_btn("📈 MAX OPEN", "settings_open"),
              _btn("📋 MAX PENDING", "settings_pending")],
             [_btn("📏 MAX SPREAD", "settings_spread"),
-             _btn("💸 DAILY LOSS", "settings_daily")],
-            [_btn("🔁 CYCLE LOSS", "settings_cycleloss"),
+             _btn("💸 DAILY DRAWDOWN", "settings_daily")],
+            [_btn("🔁 CYCLE DRAWDOWN", "settings_cycleloss"),
              _btn("🚫 LOSING CYCLES", "settings_streak")],
             [_btn("⏳ COOLDOWN", "settings_cooldown"),
              _btn("🕒 ORDER AGE", "settings_age")],
@@ -575,15 +642,16 @@ class SettingsPanel:
 
     def _menu_daily(self):
         return self._simple_menu(
-            "max_daily_loss", "💸 <b>DAILY LOSS LIMIT</b>", (0, 25, 50, 100),
-            "settings_risk",
+            "max_daily_drawdown", "💸 <b>DAILY DRAWDOWN LIMIT</b>",
+            (0, 25, 50, 100), "settings_risk",
             "Realised loss for the day that stops new entries (0 = off).")
 
     def _menu_cycleloss(self):
         return self._simple_menu(
-            "max_cycle_loss", "🔁 <b>CYCLE LOSS LIMIT</b>", (0, 10, 20, 50),
-            "settings_risk",
-            "A cycle this far under water is closed out and counted as a loss.")
+            "max_cycle_drawdown", "🔁 <b>CYCLE DRAWDOWN LIMIT</b>",
+            (0, 10, 20, 50), "settings_risk",
+            "A cycle this far under water is force-closed and counted as a "
+            "loss.\nThis is a loss guard - there is no profit target.")
 
     def _menu_streak(self):
         return self._simple_menu(

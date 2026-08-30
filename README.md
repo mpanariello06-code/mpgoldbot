@@ -31,16 +31,23 @@ Telegram + CSV
 
 ```
 optimized.py            entry point: MT5 connection, lifecycle, threads, hooks
-ladder_engine.py        RollingLadderEngine — levels, cycles, reconciliation, state machine
+ladder_engine.py        RollingLadderEngine — levels, reconciliation, cycles, risk
+exit_engine.py          LadderSequence + RollingLadderExitEngine — the adaptive exit
 broker.py               execution adapters: live MT5 and the paper simulator
 price_utils.py          symbol-aware price/pip/point/volume conversions
+replay.py               historical replay / backtest over M5 bars
 config.py               .env loading, typed parsing, validation
 runtime_settings.py     Telegram-controlled settings, persisted as JSON
 telegram_controller.py  control panel (own thread, own event loop)
 telegram_settings.py    the ⚙️ SETTINGS menu tree
-csv_logger.py           trades.csv, events.csv, account_snapshots.csv, ladder.csv
-tests/                  442 offline checks — python tests/run_all.py
+csv_logger.py           trades, events, account snapshots, ladder events, cycles
+tests/                  613 offline checks — python tests/run_all.py
 data/                   CSVs + runtime_settings.json + state files (auto-created)
+```
+
+```
+market data → rolling ladder engine → order manager → position manager
+            → exit engine → risk manager → cycle manager → Telegram + CSV
 ```
 
 ## Setup
@@ -82,15 +89,47 @@ account, the symbol and the mode in force.
 `ROLL_MODE=static` pins the grid where the cycle started and lets price consume
 it — the behaviour visible in the reference recording.
 
-## Profit cycle
+## The exit engine
 
-A cycle ends when `PROFIT_CYCLE_TARGET` trades have closed in profit (default 4).
-Then: pending orders are cancelled, remaining positions are closed
-(`CYCLE_CLOSE_POSITIONS`), the result is recorded, and a fresh ladder is anchored
-at the new price. `CYCLE_TAKE_PROFIT_MONEY` optionally ends a cycle on a net
-basket profit instead — the "close everything at once, re-anchor" pattern the
-recording shows. `MAX_CYCLE_LOSS` closes a cycle out the other way and starts
-the cooldown.
+**There is no "close after N trades" and no "close at $X".** A cycle ends when
+the market structure says the move is over. `exit_engine.py` turns the trigger
+sequence and the price path into three readings:
+
+| Reading | What it means |
+| --- | --- |
+| **CONTINUATION** | the original direction is still working — levels keep paying a full level of movement |
+| **REVERSAL** | the original direction failed: opposite-side runs, dominance, and give-back of the favourable excursion |
+| **EXHAUSTION** | levels keep firing but price has stopped paying — chop, decaying progress, stretching gaps, stalling |
+
+They blend into an **exit score (0-100)**: reversal, exhaustion, ladder depth
+and basket drawdown push it up; the momentum still carrying the move holds it
+down. Below `EXIT_THRESHOLD_MONITOR` the cycle continues, above
+`EXIT_THRESHOLD_EXIT` it closes, in between it is watched. Every component,
+weight and threshold is configurable and reported.
+
+**P/L is context, never the trigger.** Profit already banked (normalised against
+the cycle's own activity, so it is never a fixed dollar amount) makes the engine
+readier to act on a reversal it has *already* detected; an open loss makes it
+less willing to bail without one. Neither can end a cycle alone — that is the
+risk manager's job, on `MAX_CYCLE_DRAWDOWN`, and it is a loss guard, not a
+profit target.
+
+Worked examples from the test suite:
+
+| Sequence | Reading | Decision |
+| --- | --- | --- |
+| BUY ×4, clean move | CONTINUATION | continue — a trade count is not an exit |
+| BUY ×2 then SELL ×5 | REVERSAL (2.5x dominance) | exit |
+| BUY ×7, still clean | CONTINUATION | continue |
+| SELL ×2 then BUY ×3 | REVERSAL | exit / monitor |
+| BUY ×4 then price dies | EXHAUSTION | monitor, rising |
+| BUY/SELL alternating ×6 | EXHAUSTION (chop) | exit / monitor |
+| +$3.50 with momentum | CONTINUATION | continue |
+| +$1.20 with a reversal | REVERSAL | exit |
+
+When a cycle ends: pending orders are cancelled, remaining positions are closed
+(`CYCLE_CLOSE_POSITIONS`), the cycle is written to `rolling_ladder_cycles.csv`
+with the scores that ended it, and a fresh ladder is anchored at the new price.
 
 ## Telegram
 
@@ -102,7 +141,7 @@ the cooldown.
 | ⏸ PAUSE | cancels pending levels, opens nothing new — open positions keep being managed |
 | ▶️ RESUME | rebuilds the ladder |
 | 🛑 STOP | stops the loop and cancels pending orders; **open positions are left untouched** |
-| 📊 STATUS | state, mode, price, spread, spacing, TP, lot, positions, pendings, cycle, TPs, cycle P/L, daily P/L, last update |
+| 📊 STATUS | mode, price, spread, spacing, TP, lot, cycle, BUY/SELL triggers, last direction, imbalance, positions, pendings, basket P/L and drawdown, momentum, reversal, exit score, decision and market state |
 | 💰 ACCOUNT | live balance/equity/margin |
 | 📈 POSITIONS | open positions + pending count |
 | 📋 TODAY'S STATS | from `ladder.csv`: orders placed, levels triggered, TP/SL hits, cycles, realised P/L |
@@ -125,10 +164,11 @@ immediately (no restart), never modifies open positions, and is stored in
 
 | Menu | Controls |
 | --- | --- |
-| 🎯 TP SETTINGS | DISTANCE (any value) or 1–5 PIPS, stop loss, pip size |
+| 🎯 TP SETTINGS | 1–5 LEVELS (default 1 = the next rung), or an absolute distance / pips |
 | 💰 LOT SIZE | 0.01–0.10 or custom, plus the hard MAX LOT cap |
-| 🪜 LADDER SETTINGS | spacing, depth, first-level offset, roll mode, profit cycle, basket TP |
-| 🛡 RISK SETTINGS | max open, max pending, max spread, daily loss, cycle loss, losing-cycle streak, cooldown, order age |
+| 🪜 LADDER SETTINGS | spacing (0.10–0.50), depth, first-level offset, roll mode, cycle |
+| ⚖️ EXIT ENGINE | exit score, monitor score, and every weight behind them |
+| 🛡 RISK SETTINGS | max open, max pending, max depth, max spread, daily/cycle drawdown, losing-cycle streak, cooldown, order age |
 | 🧭 DIRECTION | OFF / BOTH / BUY ONLY / SELL ONLY / NO ENTRIES |
 
 **Pips are never hardcoded.** `price_utils.get_pip_size()` derives the pip from
@@ -149,11 +189,17 @@ filter in particular blocks and un-blocks automatically.
 
 ## Data
 
-* `data/ladder.csv` — one row per ladder event: `LADDER_CREATED`, `ORDER_PLACED`,
-  `ORDER_CANCELLED`, `ORDER_TRIGGERED`, `TP_HIT`, `SL_HIT`, `LEVEL_ROLLED`,
-  `CYCLE_STARTED`, `CYCLE_COMPLETED`, `CYCLE_LOSS`, `RISK_BLOCK`,
-  `SPREAD_BLOCK`, `ERROR` — with cycle, level, prices, lot, spread, tickets and
-  running P/L
+* `data/rolling_ladder_events.csv` — one row per ladder event
+  (`LADDER_CREATED`, `ORDER_PLACED`, `ORDER_CANCELLED`, `ORDER_TRIGGERED`,
+  `TP_HIT`, `SL_HIT`, `LEVEL_ROLLED`, `CYCLE_STARTED`, `CYCLE_COMPLETED`,
+  `CYCLE_LOSS`, `RISK_BLOCK`, `SPREAD_BLOCK`, `ERROR`) with the **full market
+  state at that moment**: trigger counts, consecutive runs, last/previous side,
+  direction changes, ratios, imbalance, depth used, distance travelled,
+  efficiency, gap since the previous trigger, volatility, basket P/L and
+  drawdown, and the momentum / reversal / exhaustion / exit scores. This is the
+  data the exit rules are meant to be re-fitted against.
+* `data/rolling_ladder_cycles.csv` — one row per finished cycle: how it ran and
+  exactly why it ended
 * `data/trades.csv` — one row per open and close, with cycle and level context
 * `data/events.csv` — bot events (start/stop/pause/settings/errors)
 * `data/account_snapshots.csv` — periodic balance/equity/margin
@@ -173,18 +219,48 @@ lock, settings through their own lock — the engine takes a single
 `SETTINGS.snapshot()` per pass, so a change landing mid-pass can never produce a
 half-updated ladder.
 
+## Replay / backtest
+
+```bash
+python replay.py --bars 3000                      # M5 bars straight from MT5
+python replay.py --csv gold_m5.csv                # time,open,high,low,close[,spread]
+python replay.py --csv g.csv --spacing 0.20 --tp-levels 2 --exit-threshold 60
+```
+
+The replay drives the **real** engine and the **real** paper broker, so what is
+measured is the shipped strategy. Bars are fed one at a time and walked as a
+price path (open → adverse extreme → other extreme → close, by default), the
+engine only ever sees prices up to the current step, and the intrabar ordering
+is derived from the current bar alone — no look-ahead. Spread, commission,
+slippage and the broker's minimum stop distance are all applied, and simulated
+time drives cooldowns, order ages and trigger gaps. The summary prints its own
+assumptions, because at this timescale they matter more than the strategy.
+
+When fitting parameters, split the data: development → validation → a holdout
+you only touch once.
+
 ## Tests
 
 ```bash
-python tests/run_all.py        # 442 checks, no MT5 or network needed
+python tests/run_all.py        # 613 checks, no MT5 or network needed
 ```
 
-Covers: pip/point conversion, the paper and live execution adapters, settings
-validation and persistence, ladder creation, both-sided stop placement,
-triggering, TP, rolling, a full 4-TP cycle and reset, duplicate prevention,
-restart and reconnect recovery, spread blocking, daily-loss, cycle-loss and
-position caps, pause/resume/stop, every Telegram button and settings screen, and
-a paper-mode run end to end.
+Covers: pip/point conversion, both execution adapters, settings validation and
+persistence, ladder creation and both-sided stop placement, triggering, TP,
+rolling and replenishment, the six exit scenarios (continuation, reversal both
+ways, continuing momentum, exhaustion, chop), the guarantees that the exit is
+neither a trade count nor a dollar amount, adaptive and risk-forced cycle ends,
+duplicate prevention, restart and reconnect recovery, spread blocking, daily and
+cycle drawdown guards, depth and position caps, pause/resume/stop, every
+Telegram button and settings screen, replay determinism and costing, and a
+paper-mode run end to end.
+
+## What still needs fitting
+
+The exit weights and thresholds, the ladder spacing, depth and first-level
+offset, the TP size, and the cooldown are **starting values chosen to reproduce
+observed behaviour** — not results. Fit them with `replay.py` on real XAUUSD M5
+history before trusting any of them.
 
 > Ladder scalping on gold is high risk. Start in PAPER, and keep the risk limits
 > switched on.

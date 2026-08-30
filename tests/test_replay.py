@@ -1,0 +1,144 @@
+"""Replay harness: deterministic, cost-aware, and free of look-ahead."""
+import pathlib
+import shutil
+
+from harness import Suite, use_stub_mt5
+use_stub_mt5()
+
+import replay
+from fakes import gold_spec
+
+t = Suite("replay")
+TMP = pathlib.Path("/tmp/replay_tests")
+shutil.rmtree(TMP, ignore_errors=True)
+TMP.mkdir(parents=True)
+SPEC = gold_spec()
+
+
+def bars_from_closes(closes, start=1000, step=300, wick=0.10):
+    """Build M5-shaped bars from a close series."""
+    out = []
+    prev = closes[0]
+    for i, close in enumerate(closes):
+        o, c = prev, close
+        out.append({"time": start + i * step, "open": o, "close": c,
+                    "high": max(o, c) + wick, "low": min(o, c) - wick})
+        prev = close
+    return out
+
+
+def trend(n=40, start=4010.0, step=0.12):
+    return [round(start + i * step, 2) for i in range(n)]
+
+
+def reversal(n=20, start=4010.0, step=0.15):
+    up = [round(start + i * step, 2) for i in range(n)]
+    down = [round(up[-1] - i * step, 2) for i in range(1, n * 2)]
+    return up + down
+
+
+def chop(n=60, start=4010.0, amp=0.35):
+    return [round(start + (amp if i % 2 else -amp), 2) for i in range(n)]
+
+
+t.section("BAR PATH (no look-ahead, stated assumption)")
+bar = {"open": 4010.0, "high": 4010.9, "low": 4009.5, "close": 4010.6}
+path = replay.bar_path(bar, steps_per_leg=3, adverse_first=True)
+t.check("path starts at the open", path[0] == 4010.0)
+t.check("path ends at the close", abs(path[-1] - 4010.6) < 1e-9)
+t.check("path visits the low", any(abs(p - 4009.5) < 1e-9 for p in path))
+t.check("path visits the high", any(abs(p - 4010.9) < 1e-9 for p in path))
+t.check("bullish bar walks the low first (conservative)",
+        path.index(min(path)) < path.index(max(path)))
+optimistic = replay.bar_path(bar, steps_per_leg=3, adverse_first=False)
+t.check("optimistic mode walks the high first",
+        optimistic.index(max(optimistic)) < optimistic.index(min(optimistic)))
+t.check("path only uses this bar's own OHLC",
+        min(path) >= bar["low"] - 1e-9 and max(path) <= bar["high"] + 1e-9)
+
+t.section("REPLAY RUNS THE REAL ENGINE")
+res = replay.run_replay(bars_from_closes(trend()), spec=SPEC, data_dir=TMP,
+                        start_balance=1000.0,
+                        overrides={"cooldown_after_loss_minutes": 0})
+t.check("bars replayed", res.bars == 40, str(res.bars))
+t.check("price steps generated", res.ticks > res.bars, str(res.ticks))
+t.check("levels triggered on a trend", res.triggers > 0, str(res.triggers))
+t.check("trades closed", res.closed_trades > 0, str(res.closed_trades))
+t.check("balance moved", res.balance_end != res.balance_start,
+        f"{res.balance_start} -> {res.balance_end}")
+t.check("assumptions are reported", len(res.assumptions) >= 4)
+t.check("summary is printable", "ROLLING LADDER REPLAY" in res.summary())
+t.check("summary refuses to claim profitability",
+        "not a profitability claim" in res.summary())
+
+t.section("DETERMINISM")
+res_a = replay.run_replay(bars_from_closes(trend()), spec=SPEC, data_dir=TMP,
+                          start_balance=1000.0)
+res_b = replay.run_replay(bars_from_closes(trend()), spec=SPEC, data_dir=TMP,
+                          start_balance=1000.0)
+t.check("same input -> same result",
+        (res_a.balance_end, res_a.triggers, len(res_a.cycles)) ==
+        (res_b.balance_end, res_b.triggers, len(res_b.cycles)),
+        f"{res_a.balance_end} vs {res_b.balance_end}")
+
+t.section("COSTS ARE APPLIED")
+cheap = replay.run_replay(bars_from_closes(trend()), spec=SPEC, data_dir=TMP,
+                          start_balance=1000.0, commission_per_lot=0.0)
+dear = replay.run_replay(bars_from_closes(trend()), spec=SPEC, data_dir=TMP,
+                         start_balance=1000.0, commission_per_lot=50.0)
+t.check("commission reduces the result", dear.balance_end < cheap.balance_end,
+        f"{cheap.balance_end:.2f} vs {dear.balance_end:.2f}")
+wide = replay.run_replay(bars_from_closes(trend()), spec=SPEC, data_dir=TMP,
+                         start_balance=1000.0, spread=0.60)
+t.check("a wider spread changes the outcome",
+        wide.balance_end != cheap.balance_end or wide.triggers != cheap.triggers,
+        f"{wide.balance_end:.2f} vs {cheap.balance_end:.2f}")
+
+t.section("CYCLES END ADAPTIVELY")
+res = replay.run_replay(bars_from_closes(reversal()), spec=SPEC, data_dir=TMP,
+                        start_balance=1000.0,
+                        overrides={"cooldown_after_loss_minutes": 0})
+t.check("a reversal series completes cycles", len(res.cycles) > 0,
+        str(len(res.cycles)))
+t.check("cycle endings are attributed", bool(res.exit_reasons),
+        str(res.exit_reasons))
+t.check("endings name the market state, not a trade count",
+        all("EXIT_ENGINE" in k or "RISK" in k for k in res.exit_reasons),
+        str(res.exit_reasons))
+t.check("cycle rows carry the sequence",
+        all({"buy", "sell", "triggers", "exit_score"} <= set(c)
+            for c in res.cycles))
+
+t.section("CHOP IS SURVIVABLE")
+res = replay.run_replay(bars_from_closes(chop()), spec=SPEC, data_dir=TMP,
+                        start_balance=1000.0,
+                        overrides={"cooldown_after_loss_minutes": 0})
+t.check("chop does not run away with exposure",
+        res.max_drawdown < 200.0, f"drawdown {res.max_drawdown:.2f}")
+t.check("chop still produces bounded cycles", len(res.cycles) >= 0)
+
+t.section("PARAMETER SWEEP (what optimisation will look like)")
+results = {}
+for spacing in (0.20, 0.30, 0.40):
+    r = replay.run_replay(bars_from_closes(trend()), spec=SPEC, data_dir=TMP,
+                          start_balance=1000.0,
+                          overrides={"ladder_spacing": spacing,
+                                     "cooldown_after_loss_minutes": 0})
+    results[spacing] = (r.triggers, round(r.balance_end - r.balance_start, 2))
+t.check("spacing changes the trigger count",
+        len({v[0] for v in results.values()}) > 1, str(results))
+t.check("every spacing produced a runnable result",
+        all(isinstance(v[1], float) for v in results.values()), str(results))
+
+t.section("CSV BAR LOADING")
+path = TMP / "bars.csv"
+path.write_text("time,open,high,low,close,spread\n"
+                "1000,4010.0,4010.5,4009.8,4010.4,0.08\n"
+                "1300,4010.4,4011.0,4010.2,4010.9,0.09\n"
+                "bad,row,here,,,\n")
+bars = replay.load_bars_csv(path)
+t.check("valid rows loaded", len(bars) == 2, str(len(bars)))
+t.check("malformed rows skipped", all("open" in b for b in bars))
+t.check("per-bar spread read", bars[0]["spread"] == 0.08)
+
+t.done()

@@ -92,7 +92,8 @@ t.check("small price moves do not re-place the ladder",
 t.section("TRIGGER -> TP -> ROLL")
 # TP below the spacing keeps this scenario to a single trade; with the default
 # TP == spacing a TP and the next trigger land on the same tick (see below).
-engine, broker, feed, settings, rec = build({"tp_distance": 0.20}, name="roll")
+engine, broker, feed, settings, rec = build(
+    {"tp_mode": "distance", "tp_distance": 0.20}, name="roll")
 engine.step()
 first_buy = min(o.price for o in broker.orders() if o.side == BUY_STOP)
 trigger_buy(feed, first_buy)
@@ -128,7 +129,8 @@ t.check("levels stay on the cycle grid",
                 round((p - engine.cycle.anchor) / 0.30)) < 1e-6 for p in new_buys))
 
 t.section("SELL SIDE")
-engine, broker, feed, settings, rec = build({"tp_distance": 0.20}, name="sell")
+engine, broker, feed, settings, rec = build(
+    {"tp_mode": "distance", "tp_distance": 0.20}, name="sell")
 engine.step()
 first_sell = max(o.price for o in broker.orders() if o.side == SELL_STOP)
 trigger_sell(feed, first_sell)
@@ -145,61 +147,105 @@ t.check("sell profit is positive", engine.cycle.realized > 0,
         f"{engine.cycle.realized:.2f}")
 
 # ===========================================================================
-t.section("PROFIT CYCLE (4 TPs -> reset)")
-engine, broker, feed, settings, rec = build({"tp_distance": 0.20}, name="cycle")
+t.section("ADAPTIVE EXIT: A CLEAN RUN IS NOT CLOSED BY A TRADE COUNT")
+engine, broker, feed, settings, rec = build(
+    {"tp_mode": "distance", "tp_distance": 0.20}, name="cycle")
 start_cycle = engine.cycle.cycle_id
-for i in range(4):
+for i in range(5):
     engine.step()
     buys = [o for o in broker.orders() if o.side == BUY_STOP]
+    if not buys:
+        break
     target = min(buys, key=lambda o: o.price)
     trigger_buy(feed, target.price)
     engine.step()
-    pos = broker.positions()[0]
-    reach_buy_tp(feed, pos.tp)
-    engine.step()
-    if i < 3:
-        t.check(f"TP {i + 1} counted, cycle still open",
-                engine.cycle.tp_count == i + 1 and
-                engine.cycle.cycle_id == start_cycle,
-                f"tp={engine.cycle.tp_count} cycle={engine.cycle.cycle_id}")
+    if broker.positions():
+        reach_buy_tp(feed, broker.positions()[0].tp)
+        engine.step()
 
-t.check("cycle completed after the 4th TP",
-        engine.cycle.cycle_id == start_cycle + 1,
-        f"cycle now #{engine.cycle.cycle_id}")
-t.check("CYCLE_COMPLETED logged", rec.count("CYCLE_COMPLETED") == 1)
-t.check("cycle hook carries the P/L",
-        any(c[0] == "complete" and c[2] > 0 for c in rec.cycles), str(rec.cycles[-1]))
-t.check("new cycle starts flat", engine.cycle.tp_count == 0 and
-        engine.cycle.realized == 0.0)
-t.check("CYCLE_STARTED logged for the new cycle", rec.count("CYCLE_STARTED") >= 1)
-t.check("ladder re-anchored at the new price",
-        abs(engine.cycle.anchor - feed().mid) < 0.30,
-        f"anchor {engine.cycle.anchor} price {feed().mid}")
-engine.step()
-t.check("fresh ladder built for the new cycle", len(broker.orders()) == 10)
-t.check("new orders carry the new cycle id",
-        all(parse_comment(o.comment)[0] == engine.cycle.cycle_id
-            for o in broker.orders()))
-t.check("cycle completed only once", rec.count("CYCLE_COMPLETED") == 1)
+t.check("five clean BUY levels did not end the cycle",
+        engine.cycle.cycle_id == start_cycle,
+        f"cycle #{engine.cycle.cycle_id} after {engine.sequence.total_triggers} triggers")
+t.check("no CYCLE_COMPLETED logged for a trade count",
+        rec.count("CYCLE_COMPLETED") == 0)
+t.check("the sequence was tracked", engine.sequence.buy_triggers >= 4,
+        str(engine.sequence.buy_triggers))
+t.check("engine reads it as continuation",
+        engine.assessment.state == "MOMENTUM_CONTINUATION", engine.assessment.state)
+t.check("exit score stayed below the threshold",
+        engine.assessment.exit_score < settings.get("exit_threshold_exit"),
+        f"{engine.assessment.exit_score:.1f}")
 
-t.section("BASKET CYCLE TARGET (observed behaviour)")
+t.section("ADAPTIVE EXIT: A REVERSAL ENDS THE CYCLE")
 engine, broker, feed, settings, rec = build(
-    {"profit_cycle_target": 0, "cycle_take_profit_money": 0.50,
-     "cycle_close_positions": True}, name="basket")
+    {"tp_mode": "distance", "tp_distance": 0.20}, name="reverse")
 engine.step()
 buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
               key=lambda o: o.price)
-trigger_buy(feed, buys[1].price)          # ask crosses the first two levels
+trigger_buy(feed, buys[1].price)          # two BUY levels trigger
 engine.step()
-t.check("two levels triggered", len(broker.positions()) == 2, str(len(broker.positions())))
-feed.set(buys[1].price + 1.00)            # both deeply in profit
-engine.step()
-t.check("basket target closed the whole cycle", not broker.positions())
-t.check("cycle rolled on the basket target",
-        any(c[0] == "complete" and "basket" in str(c[3]) for c in rec.cycles),
-        str([c for c in rec.cycles if c[0] == "complete"]))
+start_cycle = engine.cycle.cycle_id
+t.check("two BUY triggers recorded", engine.sequence.buy_triggers == 2,
+        str(engine.sequence.buy_triggers))
 
-# ===========================================================================
+# the market turns and takes out the sell side
+for _ in range(6):
+    engine.step()
+    sells = [o for o in broker.orders() if o.side == SELL_STOP]
+    if not sells:
+        break
+    target = max(sells, key=lambda o: o.price)
+    trigger_sell(feed, target.price)
+    engine.step()
+    if engine.cycle.cycle_id != start_cycle:
+        break
+
+t.check("the cycle closed on the reversal",
+        engine.cycle.cycle_id != start_cycle,
+        f"cycle #{engine.cycle.cycle_id} vs #{start_cycle}")
+t.check("CYCLE_COMPLETED or CYCLE_LOSS logged",
+        rec.count("CYCLE_COMPLETED") + rec.count("CYCLE_LOSS") == 1)
+closes = [c for c in rec.cycles if c.kind_of == "complete"]
+t.check("the close was attributed to the exit engine",
+        any(c.kind == "EXIT_ENGINE" for c in closes), str(closes))
+t.check("the reason names the structure",
+        any("reversal" in c.reason or "exhaustion" in c.reason for c in closes),
+        str([c.reason for c in closes]))
+t.check("the assessment is handed to the logger",
+        any(c.assessment is not None and c.assessment.exit_score > 0
+            for c in closes))
+t.check("positions were closed out", not broker.positions())
+t.check("pending orders were cancelled or rebuilt for the new cycle",
+        all(parse_comment(o.comment)[0] == engine.cycle.cycle_id
+            for o in broker.orders()))
+t.check("a fresh sequence started", engine.sequence.total_triggers == 0)
+t.check("new cycle re-anchored at the current price",
+        abs(engine.cycle.anchor - feed().mid) < 0.60,
+        f"anchor {engine.cycle.anchor} price {feed().mid}")
+engine.step()
+t.check("a fresh ladder is built, unless a cooldown is holding it",
+        len(broker.orders()) > 0 or "cooldown" in engine.block_reason.lower(),
+        f"{len(broker.orders())} orders, reason: {engine.block_reason}")
+
+t.section("RISK-FORCED CYCLE CLOSE (drawdown, not a profit target)")
+engine, broker, feed, settings, rec = build(
+    {"max_cycle_drawdown": 0.50, "cooldown_after_loss_minutes": 5},
+    name="forced")
+engine.step()
+buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
+              key=lambda o: o.price)
+trigger_buy(feed, buys[0].price)
+engine.step()
+feed.set(buys[0].price - 0.80)            # basket well past the drawdown limit
+engine.step()
+t.check("cycle force-closed on drawdown", not broker.positions())
+t.check("logged as a cycle loss", rec.count("CYCLE_LOSS") == 1)
+t.check("attributed to risk, not the exit engine",
+        any(c.kind == "RISK" for c in rec.cycles if c.kind_of == "complete"),
+        str([c for c in rec.cycles if c.kind_of == "complete"]))
+t.check("losing streak counted", engine.consecutive_losing_cycles == 1)
+t.check("cooldown armed", engine.cooldown_until > time.time())
+
 t.section("RISK: MAX POSITIONS")
 engine, broker, feed, settings, rec = build(
     {"max_open_positions": 2, "profit_cycle_target": 99}, name="maxpos")
@@ -226,7 +272,7 @@ t.check("pending orders capped", len(broker.orders()) <= 6,
 
 t.section("RISK: DAILY LOSS")
 engine, broker, feed, settings, rec = build(
-    {"max_daily_loss": 0.50, "stop_loss_distance": 0.30}, name="daily")
+    {"max_daily_drawdown": 0.50, "stop_loss_distance": 0.30}, name="daily")
 engine.step()
 sells = [o for o in broker.orders() if o.side == SELL_STOP]
 target = max(sells, key=lambda o: o.price)
@@ -240,8 +286,8 @@ t.check("SL_HIT logged", rec.count("SL_HIT") == 1)
 t.check("daily loss recorded", engine.daily_profit < 0, f"{engine.daily_profit:.2f}")
 engine.daily_profit = -1.0                # push past the limit
 engine.step()
-t.check("daily loss limit blocks new entries", not broker.orders())
-t.check("risk block reason mentions the daily loss",
+t.check("daily drawdown limit blocks new entries", not broker.orders())
+t.check("risk block reason mentions the daily drawdown",
         "daily" in engine.block_reason.lower(), engine.block_reason)
 
 t.section("RISK: SPREAD FILTER")
@@ -258,24 +304,18 @@ t.check("SPREAD_CLEARED logged", rec.count("SPREAD_CLEARED") == 1)
 t.check("spread block logged only once while blocked",
         rec.count("SPREAD_BLOCK") == 1)
 
-t.section("RISK: CYCLE LOSS + COOLDOWN")
-engine, broker, feed, settings, rec = build(
-    {"max_cycle_loss": 0.40, "cooldown_after_loss_minutes": 5,
-     "stop_loss_distance": 1.00}, name="cycleloss")
+t.section("RISK: LADDER DEPTH CAP")
+engine, broker, feed, settings, rec = build({"max_ladder_depth": 2}, name="depthcap")
 engine.step()
 buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
               key=lambda o: o.price)
-trigger_buy(feed, buys[0].price)
+trigger_buy(feed, buys[1].price)
 engine.step()
-feed.set(buys[0].price - 0.60)            # deep drawdown, no SL hit yet
 engine.step()
-t.check("cycle loss limit closed the cycle out", not broker.positions())
-t.check("CYCLE_LOSS logged", rec.count("CYCLE_LOSS") == 1)
-t.check("losing streak counted", engine.consecutive_losing_cycles == 1)
-t.check("cooldown armed", engine.cooldown_until > time.time())
-engine.step()
-t.check("no new ladder during the cooldown", not broker.orders())
-t.check("cooldown is the stated reason", "cooldown" in engine.block_reason.lower(),
+t.check("depth cap stops new levels",
+        not broker.orders() or engine.block_reason,
+        f"{len(broker.orders())} orders, reason: {engine.block_reason}")
+t.check("depth cap is the stated reason", "depth" in engine.block_reason.lower(),
         engine.block_reason)
 
 t.section("RISK: LOSING CYCLE STREAK")

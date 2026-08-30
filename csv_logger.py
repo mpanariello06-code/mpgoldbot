@@ -52,25 +52,32 @@ EVENT_HEADER = [
     "status",
 ]
 
+# One row per ladder event. Deliberately wide: this is the data the exit rules
+# are meant to be re-fitted against later, so the market state at the moment of
+# every decision is captured, not just the decision.
 LADDER_HEADER = [
-    "timestamp",
-    "cycle_id",
-    "ladder_id",
-    "symbol",
-    "direction",
-    "level",
-    "entry_price",
-    "exit_price",
-    "tp",
-    "sl_if_used",
-    "lot_size",
-    "spread",
-    "order_ticket",
-    "position_ticket",
-    "event",
-    "profit",
-    "cycle_profit",
-    "daily_profit",
+    "timestamp", "symbol", "cycle_id", "candle_time", "event_type", "side",
+    "entry_price", "exit_price", "ladder_price", "ladder_index", "tp",
+    "sl_if_used", "lot_size", "spread", "order_ticket", "position_ticket",
+    "buy_trigger_count", "sell_trigger_count", "consecutive_buy",
+    "consecutive_sell", "last_side", "previous_side", "direction_changes",
+    "buy_sell_ratio", "sell_buy_ratio", "imbalance", "ladder_depth_used",
+    "price_distance_traveled", "net_levels", "efficiency",
+    "time_since_previous_trigger", "volatility", "basket_pnl",
+    "basket_drawdown", "profit", "cycle_profit", "daily_profit",
+    "momentum_score", "continuation_score", "reversal_score",
+    "exhaustion_score", "exit_score", "decision", "market_state", "action",
+    "reason",
+]
+
+# One row per completed cycle: how it ran and why it ended.
+CYCLE_HEADER = [
+    "timestamp", "symbol", "cycle_id", "started_at", "duration_seconds",
+    "anchor", "spacing", "triggers", "buy_triggers", "sell_triggers",
+    "direction_changes", "imbalance", "ladder_depth_used", "net_levels",
+    "path_levels", "efficiency", "tp_count", "realized_pnl", "peak_pnl",
+    "drawdown", "momentum_score", "reversal_score", "exhaustion_score",
+    "exit_score", "market_state", "end_kind", "end_reason", "daily_profit",
 ]
 
 ACCOUNT_HEADER = [
@@ -102,12 +109,14 @@ def _fmt(value, digits=None):
 
 class CsvLogger:
     def __init__(self, data_dir, trade_file, event_file, account_file,
-                 ladder_file="ladder.csv"):
+                 ladder_file="rolling_ladder_events.csv",
+                 cycle_file="rolling_ladder_cycles.csv"):
         self.dir = Path(data_dir)
         self.trade_path = self.dir / trade_file
         self.event_path = self.dir / event_file
         self.account_path = self.dir / account_file
         self.ladder_path = self.dir / ladder_file
+        self.cycle_path = self.dir / cycle_file
 
         self._lock = threading.Lock()
         # Keys of trade rows already written -> prevents duplicates across restarts
@@ -122,6 +131,7 @@ class CsvLogger:
         self._ensure_file(self.event_path, EVENT_HEADER)
         self._ensure_file(self.account_path, ACCOUNT_HEADER)
         self._ensure_file(self.ladder_path, LADDER_HEADER)
+        self._ensure_file(self.cycle_path, CYCLE_HEADER)
         self._load_trade_keys()
 
     @staticmethod
@@ -269,35 +279,48 @@ class CsvLogger:
             return key in self._trade_keys
 
     # ------------------------------------------------------------ ladder log
-    def log_ladder(self, event, cycle_id="", ladder_id="", symbol="", direction="",
-                   level="", entry_price=None, exit_price=None, tp=None,
-                   sl_if_used=None, lot_size=None, spread=None, order_ticket="",
-                   position_ticket="", profit=None, cycle_profit=None,
-                   daily_profit=None, digits=2):
-        """One row per ladder event (see LADDER_HEADER)."""
+    def log_ladder(self, event, digits=2, **fields):
+        """
+        One ladder event row. Unknown keys are ignored and missing ones stay
+        empty, so callers pass whatever context they have.
+        """
+        fields["event_type"] = event
+        fields.setdefault("timestamp", _now())
+        price_keys = {"entry_price", "exit_price", "ladder_price", "tp",
+                      "sl_if_used", "spread"}
+        money_keys = {"profit", "cycle_profit", "daily_profit", "basket_pnl",
+                      "basket_drawdown"}
+        row = []
+        for column in LADDER_HEADER:
+            value = fields.get(column, "")
+            if column in price_keys:
+                row.append(_fmt(value, digits))
+            elif column in money_keys:
+                row.append(_fmt(value, 2))
+            else:
+                row.append(_fmt(value))
         try:
-            self._append(self.ladder_path, [
-                _now(),
-                _fmt(cycle_id),
-                _fmt(ladder_id),
-                _fmt(symbol),
-                _fmt(direction),
-                _fmt(level),
-                _fmt(entry_price, digits),
-                _fmt(exit_price, digits),
-                _fmt(tp, digits),
-                _fmt(sl_if_used, digits),
-                _fmt(lot_size),
-                _fmt(spread, digits),
-                _fmt(order_ticket),
-                _fmt(position_ticket),
-                _fmt(event),
-                _fmt(profit, 2),
-                _fmt(cycle_profit, 2),
-                _fmt(daily_profit, 2),
-            ])
+            self._append(self.ladder_path, row)
         except Exception as exc:
             print(f"[csv_logger] ladder write failed: {exc}")
+
+    def log_cycle(self, digits=2, **fields):
+        """One row per finished cycle."""
+        fields.setdefault("timestamp", _now())
+        row = []
+        for column in CYCLE_HEADER:
+            value = fields.get(column, "")
+            if column in ("anchor", "spacing"):
+                row.append(_fmt(value, digits))
+            elif column in ("realized_pnl", "peak_pnl", "drawdown",
+                            "daily_profit"):
+                row.append(_fmt(value, 2))
+            else:
+                row.append(_fmt(value))
+        try:
+            self._append(self.cycle_path, row)
+        except Exception as exc:
+            print(f"[csv_logger] cycle write failed: {exc}")
 
     def ladder_stats(self, day=None):
         """Today's ladder activity, straight from ladder.csv."""
@@ -316,7 +339,7 @@ class CsvLogger:
         for row in rows:
             if not (row.get("timestamp") or "").startswith(day):
                 continue
-            event = (row.get("event") or "").upper()
+            event = (row.get("event_type") or "").upper()
             counts[event] = counts.get(event, 0) + 1
             if row.get("cycle_id"):
                 cycles.add(row["cycle_id"])

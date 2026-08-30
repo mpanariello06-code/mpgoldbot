@@ -138,21 +138,56 @@ REARM_LEVELS = _get_bool("REARM_LEVELS", True)
 # ---------------------------------------------------------------------------
 # TAKE PROFIT
 # ---------------------------------------------------------------------------
-# distance = TP_DISTANCE price units; 1_pip..5_pips = symbol-aware pips
-TP_MODE = _get_str("TP_MODE", "distance").lower()
-TP_DISTANCE = _get_float("TP_DISTANCE", 0.30)
+# levels = TP_LEVELS x LADDER_SPACING (default) | distance = TP_DISTANCE price
+# units | 1_pip..5_pips = symbol-aware pips
+TP_MODE = _get_str("TP_MODE", "levels").lower()
+TP_LEVELS = _get_int("TP_LEVELS", 1)
+TP_DISTANCE = _get_float("TP_DISTANCE", LADDER_SPACING)
 STOP_LOSS_DISTANCE = _get_float("STOP_LOSS_DISTANCE", 0.0)   # 0 = no SL
 # 1 pip = N points; 0 = derive from the symbol's digits/point
 PIP_POINTS = _get_int("PIP_POINTS", 0)
 
 # ---------------------------------------------------------------------------
-# PROFIT CYCLE
+# CYCLE / ADAPTIVE EXIT
 # ---------------------------------------------------------------------------
-PROFIT_CYCLE_TARGET = _get_int("PROFIT_CYCLE_TARGET", 4)     # successful TPs
+# The cycle ends when the exit engine reads reversal or exhaustion in the
+# trigger sequence - never on a trade count and never on a dollar target.
+# Every weight and threshold below is a starting value to be fitted against
+# historical XAUUSD data, not a discovered truth.
 CYCLE_CLOSE_POSITIONS = _get_bool("CYCLE_CLOSE_POSITIONS", True)
-# Optional basket target in account currency (0 = off). This is the behaviour
-# the reference recording shows: everything closes together on a net profit.
-CYCLE_TAKE_PROFIT_MONEY = _get_float("CYCLE_TAKE_PROFIT_MONEY", 0.0)
+
+_EXIT_DEFAULTS = {
+    "recent_window": 5,
+    "progress_intervals": 2,
+    "consecutive_norm": 4.0,
+    "depth_norm": 6.0,
+    "gap_reference": 60.0,
+    "min_triggers_for_exhaustion": 3,
+    "min_triggers_for_reversal": 2,
+    "w_reversal": 0.75,
+    "w_exhaustion": 0.45,
+    "w_depth": 0.20,
+    "w_drawdown": 0.25,
+    "w_continuation": 0.45,
+    "w_harvest": 0.30,
+    "w_loss_hold": 0.20,
+    "threshold_exit": 70.0,
+    "threshold_monitor": 40.0,
+}
+
+
+def _exit_settings():
+    """EXIT_<FIELD> in .env overrides any exit-engine parameter."""
+    out = {}
+    for key, default in _EXIT_DEFAULTS.items():
+        env = f"EXIT_{key.upper()}"
+        if isinstance(default, bool):
+            out[f"exit_{key}"] = _get_bool(env, default)
+        elif isinstance(default, int):
+            out[f"exit_{key}"] = _get_int(env, default)
+        else:
+            out[f"exit_{key}"] = _get_float(env, default)
+    return out
 
 # ---------------------------------------------------------------------------
 # RISK
@@ -161,10 +196,17 @@ LOT_SIZE = _get_float("LOT_SIZE", 0.01)                 # fixed lots, no marting
 MAX_LOT_SIZE = _get_float("MAX_LOT_SIZE", 0.10)
 MAX_OPEN_POSITIONS = _get_int("MAX_OPEN_POSITIONS", 4)
 MAX_PENDING_ORDERS = _get_int("MAX_PENDING_ORDERS", 10)
+MAX_LADDER_DEPTH = _get_int("MAX_LADDER_DEPTH", 12)     # levels used per cycle
 MAX_SPREAD = _get_float("MAX_SPREAD", 0.50)             # price units, 0 = off
 MAX_SLIPPAGE = _get_int("MAX_SLIPPAGE", 20)             # deviation points
-MAX_DAILY_LOSS = _get_float("MAX_DAILY_LOSS", 50.0)     # account currency, 0 = off
-MAX_CYCLE_LOSS = _get_float("MAX_CYCLE_LOSS", 20.0)     # account currency, 0 = off
+# Round-turn commission per lot in account currency (paper/replay costing)
+COMMISSION_PER_LOT = _get_float("COMMISSION_PER_LOT", 0.0)
+# Drawdown guards, in account currency (0 = off). MAX_DAILY_LOSS /
+# MAX_CYCLE_LOSS are accepted as aliases.
+MAX_DAILY_DRAWDOWN = _get_float("MAX_DAILY_DRAWDOWN",
+                                _get_float("MAX_DAILY_LOSS", 50.0))
+MAX_CYCLE_DRAWDOWN = _get_float("MAX_CYCLE_DRAWDOWN",
+                                _get_float("MAX_CYCLE_LOSS", 20.0))
 MAX_CONSECUTIVE_LOSING_CYCLES = _get_int("MAX_CONSECUTIVE_LOSING_CYCLES", 3)
 COOLDOWN_AFTER_LOSS = _get_float("COOLDOWN_AFTER_LOSS", 15.0)   # minutes
 
@@ -216,7 +258,8 @@ DATA_DIRECTORY = _get_str("DATA_DIRECTORY", "data")
 TRADE_LOG_FILE = _get_str("TRADE_LOG_FILE", "trades.csv")
 EVENT_LOG_FILE = _get_str("EVENT_LOG_FILE", "events.csv")
 ACCOUNT_LOG_FILE = _get_str("ACCOUNT_LOG_FILE", "account_snapshots.csv")
-LADDER_LOG_FILE = _get_str("LADDER_LOG_FILE", "ladder.csv")
+LADDER_LOG_FILE = _get_str("LADDER_LOG_FILE", "rolling_ladder_events.csv")
+CYCLE_LOG_FILE = _get_str("CYCLE_LOG_FILE", "rolling_ladder_cycles.csv")
 
 RUNTIME_SETTINGS_FILE = _get_str("RUNTIME_SETTINGS_FILE", "runtime_settings.json")
 LADDER_STATE_FILE = _get_str("LADDER_STATE_FILE", "ladder_state.json")
@@ -253,22 +296,22 @@ def runtime_defaults():
         "rearm_levels": REARM_LEVELS,
         # take profit
         "tp_mode": TP_MODE,
+        "tp_levels": TP_LEVELS,
         "tp_distance": TP_DISTANCE,
         "stop_loss_distance": STOP_LOSS_DISTANCE,
         "pip_points": PIP_POINTS,
-        # cycle
-        "profit_cycle_target": PROFIT_CYCLE_TARGET,
+        # cycle / adaptive exit
         "cycle_close_positions": CYCLE_CLOSE_POSITIONS,
-        "cycle_take_profit_money": CYCLE_TAKE_PROFIT_MONEY,
         # risk
         "lot_size": LOT_SIZE,
         "max_lot_size": MAX_LOT_SIZE,
         "max_open_positions": MAX_OPEN_POSITIONS,
         "max_pending_orders": MAX_PENDING_ORDERS,
+        "max_ladder_depth": MAX_LADDER_DEPTH,
         "max_spread": MAX_SPREAD,
         "max_slippage": MAX_SLIPPAGE,
-        "max_daily_loss": MAX_DAILY_LOSS,
-        "max_cycle_loss": MAX_CYCLE_LOSS,
+        "max_daily_drawdown": MAX_DAILY_DRAWDOWN,
+        "max_cycle_drawdown": MAX_CYCLE_DRAWDOWN,
         "max_consecutive_losing_cycles": MAX_CONSECUTIVE_LOSING_CYCLES,
         "cooldown_after_loss_minutes": COOLDOWN_AFTER_LOSS,
         # hygiene
@@ -276,6 +319,7 @@ def runtime_defaults():
         "m5_candle_reset": M5_CANDLE_RESET,
         # direction
         "direction_filter": DIRECTION_FILTER,
+        **_exit_settings(),
     }
 
 
@@ -310,10 +354,13 @@ def validate():
         errors.append("LADDER_SPACING must be greater than 0")
     if LADDER_DEPTH < 1:
         errors.append("LADDER_DEPTH must be at least 1")
-    if TP_MODE not in ("distance", "1_pip", "2_pips", "3_pips", "4_pips", "5_pips"):
-        errors.append("TP_MODE must be distance or 1_pip..5_pips")
+    if TP_MODE not in ("levels", "distance", "1_pip", "2_pips", "3_pips",
+                       "4_pips", "5_pips"):
+        errors.append("TP_MODE must be levels, distance or 1_pip..5_pips")
     if TP_MODE == "distance" and TP_DISTANCE <= 0:
         errors.append("TP_DISTANCE must be greater than 0")
+    if TP_MODE == "levels" and TP_LEVELS < 1:
+        errors.append("TP_LEVELS must be at least 1")
     if LOT_SIZE <= 0:
         errors.append("LOT_SIZE must be greater than 0")
     if LOT_SIZE > MAX_LOT_SIZE:
@@ -331,13 +378,13 @@ def validate():
 
     if MAX_SPREAD <= 0:
         warnings.append("MAX_SPREAD is 0 - the spread filter is disabled")
-    if MAX_DAILY_LOSS <= 0:
-        warnings.append("MAX_DAILY_LOSS is 0 - the daily loss guard is disabled")
-    if PROFIT_CYCLE_TARGET <= 0 and CYCLE_TAKE_PROFIT_MONEY <= 0:
-        warnings.append(
-            "PROFIT_CYCLE_TARGET and CYCLE_TAKE_PROFIT_MONEY are both 0 - "
-            "cycles will only end on a loss limit"
-        )
+    if MAX_DAILY_DRAWDOWN <= 0:
+        warnings.append("MAX_DAILY_DRAWDOWN is 0 - the daily guard is disabled")
+    if MAX_CYCLE_DRAWDOWN <= 0:
+        warnings.append("MAX_CYCLE_DRAWDOWN is 0 - the cycle guard is disabled")
+    exits = _exit_settings()
+    if exits["exit_threshold_exit"] <= exits["exit_threshold_monitor"]:
+        errors.append("EXIT_THRESHOLD_EXIT must be above EXIT_THRESHOLD_MONITOR")
 
     if not TELEGRAM_BOT_TOKEN:
         warnings.append(
@@ -362,9 +409,10 @@ def strategy_summary():
         "Mode": TRADING_MODE,
         "Spacing": LADDER_SPACING,
         "Depth": LADDER_DEPTH,
-        "TP": TP_DISTANCE if TP_MODE == "distance" else TP_MODE,
+        "TP": f"{TP_LEVELS} level(s)" if TP_MODE == "levels" else (
+            TP_DISTANCE if TP_MODE == "distance" else TP_MODE),
         "Lot": LOT_SIZE,
-        "Cycle Target": PROFIT_CYCLE_TARGET,
+        "Exit": f"score >= {_EXIT_DEFAULTS['threshold_exit']:.0f}",
         "Max Positions": MAX_OPEN_POSITIONS,
         "Max Pendings": MAX_PENDING_ORDERS,
         "Max Spread": MAX_SPREAD,

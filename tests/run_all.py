@@ -14,7 +14,9 @@ SUITES = [
     "test_price_utils.py",
     "test_broker.py",
     "test_settings.py",
+    "test_exit_engine.py",
     "test_ladder_engine.py",
+    "test_replay.py",
     "test_telegram.py",
     "test_app.py",
 ]
@@ -34,18 +36,20 @@ def main():
         fails = [ln for ln in out.splitlines() if ln.startswith("FAIL |")]
         total += passed
         failed += len(fails)
-        results.append((suite, passed, len(fails), proc.returncode))
+        # a suite that produced no PASS lines crashed before it could run
+        crashed = passed == 0 or proc.returncode not in (0, 1)
+        results.append((suite, passed, len(fails), crashed))
         print(f"{suite:<28} {passed:>4} passed  {len(fails):>3} failed"
-              f"{'  <-- FAILURES' if fails else ''}")
+              f"{'  <-- CRASHED' if crashed else '  <-- FAILURES' if fails else ''}")
         for line in fails:
             print("   " + line)
-        if proc.returncode not in (0, 1):
-            print(proc.stdout[-2000:])
-            print(proc.stderr[-2000:])
+        if crashed:
+            print((proc.stdout or "")[-1500:])
+            print((proc.stderr or "")[-1500:])
 
     print("-" * 60)
     print(f"TOTAL: {total} passed, {failed} failed across {len(SUITES)} suites")
-    return 1 if failed or any(r[3] not in (0, 1) for r in results) else 0
+    return 1 if failed or any(r[3] for r in results) else 0
 
 
 if __name__ == "__main__":

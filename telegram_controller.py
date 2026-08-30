@@ -260,32 +260,54 @@ class TelegramController:
                  if s.get("bid") and s.get("ask") else "n/a")
         spread = f"{s['spread']:.{d}f}" if s.get("spread") is not None else "n/a"
         updated = s.get("last_update")
+
+        momentum = s.get("momentum_score", 0.0)
+        momentum_word = ("STRONG" if momentum >= 0.66 else
+                         "WEAK" if momentum <= 0.33 else "NEUTRAL")
+        reversal = s.get("reversal_score", 0.0)
+        reversal_word = "DETECTED" if s.get("state") == "REVERSAL_DETECTED" or \
+            reversal >= 0.5 else "NOT DETECTED"
+        market_state = (s.get("state") or "").replace("_", " ")
+
         lines = [
-            "📊 <b>BOT STATUS</b>", "",
-            f"Status: {s['icon']} {s['state']}"
-            + (f" ({s.get('engine_state')})" if s.get("engine_state") else ""),
-            f"Mode: {s.get('mode', '?')}",
-            f"Symbol: {s['symbol']}   Timeframe: {s.get('timeframe', '')}",
+            "🪜 <b>ROLLING LADDER SCALPER</b>", "",
+            f"Bot: {s['icon']} {s['lifecycle']}   [{s.get('mode', '?')}]",
+            f"Symbol: {s['symbol']}",
+            f"Timeframe: {s.get('timeframe', '')}",
             f"MT5: {'Connected' if s['mt5_connected'] else 'Disconnected'}",
             f"Price: {price}   Spread: {spread}",
             "",
             f"Ladder spacing: {s.get('spacing')}",
-            f"Depth: {s.get('depth')} per side",
-            f"TP: {s.get('tp_mode')} ({_num(s.get('tp_distance'))})",
-            f"Lot: {s.get('lot')}",
+            f"TP: {_num(s.get('tp_distance'))}   Lot: {s.get('lot')}",
+            "",
+            f"Cycle: #{s.get('cycle_id', 0)}",
+            f"BUY triggers: {s.get('buy_triggers', 0)}",
+            f"SELL triggers: {s.get('sell_triggers', 0)}",
+            f"Last direction: {s.get('last_side') or '-'}",
+            f"Directional imbalance: {s.get('imbalance', 0):.2f}x",
+            f"Direction changes: {s.get('direction_changes', 0)}",
             "",
             f"Open positions: {s.get('positions', 0)}",
             f"Pending orders: {s.get('orders', 0)}",
+            f"Ladder depth used: {s.get('ladder_depth_used', 0)}",
             "",
-            f"Cycle: #{s.get('cycle_id', 0)}",
-            f"Successful TPs: {s.get('tp_count', 0)}/{s.get('cycle_target', 0)}",
-            f"Cycle P/L: {_money(s.get('cycle_profit', 0))}",
+            f"Basket P/L: {_money(s.get('cycle_profit', 0))}",
+            f"Basket drawdown: {_money(s.get('basket_drawdown', 0))}",
             f"Daily P/L: {_money(s.get('daily_profit', 0))}",
-            f"Total TPs: {s.get('total_tp', 0)} / {s.get('total_trades', 0)} trades",
             "",
-            f"Last ladder update: "
-            f"{updated.strftime('%H:%M:%S') if updated else 'n/a'}",
+            f"Momentum: {momentum_word} ({momentum:.2f})",
+            f"Reversal: {reversal_word} ({reversal:.2f})",
+            f"Exhaustion: {s.get('exhaustion_score', 0):.2f}",
+            f"Exit score: {s.get('exit_score', 0):.0f}"
+            f" / {s.get('settings', {}).get('exit_threshold_exit', 70):.0f}",
+            f"Decision: {s.get('decision', '-')}",
+            f"State: {market_state or '-'}",
         ]
+        if s.get("reason"):
+            lines.append(f"Why: {s['reason']}")
+        lines += ["",
+                  f"Last ladder update: "
+                  f"{updated.strftime('%H:%M:%S') if updated else 'n/a'}"]
         if account:
             lines.append(f"Balance: {_money(account.balance)} | "
                          f"Equity: {_money(account.equity)}")
@@ -421,9 +443,10 @@ class TelegramController:
             f"Symbol: {s['symbol']} {s.get('timeframe', '')}   Price: {price}",
             f"MT5: {'Connected' if s['mt5_connected'] else 'Disconnected'}",
             "",
-            f"Cycle #{s.get('cycle_id', 0)}  ·  TPs "
-            f"{s.get('tp_count', 0)}/{s.get('cycle_target', 0)}  ·  "
-            f"P/L {_money(s.get('cycle_profit', 0))}",
+            f"Cycle #{s.get('cycle_id', 0)}  ·  "
+            f"{s.get('buy_triggers', 0)}B/{s.get('sell_triggers', 0)}S  ·  "
+            f"P/L {_money(s.get('cycle_profit', 0))}  ·  "
+            f"exit {s.get('exit_score', 0):.0f}",
             f"Positions: {s.get('positions', 0)}   "
             f"Pending: {s.get('orders', 0)}",
             f"Spacing {s.get('spacing')} · TP {_num(s.get('tp_distance'))} · "

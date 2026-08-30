@@ -68,6 +68,7 @@ CSV = CsvLogger(
     cfg.EVENT_LOG_FILE,
     cfg.ACCOUNT_LOG_FILE,
     cfg.LADDER_LOG_FILE,
+    cfg.CYCLE_LOG_FILE,
 )
 
 
@@ -342,6 +343,7 @@ class LadderBot:
                 state_path=cfg.DATA_PATH / cfg.PAPER_STATE_FILE,
                 start_balance=cfg.PAPER_START_BALANCE,
                 max_slippage_points=snap["max_slippage"],
+                commission_per_lot=cfg.COMMISSION_PER_LOT,
             )
         self.engine = RollingLadderEngine(
             broker=self.broker,
@@ -527,11 +529,14 @@ class LadderBot:
         }
         if self.engine:
             data.update(self.engine.snapshot())
-            data["state"] = state          # lifecycle state wins for display
+            # `state` is the market reading from the exit engine; `lifecycle`
+            # is what the bot itself is doing.
+            data["lifecycle"] = state
             data["engine_state"] = self.engine.state
             data["icon"] = STATE_ICONS.get(state, "⚪")
         else:
-            data.update({"engine_state": State.IDLE, "positions": 0, "orders": 0,
+            data.update({"lifecycle": state, "engine_state": State.IDLE,
+                         "positions": 0, "orders": 0,
                          "cycle_id": 0, "tp_count": 0, "cycle_profit": 0.0,
                          "daily_profit": 0.0, "spread": None, "bid": None,
                          "ask": None})
@@ -541,7 +546,7 @@ class LadderBot:
                          "tp_mode": snap["tp_mode"],
                          "tp_distance": snap["tp_distance"],
                          "lot": snap["lot_size"],
-                         "cycle_target": snap["profit_cycle_target"],
+                         "exit_score": 0.0, "decision": "CONTINUE",
                          "timeframe": snap["timeframe"]})
         return data
 
@@ -583,10 +588,11 @@ class LadderBot:
             log("=" * 70)
             log(f"ROLLING LADDER SCALPER: {SYMBOL} {TIMEFRAME} [{self.broker.name}]")
             log(f"Spacing {snap['ladder_spacing']} | Depth {snap['ladder_depth']} "
-                f"| TP {snap['tp_mode']} {snap['tp_distance']} | Lot {snap['lot_size']}")
-            log(f"Cycle target {snap['profit_cycle_target']} TPs | "
+                f"| TP {snap['tp_mode']} | Lot {snap['lot_size']}")
+            log(f"Adaptive exit at score {snap['exit_threshold_exit']:g} | "
                 f"Max {snap['max_open_positions']} positions / "
-                f"{snap['max_pending_orders']} pendings")
+                f"{snap['max_pending_orders']} pendings / "
+                f"depth {snap['max_ladder_depth']}")
             log(spec.describe())
             log("=" * 70)
 
@@ -659,7 +665,14 @@ class LadderBot:
         }
 
     def _on_event(self, event, message, fields):
-        """Every ladder event -> console + events.csv + ladder.csv."""
+        """
+        Every ladder event -> console + events.csv + rolling_ladder_events.csv.
+
+        The ladder row carries the full market state at the moment of the
+        event - trigger sequence, imbalance, momentum/reversal/exhaustion and
+        the exit score - so the exit rules can be re-fitted from the log later
+        instead of from memory.
+        """
         noisy = event in ("ORDER_PLACED", "ORDER_CANCELLED")
         if not noisy or DIAGNOSTICS:
             log(f"[{event}] {message}")
@@ -667,27 +680,60 @@ class LadderBot:
                       ticket=fields.get("position_ticket") or
                       fields.get("order_ticket") or "",
                       status=fields.get("status", "OK"))
-        spec = self.engine.spec if self.engine else None
-        CSV.log_ladder(
-            event=event,
-            cycle_id=fields.get("cycle_id", ""),
-            ladder_id=f"L{fields.get('cycle_id', '')}",
-            symbol=SYMBOL,
-            direction=fields.get("direction", ""),
-            level=fields.get("level", ""),
-            entry_price=fields.get("entry_price"),
-            exit_price=fields.get("exit_price"),
-            tp=fields.get("tp"),
-            sl_if_used=fields.get("sl"),
-            lot_size=fields.get("lot_size"),
-            spread=fields.get("spread"),
-            order_ticket=fields.get("order_ticket", ""),
-            position_ticket=fields.get("position_ticket", ""),
-            profit=fields.get("profit"),
-            cycle_profit=fields.get("cycle_profit"),
-            daily_profit=fields.get("daily_profit"),
-            digits=spec.digits if spec else 2,
-        )
+
+        engine = self.engine
+        spec = engine.spec if engine else None
+        row = {
+            "symbol": SYMBOL,
+            "candle_time": self.last_candle_time or "",
+            "side": fields.get("direction", ""),
+            "ladder_index": fields.get("level", ""),
+            "ladder_price": fields.get("entry_price"),
+            "action": fields.get("status", ""),
+            "reason": message,
+        }
+        for key in ("cycle_id", "entry_price", "exit_price", "tp", "lot_size",
+                    "spread", "order_ticket", "position_ticket", "profit",
+                    "cycle_profit", "daily_profit"):
+            if key in fields:
+                row[key] = fields[key]
+        row["sl_if_used"] = fields.get("sl", "")
+
+        if engine is not None and engine.sequence is not None:
+            seq = engine.sequence.snapshot()
+            row.update({
+                "buy_trigger_count": seq["buy_triggers"],
+                "sell_trigger_count": seq["sell_triggers"],
+                "consecutive_buy": seq["consecutive_buy"],
+                "consecutive_sell": seq["consecutive_sell"],
+                "last_side": seq["last_side"],
+                "previous_side": seq["previous_side"],
+                "direction_changes": seq["direction_changes"],
+                "buy_sell_ratio": seq["buy_sell_ratio"],
+                "sell_buy_ratio": seq["sell_buy_ratio"],
+                "imbalance": seq["imbalance"],
+                "ladder_depth_used": seq["ladder_depth_used"],
+                "price_distance_traveled": seq["price_distance_traveled"],
+                "net_levels": seq["net_levels"],
+                "efficiency": seq["efficiency"],
+                "time_since_previous_trigger": seq["time_since_last_trigger"],
+                "volatility": seq["volatility"],
+                "basket_pnl": seq["basket_pnl"],
+                "basket_drawdown": seq["basket_drawdown"],
+            })
+            row.setdefault("cycle_id", seq["cycle_id"])
+        if engine is not None and engine.assessment is not None:
+            a = engine.assessment
+            row.update({
+                "momentum_score": round(a.momentum_score, 3),
+                "continuation_score": round(a.continuation_score, 3),
+                "reversal_score": round(a.reversal_score, 3),
+                "exhaustion_score": round(a.exhaustion_score, 3),
+                "exit_score": round(a.exit_score, 1),
+                "decision": a.decision,
+                "market_state": a.state,
+            })
+        CSV.log_ladder(event, digits=spec.digits if spec else 2, **row)
 
     def _on_entry(self, position, index, cycle):
         snap = self.settings.snapshot()
@@ -736,22 +782,67 @@ class LadderBot:
             f"Exit: {trade.price_close:.{d}f}\n"
             f"Profit: ${trade.profit:.2f}\n"
             f"Cycle: #{cycle.cycle_id}\n"
-            f"TP Count: {cycle.tp_count}/{snap['profit_cycle_target']}"
+            f"Cycle TPs: {cycle.tp_count}   "
+            f"Exit score: {self.engine.assessment.exit_score:.0f}"
+            if self.engine and self.engine.assessment else
+            f"Cycle TPs: {cycle.tp_count}"
         )
 
     def _on_cycle_started(self, cycle, anchor):
         log(f"🪜 Cycle #{cycle.cycle_id} anchored at {anchor}")
 
-    def _on_cycle_complete(self, cycle, total, reason, lost):
+    def _on_cycle_complete(self, cycle, sequence, assessment, total, reason,
+                           kind, lost):
+        seq = sequence.snapshot() if sequence is not None else {}
+        spec = self.engine.spec if self.engine else None
+        CSV.log_cycle(
+            digits=spec.digits if spec else 2,
+            symbol=SYMBOL,
+            cycle_id=cycle.cycle_id,
+            started_at=datetime.fromtimestamp(cycle.started_at).strftime(
+                "%Y-%m-%d %H:%M:%S"),
+            duration_seconds=round(time.time() - cycle.started_at, 1),
+            anchor=cycle.anchor,
+            spacing=self.settings.get("ladder_spacing"),
+            triggers=seq.get("total_triggers", cycle.trades),
+            buy_triggers=seq.get("buy_triggers", ""),
+            sell_triggers=seq.get("sell_triggers", ""),
+            direction_changes=seq.get("direction_changes", ""),
+            imbalance=seq.get("imbalance", ""),
+            ladder_depth_used=seq.get("ladder_depth_used", ""),
+            net_levels=seq.get("net_levels", ""),
+            path_levels=seq.get("path_levels", ""),
+            efficiency=seq.get("efficiency", ""),
+            tp_count=cycle.tp_count,
+            realized_pnl=total,
+            peak_pnl=seq.get("peak_pnl", ""),
+            drawdown=seq.get("basket_drawdown", ""),
+            momentum_score=round(assessment.momentum_score, 3) if assessment else "",
+            reversal_score=round(assessment.reversal_score, 3) if assessment else "",
+            exhaustion_score=round(assessment.exhaustion_score, 3) if assessment else "",
+            exit_score=round(assessment.exit_score, 1) if assessment else "",
+            market_state=assessment.state if assessment else "",
+            end_kind=kind,
+            end_reason=reason,
+            daily_profit=self.engine.daily_profit if self.engine else "",
+        )
+
         icon = "🔻" if lost else "💰"
-        head = "CYCLE LOSS" if lost else "CYCLE COMPLETE"
+        head = "CYCLE CLOSED (LOSS)" if lost else "CYCLE COMPLETE"
+        detail = ""
+        if assessment is not None:
+            detail = (f"\nExit score: {assessment.exit_score:.0f}\n"
+                      f"State: {assessment.state.replace('_', ' ').title()}")
         self.notify(
             f"{icon} <b>{head}</b>\n\n"
             f"Cycle: #{cycle.cycle_id}\n"
+            f"Triggers: {seq.get('total_triggers', cycle.trades)} "
+            f"({seq.get('buy_triggers', 0)}B / {seq.get('sell_triggers', 0)}S)\n"
             f"Successful TPs: {cycle.tp_count}\n"
-            f"Trades: {cycle.trades}\n"
-            f"Cycle P/L: ${total:.2f}\n"
-            f"Reason: {reason}\n"
+            f"Cycle P/L: ${total:.2f}"
+            f"{detail}\n"
+            f"Closed by: {kind.replace('_', ' ').title()}\n"
+            f"Reason: {reason}\n\n"
             f"New ladder: ACTIVE"
         )
 
@@ -836,11 +927,19 @@ class Application:
             f"{'  (simulated fills, no orders sent)' if cfg.TRADING_MODE == 'PAPER' else '  *** REAL ORDERS ***'}")
         log(f"Ladder: spacing {snap['ladder_spacing']} x depth {snap['ladder_depth']} "
             f"| first level {snap['first_level_offset']} | {snap['roll_mode']}")
-        log(f"TP: {snap['tp_mode']} ({snap['tp_distance']}) | "
-            f"SL: {snap['stop_loss_distance'] or 'none'} | Lot: {snap['lot_size']}")
-        log(f"Cycle: {snap['profit_cycle_target']} TPs | "
-            f"Risk: {snap['max_open_positions']} pos / {snap['max_pending_orders']} "
-            f"pend / spread {snap['max_spread']} / daily {snap['max_daily_loss']}")
+        tp_txt = (f"{snap['tp_levels']} level(s) = "
+                  f"{snap['tp_levels'] * snap['ladder_spacing']:g}"
+                  if snap["tp_mode"] == "levels"
+                  else f"{snap['tp_mode']} ({snap['tp_distance']})")
+        log(f"TP: {tp_txt} | SL: {snap['stop_loss_distance'] or 'none'} | "
+            f"Lot: {snap['lot_size']}")
+        log(f"Exit: adaptive (score >= {snap['exit_threshold_exit']:g}, "
+            f"monitor {snap['exit_threshold_monitor']:g}) - no trade count, "
+            f"no dollar target")
+        log(f"Risk: {snap['max_open_positions']} pos / "
+            f"{snap['max_pending_orders']} pend / depth {snap['max_ladder_depth']} "
+            f"/ spread {snap['max_spread']} / daily {snap['max_daily_drawdown']} "
+            f"/ cycle {snap['max_cycle_drawdown']}")
         log(f"Data directory: {cfg.DATA_PATH}")
         log(f"Telegram control: {'ENABLED' if cfg.TELEGRAM_ENABLED else 'DISABLED'}")
         log("=" * 70)

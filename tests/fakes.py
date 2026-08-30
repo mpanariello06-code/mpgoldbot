@@ -1,5 +1,6 @@
 """Shared fakes: a scriptable tick feed and a ready-made paper broker."""
 import time
+from dataclasses import dataclass
 
 from broker import PaperBroker, Tick
 from price_utils import SymbolSpec
@@ -63,6 +64,22 @@ def reach_sell_tp(feed, tp):
     return feed.set(round(tp - feed.spread, 2))
 
 
+@dataclass
+class CycleRecord:
+    kind_of: str
+    cycle_id: int
+    total: float
+    reason: str
+    kind: str
+    lost: bool
+    assessment: object = None
+    sequence: object = None
+
+    def __getitem__(self, i):
+        return (self.kind_of, self.cycle_id, self.total, self.reason,
+                self.kind, self.lost)[i]
+
+
 class Recorder:
     """Collects engine hook calls so tests can assert on notifications."""
 
@@ -78,9 +95,12 @@ class Recorder:
             "event": lambda e, m, f: self.events.append((e, m, f)),
             "entry": lambda p, i, c: self.entries.append((p, i, c.cycle_id)),
             "closed": lambda t, i, c, w: self.closed.append((t, i, c.cycle_id, w)),
-            "cycle_started": lambda c, a: self.cycles.append(("start", c.cycle_id, a)),
-            "cycle_complete": lambda c, tot, r, lost:
-                self.cycles.append(("complete", c.cycle_id, tot, r, lost)),
+            "cycle_started": lambda c, a: self.cycles.append(
+                CycleRecord("start", c.cycle_id, 0.0, "", "", False)),
+            "cycle_complete": lambda c, seq, assessment, tot, reason, kind, lost:
+                self.cycles.append(CycleRecord("complete", c.cycle_id, tot,
+                                               reason, kind, lost, assessment,
+                                               seq)),
             "risk_blocked": lambda r: self.blocks.append(r),
         }
 

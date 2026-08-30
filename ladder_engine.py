@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from broker import BUY, BUY_STOP, SELL, SELL_STOP
+from exit_engine import (CONTINUE, EXIT, ExitConfig, LadderSequence,
+                         RollingLadderExitEngine)
 
 COMMENT_RE = re.compile(r"^RL(\d+)([BS])(-?\d+)")
 
@@ -93,6 +95,9 @@ class DesiredLevel:
     tp: float
     sl: float
     comment: str
+    # False while the level sits inside the minimum creation distance: it may
+    # stay alive if it is already placed, but a new one is not created there.
+    placeable: bool = True
 
 
 @dataclass
@@ -115,7 +120,11 @@ class Cycle:
 class RollingLadderEngine:
     """One ladder, one cycle at a time, reconciled against the broker."""
 
-    def __init__(self, broker, settings, hooks=None, state_path=None):
+    def __init__(self, broker, settings, hooks=None, state_path=None,
+                 clock=time.time):
+        # Injectable so a replay can run on simulated time: cooldowns, order
+        # ages and trigger gaps then behave the same as they would live.
+        self.clock = clock
         self.broker = broker
         self.settings = settings          # RuntimeSettings (thread-safe)
         self.hooks = hooks or {}
@@ -125,6 +134,11 @@ class RollingLadderEngine:
         self.state = State.IDLE
         self.paused = False
         self.cycle = Cycle()
+        # Adaptive exit: the cycle ends on market structure, never on a trade
+        # count or a dollar amount.
+        self.exit_engine = RollingLadderExitEngine()
+        self.sequence = None
+        self.assessment = None
         self.spec = None
         self.last_tick = None
         self.last_update = None
@@ -142,6 +156,7 @@ class RollingLadderEngine:
         self._known_orders = {}           # ticket -> PendingOrder
         self._levels_open = set()         # (side, index) currently holding a position
         self._levels_done = set()         # (side, index) consumed this cycle
+        self._triggered_keys = set()      # (side, index) already in the sequence
         self._last_place_error = 0.0
 
     # =================================================================== utils
@@ -242,6 +257,14 @@ class RollingLadderEngine:
         elif not self.cycle.anchor:
             self._start_cycle(new_id=self.cycle.cycle_id, reason="startup")
 
+        if self.sequence is None or self.sequence.cycle_id != self.cycle.cycle_id:
+            # after a restart the sequence restarts empty: only what MT5 can
+            # still show us is trustworthy, and trigger history is not stored
+            # on the broker.
+            self.sequence = LadderSequence(
+                self.cycle.cycle_id, self.cycle.anchor,
+                float(self.settings.get("ladder_spacing")))
+
         for p in positions:
             self._known_positions[p.ticket] = p
             parsed = parse_comment(p.comment)
@@ -271,8 +294,12 @@ class RollingLadderEngine:
         anchor = self.spec.normalize_price(tick.mid) if self.spec else tick.mid
         cid = new_id if new_id is not None else self.cycle.cycle_id + 1
         self.cycle = Cycle(cycle_id=cid, anchor=anchor)
+        self.sequence = LadderSequence(cid, anchor,
+                                       float(self.settings.get("ladder_spacing")))
+        self.assessment = None
         self._levels_open.clear()
         self._levels_done.clear()
+        self._triggered_keys.clear()
         self._event("CYCLE_STARTED",
                     f"Cycle #{cid} anchored at {anchor} ({reason})",
                     cycle_id=cid, entry_price=anchor)
@@ -304,14 +331,19 @@ class RollingLadderEngine:
             return False
 
     # ============================================================ ladder maths
-    def desired_levels(self, tick, snap):
+    def desired_levels(self, tick, snap, orders=()):
         """
         The levels that should be live right now.
 
-        BUY STOPs sit above the market, SELL STOPs below, both snapped to the
-        cycle's grid so their prices are stable. In `extend` mode the window
-        rolls with price; in `static` mode it stays where the cycle started
-        (the behaviour a fixed grid shows).
+        The window ROLLS, it does not slide: a level that has already been
+        placed stays exactly where it is until price reaches it (or it drifts
+        far out of range), and the ladder extends further out as levels are
+        consumed. Recomputing the near edge from price on every pass would push
+        the next level away from the market each time price advanced, and
+        nothing would ever trigger.
+
+        `first_level_offset` therefore gates where a NEW level may be created;
+        the broker's minimum stop distance is what keeps an existing one alive.
         """
         spec = self.spec
         spacing = float(snap["ladder_spacing"])
@@ -320,58 +352,140 @@ class RollingLadderEngine:
         if spacing <= 0 or depth <= 0 or not anchor:
             return []
 
-        # never closer than the broker allows, and never closer than configured
-        offset = max(float(snap["first_level_offset"]),
-                     spec.min_stop_distance + spec.point)
-
-        buy_base = int(math.ceil((tick.ask + offset - anchor) / spacing - 1e-9))
-        sell_base = int(math.floor((tick.bid - offset - anchor) / spacing + 1e-9))
-
-        if snap["roll_mode"] == "static":
-            if self.cycle.base_buy_index is None:
-                self.cycle.base_buy_index = buy_base
-                self.cycle.base_sell_index = sell_base
-            buy_base = self.cycle.base_buy_index
-            sell_base = self.cycle.base_sell_index
+        min_stop = spec.min_stop_distance + spec.point
+        offset = max(float(snap["first_level_offset"]), min_stop)
+        # a level this far from price has been left behind: let the ladder
+        # re-centre rather than keep orders nobody will reach
+        out_of_range = depth * spacing + offset
 
         allow_buy, allow_sell = DirectionFilter(snap["direction_filter"]).decide()
         tp_distance = self.tp_distance(snap)
         sl_distance = float(snap["stop_loss_distance"])
 
+        live = {BUY_STOP: set(), SELL_STOP: set()}
+        for order in orders:
+            parsed = parse_comment(order.comment)
+            if parsed and parsed[0] == self.cycle.cycle_id:
+                side = BUY_STOP if parsed[1] == BUY else SELL_STOP
+                live[side].add(parsed[2])
+
+        def build(side, direction):
+            """direction: +1 for the buy side above price, -1 for sells below."""
+            # A live level is never pulled just because price got close to it:
+            # that is the moment it is about to do its job. Only distance from
+            # the market retires it.
+            if direction > 0:
+                create_ok = lambda price: price >= tick.ask + offset
+                in_range = lambda price: price <= tick.ask + out_of_range
+            else:
+                create_ok = lambda price: price <= tick.bid - offset
+                in_range = lambda price: price >= tick.bid - out_of_range
+
+            def price_at(index):
+                return spec.normalize_price(anchor + index * spacing)
+
+            kept = sorted((i for i in live[side] if in_range(price_at(i))),
+                          reverse=direction < 0)
+            indexes = list(kept)
+
+            # extend beyond the outermost live level, or start fresh from the
+            # first index the offset allows
+            if indexes:
+                nxt = indexes[-1] + direction
+            else:
+                start = (tick.ask + offset) if direction > 0 else (tick.bid - offset)
+                nxt = int(math.ceil((start - anchor) / spacing - 1e-9)) if direction > 0 \
+                    else int(math.floor((start - anchor) / spacing + 1e-9))
+
+            guard = 0
+            while len(indexes) < depth and guard < depth * 8:
+                guard += 1
+                price = price_at(nxt)
+                if create_ok(price) and nxt not in indexes:
+                    indexes.append(nxt)
+                nxt += direction
+            return indexes
+
+        if snap["roll_mode"] == "static":
+            # the cycle's grid is fixed: pin the window once and let price
+            # consume it
+            if self.cycle.base_buy_index is None:
+                self.cycle.base_buy_index = int(math.ceil(
+                    (tick.ask + offset - anchor) / spacing - 1e-9))
+                self.cycle.base_sell_index = int(math.floor(
+                    (tick.bid - offset - anchor) / spacing + 1e-9))
+            buy_indexes = [self.cycle.base_buy_index + i for i in range(depth)]
+            sell_indexes = [self.cycle.base_sell_index - i for i in range(depth)]
+        else:
+            buy_indexes = build(BUY_STOP, +1)
+            sell_indexes = build(SELL_STOP, -1)
+
         levels = []
         if allow_buy:
-            for i in range(depth):
-                idx = buy_base + i
+            for idx in buy_indexes:
                 price = spec.normalize_price(anchor + idx * spacing)
-                if price <= tick.ask + spec.min_stop_distance:
-                    continue
                 levels.append(DesiredLevel(
                     side=BUY_STOP, index=idx, price=price,
                     tp=spec.normalize_price(price + tp_distance) if tp_distance else 0.0,
                     sl=spec.normalize_price(price - sl_distance) if sl_distance else 0.0,
                     comment=level_comment(self.cycle.cycle_id, BUY, idx),
+                    placeable=price >= tick.ask + offset,
                 ))
         if allow_sell:
-            for i in range(depth):
-                idx = sell_base - i
+            for idx in sell_indexes:
                 price = spec.normalize_price(anchor + idx * spacing)
-                if price >= tick.bid - spec.min_stop_distance:
-                    continue
                 levels.append(DesiredLevel(
                     side=SELL_STOP, index=idx, price=price,
                     tp=spec.normalize_price(price - tp_distance) if tp_distance else 0.0,
                     sl=spec.normalize_price(price + sl_distance) if sl_distance else 0.0,
                     comment=level_comment(self.cycle.cycle_id, SELL, idx),
+                    placeable=price <= tick.bid - offset,
                 ))
         return levels
 
     def tp_distance(self, snap):
-        """TP in price units: either an explicit distance or N pips."""
+        """
+        TP in price units. Levels (the default) tie the target to the ladder
+        spacing, so a 1-level TP is exactly the next rung.
+        """
         mode = snap["tp_mode"]
+        if mode == "levels":
+            return int(snap["tp_levels"]) * float(snap["ladder_spacing"])
         if mode == "distance":
             return float(snap["tp_distance"])
         pips = {"1_pip": 1, "2_pips": 2, "3_pips": 3, "4_pips": 4, "5_pips": 5}
         return self.spec.pips_to_price(pips.get(mode, 1))
+
+    # ============================================================ exit engine
+    def exit_config(self, snap):
+        """Build the exit engine's configuration from the live settings."""
+        cfg = ExitConfig()
+        for key in cfg.as_dict():
+            value = snap.get(f"exit_{key}")
+            if value is not None:
+                setattr(cfg, key, type(getattr(cfg, key))(value))
+        return cfg
+
+    def money_per_level(self, snap):
+        """Account currency one ladder level is worth at the configured lot."""
+        if not self.spec:
+            return 0.0
+        return self.spec.money_per_price_unit(snap["lot_size"]) * \
+            float(snap["ladder_spacing"])
+
+    def evaluate_exit(self, snap, tick, positions):
+        """Update the sequence with the current market and score the cycle."""
+        if self.sequence is None:
+            return None
+        self.sequence.update_price(tick.mid, ts=tick.time or self.clock())
+        self.sequence.update_pnl(sum(p.profit for p in positions))
+        self.exit_engine.config = self.exit_config(snap)
+        self.assessment = self.exit_engine.assess(
+            self.sequence,
+            money_per_level=self.money_per_level(snap),
+            has_exposure=bool(positions),
+        )
+        return self.assessment
 
     # ================================================================= risk
     def risk_check(self, snap, tick, positions, orders):
@@ -385,16 +499,21 @@ class RollingLadderEngine:
             self.daily_date = self._today()
             self.daily_profit = 0.0
 
-        max_daily = float(snap["max_daily_loss"])
+        max_daily = float(snap["max_daily_drawdown"])
         if max_daily > 0 and self.daily_profit <= -abs(max_daily):
-            return False, f"daily loss limit hit ({self.daily_profit:.2f})"
+            return False, f"daily drawdown limit hit ({self.daily_profit:.2f})"
+
+        max_depth = int(snap["max_ladder_depth"])
+        used = self.sequence.ladder_depth_used if self.sequence else 0
+        if max_depth > 0 and used >= max_depth:
+            return False, f"ladder depth cap reached ({used}/{max_depth})"
 
         max_streak = int(snap["max_consecutive_losing_cycles"])
         if max_streak > 0 and self.consecutive_losing_cycles >= max_streak:
             return False, f"{self.consecutive_losing_cycles} losing cycles in a row"
 
-        if time.time() < self.cooldown_until:
-            left = int(self.cooldown_until - time.time())
+        if self.clock() < self.cooldown_until:
+            left = int(self.cooldown_until - self.clock())
             return False, f"cooldown after loss ({left}s left)"
 
         # Position cap stops new entries and pulls the pending levels, which
@@ -502,6 +621,8 @@ class RollingLadderEngine:
             self._levels_done.add((side, index))
             self.cycle.trades += 1
             self.total_trades += 1
+            self._record_trigger(side, index, pos.price_open,
+                                 pos.time_open or self.clock())
             self._event("ORDER_TRIGGERED",
                         f"{pos.side} {pos.volume} @ {pos.price_open} (level {index:+d})",
                         cycle_id=self.cycle.cycle_id, direction=pos.side, level=index,
@@ -513,6 +634,17 @@ class RollingLadderEngine:
 
         live = {o.ticket: o for o in orders}
         self._known_orders = live
+
+    def _record_trigger(self, side, index, price, ts):
+        """Add a level to the sequence exactly once per cycle."""
+        if self.sequence is None:
+            return False
+        key = (side, index)
+        if key in self._triggered_keys:
+            return False
+        self._triggered_keys.add(key)
+        self.sequence.record_trigger(side, index, price, ts=ts)
+        return True
 
     # --------------------------------------------------------- closed trades
     def _on_closed(self, trade, snap):
@@ -532,6 +664,15 @@ class RollingLadderEngine:
         if is_win and cycle_id == self.cycle.cycle_id:
             self.cycle.tp_count += 1
             self.total_tp += 1
+
+        if self.sequence is not None and cycle_id == self.cycle.cycle_id:
+            # A level can fill and hit its TP inside a single poll, so it never
+            # shows up in positions(). Record the entry here or the sequence
+            # would silently lose a trigger.
+            self._record_trigger(side, index, trade.price_open, trade.time_close)
+            self.sequence.record_close(side, index, trade.price_open,
+                                       trade.price_close, trade.profit,
+                                       reason=trade.reason, ts=trade.time_close)
 
         event = "TP_HIT" if trade.reason == "TP" else (
             "SL_HIT" if trade.reason == "SL" else "POSITION_CLOSED")
@@ -554,27 +695,35 @@ class RollingLadderEngine:
 
     # --------------------------------------------------------------- cycles
     def _check_cycle(self, snap, tick, positions, orders):
-        """Complete or abandon the cycle. Returns True when the cycle rolled."""
-        target = int(snap["profit_cycle_target"])
-        basket = float(snap["cycle_take_profit_money"])
-        floating = sum(p.profit for p in positions)
+        """
+        Decide whether this cycle is over.
 
-        done = target > 0 and self.cycle.tp_count >= target
-        basket_hit = basket > 0 and (self.cycle.realized + floating) >= basket
+        Two independent authorities, in this order:
 
-        max_cycle_loss = float(snap["max_cycle_loss"])
-        lost = max_cycle_loss > 0 and \
-            (self.cycle.realized + floating) <= -abs(max_cycle_loss)
+          1. the risk manager, which force-closes a cycle that has drawn down
+             past its limit - a loss guard, never a profit target;
+          2. the exit engine, which reads continuation / reversal / exhaustion
+             from the trigger sequence and the price path.
 
-        if not (done or basket_hit or lost):
+        There is deliberately no "N trades" and no "X dollars" branch here.
+        Returns True when the cycle rolled.
+        """
+        assessment = self.evaluate_exit(snap, tick, positions)
+        basket = self.sequence.basket_pnl if self.sequence else 0.0
+
+        max_dd = float(snap["max_cycle_drawdown"])
+        forced = max_dd > 0 and basket <= -abs(max_dd)
+
+        if not forced and (assessment is None or assessment.decision != EXIT):
             return False
 
-        self.state = State.CYCLE_COMPLETE
-        reason = "profit cycle target" if done else (
-            "basket profit target" if basket_hit else "cycle loss limit")
+        kind = "RISK" if forced else "EXIT_ENGINE"
+        reason = (f"cycle drawdown limit hit ({basket:+.2f})" if forced
+                  else assessment.reason)
 
+        self.state = State.CYCLE_COMPLETE
         self._cancel_all(orders, f"cycle end: {reason}")
-        if lost or snap["cycle_close_positions"]:
+        if forced or snap["cycle_close_positions"]:
             for pos in positions:
                 ok, msg = self.broker.close_position(pos.ticket, comment="cycle end")
                 if not ok:
@@ -584,24 +733,26 @@ class RollingLadderEngine:
                 self._on_closed(trade, snap)
 
         total = self.cycle.realized
+        lost = total < 0
+        sequence = self.sequence
+
         if lost:
             self.consecutive_losing_cycles += 1
             cooldown = float(snap["cooldown_after_loss_minutes"]) * 60.0
             if cooldown > 0:
-                self.cooldown_until = time.time() + cooldown
-            self._event("CYCLE_LOSS",
-                        f"Cycle #{self.cycle.cycle_id} closed at {total:+.2f} "
-                        f"({reason})", cycle_id=self.cycle.cycle_id,
-                        profit=total, cycle_profit=total,
-                        daily_profit=self.daily_profit, status="LOSS")
+                self.cooldown_until = self.clock() + cooldown
         else:
             self.consecutive_losing_cycles = 0
-            self._event("CYCLE_COMPLETED",
-                        f"Cycle #{self.cycle.cycle_id}: {self.cycle.tp_count} TPs, "
-                        f"P/L {total:+.2f} ({reason})",
-                        cycle_id=self.cycle.cycle_id, profit=total,
-                        cycle_profit=total, daily_profit=self.daily_profit)
-        self._emit("cycle_complete", self.cycle, total, reason, lost)
+
+        self._event("CYCLE_LOSS" if lost else "CYCLE_COMPLETED",
+                    f"Cycle #{self.cycle.cycle_id}: {self.cycle.trades} triggers, "
+                    f"{self.cycle.tp_count} TPs, P/L {total:+.2f} "
+                    f"[{kind}] {reason}",
+                    cycle_id=self.cycle.cycle_id, profit=total,
+                    cycle_profit=total, daily_profit=self.daily_profit,
+                    status="LOSS" if lost else "OK")
+        self._emit("cycle_complete", self.cycle, sequence, assessment, total,
+                   reason, kind, lost)
 
         self._start_cycle(reason=reason)
         return True
@@ -609,7 +760,7 @@ class RollingLadderEngine:
     # ---------------------------------------------------------- reconciliation
     def _reconcile(self, snap, tick, positions, orders):
         """Place what is missing, cancel what should not be there. Idempotent."""
-        desired = self.desired_levels(tick, snap)
+        desired = self.desired_levels(tick, snap, orders)
         desired_by_key = {(d.side, d.index): d for d in desired}
 
         # --- cancel stale / duplicate / out-of-window orders ------------------
@@ -631,7 +782,7 @@ class RollingLadderEngine:
                 self._cancel(order, "duplicate level")
                 continue
             if max_age > 0 and order.time_setup and \
-                    (time.time() - order.time_setup) > max_age:
+                    (self.clock() - order.time_setup) > max_age:
                 self._cancel(order, f"stale (> {int(max_age)}s)")
                 continue
             # A live order must still match what the settings ask for: a changed
@@ -657,7 +808,7 @@ class RollingLadderEngine:
                                  key=lambda kv: abs(kv[1].price - tick.mid)):
             if room_orders <= 0:
                 break
-            if key in seen:
+            if key in seen or not level.placeable:
                 continue
             level_key = (BUY if level.side == BUY_STOP else SELL, level.index)
             if level_key in self._levels_open:
@@ -681,8 +832,8 @@ class RollingLadderEngine:
                             entry_price=level.price, tp=level.tp, sl=level.sl,
                             lot_size=lot, order_ticket=ticket, spread=tick.spread)
             else:
-                if time.time() - self._last_place_error > 30:
-                    self._last_place_error = time.time()
+                if self.clock() - self._last_place_error > 30:
+                    self._last_place_error = self.clock()
                     self._event("ERROR",
                                 f"place {level.side} @ {level.price} failed: {msg}",
                                 status="ERROR")
@@ -723,7 +874,7 @@ class RollingLadderEngine:
         except Exception:
             pass
         floating = sum(p.profit for p in positions)
-        return {
+        data = {
             "state": self.state,
             "mode": self.broker.name,
             "symbol": self.broker.symbol,
@@ -740,7 +891,7 @@ class RollingLadderEngine:
             "orders": len(orders),
             "cycle_id": self.cycle.cycle_id,
             "tp_count": self.cycle.tp_count,
-            "cycle_target": snap["profit_cycle_target"],
+            "cycle_triggers": self.cycle.trades,
             "cycle_profit": self.cycle.realized + floating,
             "cycle_realized": self.cycle.realized,
             "floating": floating,
@@ -754,3 +905,15 @@ class RollingLadderEngine:
             "anchor": self.cycle.anchor,
             "pip_size": self.spec.pip_size if self.spec else None,
         }
+        # everything the exit engine is currently reading
+        if self.sequence is not None:
+            data.update(self.sequence.snapshot())
+            data["cycle_profit"] = self.sequence.basket_pnl
+        if self.assessment is not None:
+            data.update(self.assessment.as_dict())
+        else:
+            data.update({"exit_score": 0.0, "decision": CONTINUE,
+                         "momentum_score": 0.0, "reversal_score": 0.0,
+                         "exhaustion_score": 0.0, "continuation_score": 0.0,
+                         "reason": "", "phase": self.state})
+        return data

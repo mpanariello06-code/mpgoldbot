@@ -325,13 +325,17 @@ class PaperBroker:
     name = "PAPER"
 
     def __init__(self, symbol, magic, spec_provider, tick_provider,
-                 state_path=None, start_balance=10000.0, max_slippage_points=20):
+                 state_path=None, start_balance=10000.0, max_slippage_points=20,
+                 commission_per_lot=0.0, clock=time.time):
         self.symbol = symbol
         self.magic = int(magic)
         # A stop order becomes a market order when it triggers. Paper fills
         # assume the broker fills at the level, or up to this much worse - the
         # same allowance MAX_SLIPPAGE gives the live path.
         self.max_slippage_points = int(max_slippage_points)
+        # Round-turn commission in account currency per lot, charged on close.
+        self.commission_per_lot = float(commission_per_lot)
+        self.clock = clock          # replay drives this with simulated time
         self._spec_provider = spec_provider
         self._tick_provider = tick_provider
         self._path = Path(state_path) if state_path else None
@@ -432,7 +436,7 @@ class PaperBroker:
                 volume=spec.normalize_volume(volume),
                 tp=spec.normalize_price(tp) if tp else 0.0,
                 sl=spec.normalize_price(sl) if sl else 0.0,
-                comment=comment[:31], magic=self.magic, time_setup=time.time(),
+                comment=comment[:31], magic=self.magic, time_setup=self.clock(),
             )
             self._save()
         return True, ticket, "OK (paper)"
@@ -458,6 +462,7 @@ class PaperBroker:
     def _close(self, pos, price, reason):
         spec = self.symbol_spec()
         profit = spec.profit(pos.side, pos.price_open, price, pos.volume)
+        profit -= self.commission_per_lot * pos.volume
         with self._lock:
             self._positions.pop(pos.ticket, None)
             self.balance += profit
@@ -465,7 +470,7 @@ class PaperBroker:
                 ticket=pos.ticket, symbol=pos.symbol, side=pos.side,
                 volume=pos.volume, price_open=pos.price_open,
                 price_close=spec.normalize_price(price), profit=round(profit, 2),
-                comment=pos.comment, reason=reason, time_close=time.time(),
+                comment=pos.comment, reason=reason, time_close=self.clock(),
             ))
             self._save()
 
@@ -491,7 +496,7 @@ class PaperBroker:
                     ticket=order.ticket, symbol=order.symbol, side=side,
                     volume=order.volume, price_open=spec.normalize_price(fill),
                     tp=order.tp, sl=order.sl, profit=0.0, comment=order.comment,
-                    magic=self.magic, time_open=time.time(),
+                    magic=self.magic, time_open=self.clock(),
                 )
             positions = list(self._positions.values())
 
