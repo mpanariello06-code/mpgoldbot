@@ -38,6 +38,7 @@ import config as cfg
 from broker import MT5_LOCK, Mt5Broker, PaperBroker
 from csv_logger import CsvLogger
 from ladder_engine import RollingLadderEngine, State
+from notifications import TelegramNotifier
 from price_utils import SymbolSpec
 from runtime_settings import RuntimeSettings
 
@@ -260,7 +261,10 @@ class LadderBot:
         self.last_candle_time = None
 
         self._notifier = None
+        # Telegram policy: important events only. Everything else goes to CSV.
+        self.notifier = TelegramNotifier(self.notify, settings=self.settings)
         self._reconnect_at = 0.0
+        self._last_candle_check = 0.0
 
     # ------------------------------------------------------------ plumbing
     def set_notifier(self, fn):
@@ -433,7 +437,11 @@ class LadderBot:
 
         log_event("BOT_STARTED", f"Rolling ladder started on {SYMBOL} "
                                  f"({self.broker.name})", symbol=SYMBOL)
-        log("🟢 Rolling ladder engine started")
+        log("🟢 Rolling ladder engine started - deploying the ladder now")
+        snap = self.settings.snapshot()
+        self.notifier.bot_started(SYMBOL, snap["timeframe"],
+                                  snap["ladder_spacing"],
+                                  self.engine.cycle.cycle_id, cfg.TRADING_MODE)
         return True, "Trading started."
 
     def pause(self):
@@ -501,6 +509,10 @@ class LadderBot:
                   symbol=SYMBOL)
         log(f"🛑 Ladder engine stopped ({cancelled} pending orders cancelled, "
             f"open positions untouched)")
+        self.notifier.bot_stopped(
+            SYMBOL, self.engine.cycle.cycle_id if self.engine else 0,
+            len(self.positions()), len(self.orders()),
+            self.engine.session_profit if self.engine else 0.0)
         return True, f"Trading stopped. {cancelled} pending orders cancelled."
 
     # ------------------------------------------------------------ reporting
@@ -609,6 +621,7 @@ class LadderBot:
 
                     self._check_new_candle()
                     self.engine.step()
+                    self._state_alert()
 
                     self._sleep(POLL_SECONDS)
 
@@ -632,13 +645,33 @@ class LadderBot:
         if self.state != BotState.ERROR:
             self._set_state(BotState.STOPPED)
 
+    def _state_alert(self):
+        """
+        Announce a change of market state, once per transition.
+
+        The notifier drops repeats, so calling this every pass costs nothing and
+        the chat only hears about NORMAL -> REVERSAL and similar transitions.
+        """
+        engine = self.engine
+        if not (engine and engine.assessment and engine.sequence):
+            return
+        seq = engine.sequence
+        self.notifier.state_change(
+            symbol=SYMBOL, cycle_id=engine.cycle.cycle_id,
+            market_state=engine.assessment.state,
+            buys=seq.buy_triggers, sells=seq.sell_triggers,
+            imbalance=seq.imbalance, dominant=seq.dominant_side)
+
     def _check_new_candle(self):
         """
-        M5 candles are context only - the ladder never waits for a candle close.
-
-        When M5_CANDLE_RESET is on, a new candle re-anchors the grid so the
-        ladder follows the market instead of drifting behind it.
+        M5 candles are context only - the ladder never waits for a candle close,
+        neither to start nor after a cycle ends. Polling for one every 0.5s
+        would be wasted work, so it is checked a few times a minute.
         """
+        now = time.time()
+        if now - self._last_candle_check < 5.0:
+            return
+        self._last_candle_check = now
         tf = MT5_TIMEFRAMES.get(self.settings.get("timeframe"), mt5.TIMEFRAME_M5)
         rates = get_rates(SYMBOL, tf, 2)
         if len(rates) < 2:
@@ -676,6 +709,11 @@ class LadderBot:
         noisy = event in ("ORDER_PLACED", "ORDER_CANCELLED")
         if not noisy or DIAGNOSTICS:
             log(f"[{event}] {message}")
+        if event == "ERROR":
+            self.notifier.error(message, action="Retrying")
+        elif event == "CYCLE_CLOSE_PENDING":
+            self.notifier.error(message, action="Reconciling before the next cycle",
+                                key=f"pending:{fields.get('cycle_id')}")
         CSV.log_event(event, message, symbol=SYMBOL,
                       ticket=fields.get("position_ticket") or
                       fields.get("order_ticket") or "",
@@ -736,6 +774,11 @@ class LadderBot:
         CSV.log_ladder(event, digits=spec.digits if spec else 2, **row)
 
     def _on_entry(self, position, index, cycle):
+        """
+        A level triggered: recorded in full, announced only if the operator
+        explicitly asked for per-entry pings (off by default - this strategy
+        would flood the chat).
+        """
         snap = self.settings.snapshot()
         spec = self.engine.spec
         self.csv.log_trade(
@@ -747,21 +790,17 @@ class LadderBot:
             tp_distance=self.engine.tp_distance(snap),
             spread=self.engine.last_tick.spread if self.engine.last_tick else None,
         )
-        if not cfg.TELEGRAM_ENTRY_NOTIFICATIONS:
+        if not snap.get("telegram_entry_alerts"):
             return
         d = spec.digits
         self.notify(
-            f"🟢 <b>LADDER ENTRY</b>\n\n"
-            f"Symbol: {SYMBOL}\n"
-            f"Direction: {position.side}\n"
-            f"Entry: {position.price_open:.{d}f}\n"
-            f"TP: {position.tp:.{d}f}\n"
-            f"Lot: {position.volume}\n"
-            f"Cycle: #{cycle.cycle_id}\n"
-            f"Level: {index:+d}"
+            f"🟢 <b>LADDER ENTRY</b>  {position.side} {position.volume}\n"
+            f"{position.price_open:.{d}f} → {position.tp:.{d}f}  "
+            f"(cycle #{cycle.cycle_id}, level {index:+d})"
         )
 
     def _on_closed(self, trade, index, cycle, is_win):
+        """A position closed: recorded in full, never announced individually."""
         spec = self.engine.spec
         snap = self.settings.snapshot()
         self.csv.log_trade(
@@ -771,28 +810,12 @@ class LadderBot:
             digits=spec.digits, deal_id=f"{trade.ticket}-{int(trade.time_close)}",
             cycle_id=cycle.cycle_id, level=index, tp_mode=snap["tp_mode"],
         )
-        d = spec.digits
-        icon = "✅" if is_win else "🔻"
-        head = "TP HIT" if trade.reason == "TP" else (
-            "SL HIT" if trade.reason == "SL" else "CLOSED")
-        self.notify(
-            f"{icon} <b>{head}</b>\n\n"
-            f"{SYMBOL} {trade.side}\n"
-            f"Entry: {trade.price_open:.{d}f}\n"
-            f"Exit: {trade.price_close:.{d}f}\n"
-            f"Profit: ${trade.profit:.2f}\n"
-            f"Cycle: #{cycle.cycle_id}\n"
-            f"Cycle TPs: {cycle.tp_count}   "
-            f"Exit score: {self.engine.assessment.exit_score:.0f}"
-            if self.engine and self.engine.assessment else
-            f"Cycle TPs: {cycle.tp_count}"
-        )
 
     def _on_cycle_started(self, cycle, anchor):
         log(f"🪜 Cycle #{cycle.cycle_id} anchored at {anchor}")
 
     def _on_cycle_complete(self, cycle, sequence, assessment, total, reason,
-                           kind, lost):
+                           kind, lost, duration=0.0, next_cycle_id=None):
         seq = sequence.snapshot() if sequence is not None else {}
         spec = self.engine.spec if self.engine else None
         CSV.log_cycle(
@@ -827,29 +850,27 @@ class LadderBot:
             daily_profit=self.engine.daily_profit if self.engine else "",
         )
 
-        icon = "🔻" if lost else "💰"
-        head = "CYCLE CLOSED (LOSS)" if lost else "CYCLE COMPLETE"
-        detail = ""
-        if assessment is not None:
-            detail = (f"\nExit score: {assessment.exit_score:.0f}\n"
-                      f"State: {assessment.state.replace('_', ' ').title()}")
-        self.notify(
-            f"{icon} <b>{head}</b>\n\n"
-            f"Cycle: #{cycle.cycle_id}\n"
-            f"Triggers: {seq.get('total_triggers', cycle.trades)} "
-            f"({seq.get('buy_triggers', 0)}B / {seq.get('sell_triggers', 0)}S)\n"
-            f"Successful TPs: {cycle.tp_count}\n"
-            f"Cycle P/L: ${total:.2f}"
-            f"{detail}\n"
-            f"Closed by: {kind.replace('_', ' ').title()}\n"
-            f"Reason: {reason}\n\n"
-            f"New ladder: ACTIVE"
-        )
+        reason_word = {
+            "REVERSAL_DETECTED": "Reversal",
+            "MOMENTUM_EXHAUSTION": "Exhaustion",
+            "MOMENTUM_CONTINUATION": "Continuation",
+        }.get(assessment.state if assessment else "", "Risk limit"
+              if kind == "RISK" else "Exit engine")
+        log(f"🔄 Cycle #{cycle.cycle_id} closed ({reason_word}, {total:+.2f}) "
+            f"-> cycle #{next_cycle_id} deployed immediately")
+        self.notifier.cycle_closed(
+            symbol=SYMBOL, cycle_id=cycle.cycle_id, total=total,
+            buys=seq.get("buy_triggers", 0), sells=seq.get("sell_triggers", 0),
+            reason_word=reason_word, direction=seq.get("dominant_side", ""),
+            duration_seconds=duration,
+            next_cycle_id=next_cycle_id if next_cycle_id is not None
+            else cycle.cycle_id + 1)
 
     def _on_risk_blocked(self, reason):
-        self.notify(f"⛔ <b>RISK BLOCK</b>\n\n{reason}\n\n"
-                    f"New entries stopped, pending orders cancelled.\n"
-                    f"Open positions keep running.")
+        self.notifier.risk_event(
+            "RISK BLOCK", f"{reason}\n\nNew entries stopped, pending orders "
+                          f"cancelled.\nOpen positions keep running.",
+            key=f"risk:{reason[:40]}")
 
 
 # ===========================================================================
@@ -866,6 +887,7 @@ class MonitorThread(threading.Thread):
         self.csv = csv_logger
         self._stopped = threading.Event()
         self._last_snapshot = 0.0
+        self._last_status = 0.0
 
     def stop(self):
         self._stopped.set()
@@ -878,6 +900,11 @@ class MonitorThread(threading.Thread):
                         now - self._last_snapshot >= cfg.ACCOUNT_SNAPSHOT_INTERVAL:
                     self._last_snapshot = now
                     self._snapshot()
+                # the periodic heartbeat is built off the trading loop, and the
+                # notifier decides whether it is due at all
+                if self.bot.is_running() and now - self._last_status >= 30:
+                    self._last_status = now
+                    self.bot.notifier.periodic_status(self.bot.status())
             except Exception as exc:
                 log(f"⚠ Monitor error: {exc}")
                 log_event("ERROR", f"Monitor error: {exc}", status="ERROR")

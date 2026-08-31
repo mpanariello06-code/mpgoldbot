@@ -116,19 +116,25 @@ level = min(o.price for o in app.bot.orders() if o.side == BUY_STOP)
 mt5.set_price(round(level - 0.08, 2))          # ask lands exactly on the level
 t.check("level triggered", wait_for(lambda: len(app.bot.positions()) >= 1),
         f"{len(app.bot.positions())} positions")
-t.check("LADDER ENTRY notification sent",
-        any("LADDER ENTRY" in n for n in notes), str(notes[-1:]))
-t.check("entry notification names the cycle and level",
-        any("Cycle: #" in n and "Level:" in n for n in notes))
-open_rows = [r for r in rows("trades.csv") if r["reason"] == "OPEN"]
+t.check("start message sent once", sum("STARTED" in n for n in notes) == 1,
+        str(notes[:1]))
+t.check("NO per-entry Telegram message (low-spam policy)",
+        not any("LADDER ENTRY" in n for n in notes), str(notes))
+# the position is visible to the broker a moment before the hook writes the
+# row, so wait for the record rather than assuming it is already there
 t.check("trade recorded with ladder context",
-        open_rows and open_rows[-1]["cycle_id"] and open_rows[-1]["level"],
-        str(open_rows[-1:]))
+        wait_for(lambda: any(r["reason"] == "OPEN" and r["cycle_id"] and
+                             r["level"] for r in rows("trades.csv"))),
+        str([r for r in rows("trades.csv") if r["reason"] == "OPEN"][-1:]))
 
 pos = app.bot.positions()[0]
 mt5.set_price(round(pos.tp, 2))
 t.check("TP executed", wait_for(lambda: not app.bot.positions()))
-t.check("TP HIT notification sent", any("TP HIT" in n for n in notes))
+t.check("NO per-TP Telegram message", not any("TP HIT" in n for n in notes),
+        str(notes))
+t.check("entries are still recorded in full",
+        any(r["event_type"] == "ORDER_TRIGGERED"
+            for r in rows("rolling_ladder_events.csv")))
 events = rows("rolling_ladder_events.csv")
 t.check("TP recorded in the ladder log",
         any(r["event_type"] == "TP_HIT" for r in events))

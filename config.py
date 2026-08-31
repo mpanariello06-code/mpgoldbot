@@ -248,8 +248,13 @@ for _cid in TELEGRAM_ALLOWED_CHAT_IDS:
 
 TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN)
 TELEGRAM_NOTIFICATIONS = _get_bool("TELEGRAM_NOTIFICATIONS", True)
-# Ladder entries are frequent; keep per-entry pings optional.
-TELEGRAM_ENTRY_NOTIFICATIONS = _get_bool("TELEGRAM_ENTRY_NOTIFICATIONS", True)
+# Telegram is event-based: cycles, state transitions, risk and errors. Per-entry
+# pings are off by default - this strategy would flood the chat.
+TELEGRAM_ENTRY_ALERTS = _get_bool("TELEGRAM_ENTRY_ALERTS", False)
+TELEGRAM_STATE_ALERTS = _get_bool("TELEGRAM_STATE_ALERTS", True)
+TELEGRAM_STATUS_UPDATES = _get_bool("TELEGRAM_STATUS_UPDATES", True)
+TELEGRAM_STATUS_INTERVAL = _get_float("TELEGRAM_STATUS_INTERVAL", 20.0)  # minutes
+TELEGRAM_ERROR_THROTTLE = _get_float("TELEGRAM_ERROR_THROTTLE", 300.0)   # seconds
 
 # ---------------------------------------------------------------------------
 # DATA / CSV PERSISTENCE
@@ -319,6 +324,12 @@ def runtime_defaults():
         "m5_candle_reset": M5_CANDLE_RESET,
         # direction
         "direction_filter": DIRECTION_FILTER,
+        # telegram policy
+        "telegram_entry_alerts": TELEGRAM_ENTRY_ALERTS,
+        "telegram_state_alerts": TELEGRAM_STATE_ALERTS,
+        "telegram_status_updates": TELEGRAM_STATUS_UPDATES,
+        "telegram_status_interval_minutes": TELEGRAM_STATUS_INTERVAL,
+        "telegram_error_throttle_seconds": TELEGRAM_ERROR_THROTTLE,
         **_exit_settings(),
     }
 

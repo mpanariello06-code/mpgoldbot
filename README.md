@@ -50,6 +50,29 @@ market data → rolling ladder engine → order manager → position manager
             → exit engine → risk manager → cycle manager → Telegram + CSV
 ```
 
+## Continuous operation
+
+START deploys the first ladder immediately — no candle, no signal, no
+confirmation, just the safety checks. From then on the bot runs a loop for as
+long as it is RUNNING and risk is OK:
+
+```
+deploy ladder → levels trigger → roll and replenish → exit engine decides
+   → close positions → cancel orders → VERIFY against MT5 → record cycle
+   → new cycle id → new ladder at the CURRENT price → repeat
+```
+
+The handoff happens **in the same pass** that closed the old cycle: a cycle
+ending at 13:42:17 has its successor live at 13:42:17, anchored on the price
+right then, not on the old grid and not at the next M5 open. There is **no
+cooldown after a normal cycle** — only a risk-forced close arms one.
+
+The transition is guarded: it is driven by a single state machine under a lock,
+so one exit event can only ever produce one new cycle. If the broker refuses a
+cancel or a close, the engine keeps retrying and **will not build a second
+ladder** until MT5 confirms the old one is gone. Cycle ids are persisted and
+never reused, including across restarts and adopted cycles.
+
 ## Setup
 
 ```bash
@@ -152,6 +175,31 @@ with the scores that ended it, and a fresh ladder is anchored at the new price.
 Commands: `/start` `/status` `/account` `/positions` `/stats` `/ladder`
 `/settings` `/pause` `/resume` `/stopbot` `/help`.
 
+### What Telegram actually sends
+
+This strategy can trigger dozens of levels a minute, so notifications are
+event-based, deduplicated and throttled:
+
+| Sent | Not sent |
+| --- | --- |
+| bot started / stopped (compact) | individual level triggers |
+| one message per cycle close: result, BUY/SELL counts, reason, duration, next cycle | individual TPs |
+| a state **transition** into reversal / strong continuation / fading — once, not per trigger | order placement or replenishment |
+| risk events and errors (identical errors suppressed for `TELEGRAM_ERROR_THROTTLE`) | repeats of a state the chat already knows |
+| optional periodic status every `TELEGRAM_STATUS_INTERVAL` minutes | anything already visible in the CSVs |
+
+Measured on a 5-day replay (109 level triggers, 109 closes, 15 cycles): the old
+one-message-per-event style would have sent **233** messages; the policy sends
+**29** (15 cycle closes + 14 state transitions), an 88% reduction, with ~15,600
+would-be messages suppressed. The optional heartbeat is separate and toggleable
+— at the default 20 minutes that is 3/hour.
+
+State alerts are capped at two per cycle, so a cycle whose reading oscillates
+between continuation and exhaustion cannot chatter.
+
+The detailed view lives behind the 📊 STATUS button — pulled when you want it,
+never pushed.
+
 Only chat ids in `TELEGRAM_CHAT_ID` / `TELEGRAM_ALLOWED_CHAT_IDS` may do
 anything; everyone else gets `Unauthorized.` Secrets are never sent to Telegram.
 
@@ -168,6 +216,7 @@ immediately (no restart), never modifies open positions, and is stored in
 | 💰 LOT SIZE | 0.01–0.10 or custom, plus the hard MAX LOT cap |
 | 🪜 LADDER SETTINGS | spacing (0.10–0.50), depth, first-level offset, roll mode, cycle |
 | ⚖️ EXIT ENGINE | exit score, monitor score, and every weight behind them |
+| 🔔 NOTIFICATIONS | status updates ON/OFF and interval, state alerts, per-entry alerts, error throttle |
 | 🛡 RISK SETTINGS | max open, max pending, max depth, max spread, daily/cycle drawdown, losing-cycle streak, cooldown, order age |
 | 🧭 DIRECTION | OFF / BOTH / BUY ONLY / SELL ONLY / NO ENTRIES |
 
@@ -188,6 +237,8 @@ own TP/SL. The bot resumes by itself once the condition clears — the spread
 filter in particular blocks and un-blocks automatically.
 
 ## Data
+
+> Telegram carries important events; the CSVs carry everything.
 
 * `data/rolling_ladder_events.csv` — one row per ladder event
   (`LADDER_CREATED`, `ORDER_PLACED`, `ORDER_CANCELLED`, `ORDER_TRIGGERED`,

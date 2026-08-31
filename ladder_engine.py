@@ -39,7 +39,9 @@ class State:
     LADDER_ACTIVE = "LADDER_ACTIVE"
     POSITION_ACTIVE = "POSITION_ACTIVE"
     ROLLING = "ROLLING"
+    CLOSING_CYCLE = "CLOSING_CYCLE"      # closing out, verifying against MT5
     CYCLE_COMPLETE = "CYCLE_COMPLETE"
+    NEW_CYCLE = "NEW_CYCLE"
     RISK_BLOCKED = "RISK_BLOCKED"
     ERROR = "ERROR"
 
@@ -139,6 +141,12 @@ class RollingLadderEngine:
         self.exit_engine = RollingLadderExitEngine()
         self.sequence = None
         self.assessment = None
+        # Cycle transitions are guarded so one exit event can only ever produce
+        # one new cycle, however many passes the close takes to verify.
+        self._transition_lock = threading.RLock()
+        self._closing_cycle = None
+        self.max_cycle_id = 0
+        self.session_profit = 0.0
         self.spec = None
         self.last_tick = None
         self.last_update = None
@@ -149,6 +157,7 @@ class RollingLadderEngine:
         self.daily_date = self._today()
         self.consecutive_losing_cycles = 0
         self.cooldown_until = 0.0
+        self._streak_paused = False
         self.total_tp = 0
         self.total_trades = 0
 
@@ -186,8 +195,10 @@ class RollingLadderEngine:
                 "cycle": self.cycle.to_dict(),
                 "daily_profit": self.daily_profit,
                 "daily_date": self.daily_date,
+                "max_cycle_id": self.max_cycle_id,
                 "consecutive_losing_cycles": self.consecutive_losing_cycles,
                 "cooldown_until": self.cooldown_until,
+                "streak_paused": self._streak_paused,
                 "total_tp": self.total_tp,
                 "total_trades": self.total_trades,
                 "levels_done": sorted(f"{s}:{i}" for s, i in self._levels_done),
@@ -211,8 +222,10 @@ class RollingLadderEngine:
         if data.get("daily_date") == self._today():
             self.daily_profit = float(data.get("daily_profit", 0.0))
             self.daily_date = data["daily_date"]
+        self.max_cycle_id = int(data.get("max_cycle_id", 0))
         self.consecutive_losing_cycles = int(data.get("consecutive_losing_cycles", 0))
         self.cooldown_until = float(data.get("cooldown_until", 0.0))
+        self._streak_paused = bool(data.get("streak_paused", False))
         self.total_tp = int(data.get("total_tp", 0))
         self.total_trades = int(data.get("total_trades", 0))
         for item in data.get("levels_done", []):
@@ -247,6 +260,7 @@ class RollingLadderEngine:
 
         if live_cycles:
             adopted = max(live_cycles)
+            self.max_cycle_id = max(self.max_cycle_id, adopted)
             if adopted != self.cycle.cycle_id:
                 self.cycle.cycle_id = adopted
             if not self.cycle.anchor:
@@ -292,7 +306,10 @@ class RollingLadderEngine:
     def _start_cycle(self, new_id=None, reason=""):
         tick = self.last_tick or self.broker.tick()
         anchor = self.spec.normalize_price(tick.mid) if self.spec else tick.mid
-        cid = new_id if new_id is not None else self.cycle.cycle_id + 1
+        # a cycle id is never reused, even after a restart or an adopted cycle
+        self.max_cycle_id = max(self.max_cycle_id, self.cycle.cycle_id)
+        cid = new_id if new_id is not None else self.max_cycle_id + 1
+        self.max_cycle_id = max(self.max_cycle_id, cid)
         self.cycle = Cycle(cycle_id=cid, anchor=anchor)
         self.sequence = LadderSequence(cid, anchor,
                                        float(self.settings.get("ladder_spacing")))
@@ -508,9 +525,30 @@ class RollingLadderEngine:
         if max_depth > 0 and used >= max_depth:
             return False, f"ladder depth cap reached ({used}/{max_depth})"
 
+        # Losing streak: a circuit breaker, not a kill switch. It pauses for the
+        # cooldown and then lets the bot try again with a clean count - the
+        # streak can only reset on a winning cycle, which can never happen while
+        # entries are blocked. With no cooldown configured it stays a hard stop,
+        # which is then the operator's explicit choice.
         max_streak = int(snap["max_consecutive_losing_cycles"])
+        cooldown = float(snap["cooldown_after_loss_minutes"]) * 60.0
         if max_streak > 0 and self.consecutive_losing_cycles >= max_streak:
-            return False, f"{self.consecutive_losing_cycles} losing cycles in a row"
+            if cooldown <= 0:
+                return False, (f"{self.consecutive_losing_cycles} losing cycles "
+                               f"in a row (no cooldown configured)")
+            if not self._streak_paused:
+                # the step loop logs the block itself when the reason changes
+                self._streak_paused = True
+                self.cooldown_until = max(self.cooldown_until,
+                                          self.clock() + cooldown)
+            if self.clock() < self.cooldown_until:
+                left = int(self.cooldown_until - self.clock())
+                return False, (f"{self.consecutive_losing_cycles} losing cycles "
+                               f"in a row (resuming in {left}s)")
+            self.consecutive_losing_cycles = 0
+            self._streak_paused = False
+            self._event("RISK_CLEARED",
+                        "losing-streak pause elapsed - resuming new cycles")
 
         if self.clock() < self.cooldown_until:
             left = int(self.cooldown_until - self.clock())
@@ -560,9 +598,15 @@ class RollingLadderEngine:
         # 2. newly triggered levels
         self._detect_triggers(positions, orders, snap, tick)
 
-        # 3. cycle completion / loss
-        if self._check_cycle(snap, tick, positions, orders):
+        # 3. cycle completion / loss - and, on a clean handoff, immediately
+        #    continue this same pass so the next ladder goes out at once
+        rolled = self._check_cycle(snap, tick, positions, orders)
+        if rolled == "pending":
+            self.last_update = datetime.now()
             return True
+        if rolled == "restarted":
+            positions = self.broker.positions()
+            orders = self.broker.orders()
 
         # 4. paused: no NEW entries, existing positions still managed
         if self.paused:
@@ -655,6 +699,7 @@ class RollingLadderEngine:
 
         self._levels_open.discard((side, index))
         self.daily_profit += trade.profit
+        self.session_profit += trade.profit
         if cycle_id == self.cycle.cycle_id:
             self.cycle.realized += trade.profit
 
@@ -696,9 +741,9 @@ class RollingLadderEngine:
     # --------------------------------------------------------------- cycles
     def _check_cycle(self, snap, tick, positions, orders):
         """
-        Decide whether this cycle is over.
+        Decide whether this cycle is over, and drive the transition.
 
-        Two independent authorities, in this order:
+        Two independent authorities:
 
           1. the risk manager, which force-closes a cycle that has drawn down
              past its limit - a loss guard, never a profit target;
@@ -706,24 +751,49 @@ class RollingLadderEngine:
              from the trigger sequence and the price path.
 
         There is deliberately no "N trades" and no "X dollars" branch here.
-        Returns True when the cycle rolled.
+
+        Returns "pending" while a close is still being verified, "restarted"
+        once the next cycle is live (the caller then re-reads state and deploys
+        the new ladder in the same pass), or False when nothing happened.
         """
-        assessment = self.evaluate_exit(snap, tick, positions)
-        basket = self.sequence.basket_pnl if self.sequence else 0.0
+        with self._transition_lock:
+            if self._closing_cycle is not None:
+                return self._advance_close(snap, positions, orders)
 
-        max_dd = float(snap["max_cycle_drawdown"])
-        forced = max_dd > 0 and basket <= -abs(max_dd)
+            assessment = self.evaluate_exit(snap, tick, positions)
+            basket = self.sequence.basket_pnl if self.sequence else 0.0
 
-        if not forced and (assessment is None or assessment.decision != EXIT):
-            return False
+            max_dd = float(snap["max_cycle_drawdown"])
+            forced = max_dd > 0 and basket <= -abs(max_dd)
 
-        kind = "RISK" if forced else "EXIT_ENGINE"
-        reason = (f"cycle drawdown limit hit ({basket:+.2f})" if forced
-                  else assessment.reason)
+            if not forced and (assessment is None or assessment.decision != EXIT):
+                return False
 
-        self.state = State.CYCLE_COMPLETE
-        self._cancel_all(orders, f"cycle end: {reason}")
-        if forced or snap["cycle_close_positions"]:
+            self._closing_cycle = {
+                "cycle_id": self.cycle.cycle_id,
+                "forced": forced,
+                "kind": "RISK" if forced else "EXIT_ENGINE",
+                "reason": (f"cycle drawdown limit hit ({basket:+.2f})" if forced
+                           else assessment.reason),
+                "assessment": assessment,
+                "attempts": 0,
+            }
+            return self._advance_close(snap, positions, orders)
+
+    def _advance_close(self, snap, positions, orders):
+        """
+        Close the cycle out and only then start the next one.
+
+        Cancel -> close -> VERIFY against what MT5 actually reports -> record ->
+        new cycle. If the broker refused something, the leftovers are retried on
+        the next pass instead of building a second ladder on top of the first.
+        """
+        info = self._closing_cycle
+        info["attempts"] += 1
+        self.state = State.CLOSING_CYCLE
+
+        self._cancel_all(orders, f"cycle end: {info['reason']}")
+        if info["forced"] or snap["cycle_close_positions"]:
             for pos in positions:
                 ok, msg = self.broker.close_position(pos.ticket, comment="cycle end")
                 if not ok:
@@ -732,30 +802,55 @@ class RollingLadderEngine:
             for trade in self.broker.poll_closed():
                 self._on_closed(trade, snap)
 
+        # --- verify: the old cycle must be gone from the broker --------------
+        left_orders = self.broker.orders()
+        left_positions = self.broker.positions() if (
+            info["forced"] or snap["cycle_close_positions"]) else []
+        if left_orders or left_positions:
+            if info["attempts"] in (3, 10) or info["attempts"] % 50 == 0:
+                self._event(
+                    "CYCLE_CLOSE_PENDING",
+                    f"Cycle #{info['cycle_id']} still has "
+                    f"{len(left_positions)} positions / {len(left_orders)} orders "
+                    f"after {info['attempts']} attempts - retrying, no new "
+                    f"ladder until it is clean",
+                    cycle_id=info["cycle_id"], status="RETRY")
+            return "pending"
+
+        # --- record ----------------------------------------------------------
         total = self.cycle.realized
         lost = total < 0
         sequence = self.sequence
+        assessment = info["assessment"]
 
         if lost:
             self.consecutive_losing_cycles += 1
+        else:
+            self.consecutive_losing_cycles = 0
+        # Continuous mode: a normal cycle is followed immediately by the next
+        # one. Only a risk-forced close arms the cooldown.
+        if info["forced"]:
             cooldown = float(snap["cooldown_after_loss_minutes"]) * 60.0
             if cooldown > 0:
                 self.cooldown_until = self.clock() + cooldown
-        else:
-            self.consecutive_losing_cycles = 0
 
         self._event("CYCLE_LOSS" if lost else "CYCLE_COMPLETED",
-                    f"Cycle #{self.cycle.cycle_id}: {self.cycle.trades} triggers, "
+                    f"Cycle #{info['cycle_id']}: {self.cycle.trades} triggers, "
                     f"{self.cycle.tp_count} TPs, P/L {total:+.2f} "
-                    f"[{kind}] {reason}",
-                    cycle_id=self.cycle.cycle_id, profit=total,
+                    f"[{info['kind']}] {info['reason']}",
+                    cycle_id=info["cycle_id"], profit=total,
                     cycle_profit=total, daily_profit=self.daily_profit,
                     status="LOSS" if lost else "OK")
-        self._emit("cycle_complete", self.cycle, sequence, assessment, total,
-                   reason, kind, lost)
 
-        self._start_cycle(reason=reason)
-        return True
+        duration = self.clock() - self.cycle.started_at
+        closed_cycle = self.cycle
+        self._closing_cycle = None
+        # the next cycle is anchored on the CURRENT price, never the old grid
+        self._start_cycle(reason=info["reason"])
+        self._emit("cycle_complete", closed_cycle, sequence, assessment, total,
+                   info["reason"], info["kind"], lost, duration,
+                   self.cycle.cycle_id)
+        return "restarted"
 
     # ---------------------------------------------------------- reconciliation
     def _reconcile(self, snap, tick, positions, orders):

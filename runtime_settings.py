@@ -116,6 +116,13 @@ VALIDATORS = {
     "timeframe":           (lambda v: _upper_choice(v, TIMEFRAMES, "Timeframe"), "Timeframe", False),
     "direction_filter":    (lambda v: _choice(v, DIRECTION_MODES, "Direction filter"), "Direction", True),
 
+    # --- telegram notification policy ---
+    "telegram_entry_alerts":  (lambda v: _flag(v, "Entry alerts"), "Entry Alerts", False),
+    "telegram_state_alerts":  (lambda v: _flag(v, "State alerts"), "State Alerts", False),
+    "telegram_status_updates": (lambda v: _flag(v, "Status updates"), "Status Updates", False),
+    "telegram_status_interval_minutes": (lambda v: _num(v, float, "Status interval", 1.0, 1440.0), "Status Interval", False),
+    "telegram_error_throttle_seconds": (lambda v: _num(v, float, "Error throttle", 0.0, 86400.0), "Error Throttle", False),
+
     # --- adaptive exit engine (all fittable against historical data) ---
     "exit_threshold_exit":    (lambda v: _num(v, float, "Exit threshold", 1.0, 100.0), "Exit Score", True),
     "exit_threshold_monitor": (lambda v: _num(v, float, "Monitor threshold", 0.0, 99.0), "Monitor Score", False),
@@ -255,6 +262,10 @@ class RuntimeSettings:
             return "AUTO" if not value else f"{value} pts"
         if key == "cooldown_after_loss_minutes":
             return "OFF" if not value else f"{float(value):g} min"
+        if key == "telegram_status_interval_minutes":
+            return f"{float(value):g} min"
+        if key == "telegram_error_throttle_seconds":
+            return "OFF" if not value else f"{float(value):g}s"
         if key == "order_max_age_seconds":
             return "OFF" if not value else f"{float(value):g}s"
         return str(value)

@@ -246,7 +246,8 @@ async def run():
              "settings_maxlot", "settings_ladder", "settings_spacing",
              "settings_depth", "settings_offset", "settings_roll", "settings_cycle",
              "settings_exit", "settings_exitweights", "settings_maxdepth",
-             "settings_risk", "settings_open", "settings_pending",
+             "settings_notify", "settings_risk", "settings_open",
+             "settings_pending",
              "settings_spread", "settings_daily", "settings_cycleloss",
              "settings_streak", "settings_cooldown", "settings_age",
              "settings_direction"]
@@ -318,6 +319,19 @@ async def run():
             [l for l in text.splitlines() if "pip =" in l])
     panel.render("apply:order_max_age_seconds:300", 111)
     t.check("order age applied", S.get("order_max_age_seconds") == 300)
+    text, markup = panel.render("settings_notify", 111)
+    t.check("notifications menu shows the policy",
+            "Status updates:" in text and "Per-entry alerts: OFF" in text,
+            text.replace("\n", " | ")[:140])
+    t.check("notifications menu explains where the detail lives",
+            "CSV logs in full" in text)
+    t.check("status updates can be toggled from the menu",
+            any("telegram_status_updates" in b for b in buttons(markup)),
+            str(buttons(markup)))
+    panel.render("apply:telegram_status_updates:false", 111)
+    t.check("status updates can be switched off from Telegram",
+            S.get("telegram_status_updates") is False)
+    panel.render("apply:telegram_status_updates:true", 111)
     before = S.get("rearm_levels")
     panel.render(f"apply:rearm_levels:{'false' if before else 'true'}", 111)
     t.check("toggle flips a boolean", S.get("rearm_levels") is not before)

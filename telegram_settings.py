@@ -64,6 +64,10 @@ class SettingsPanel:
         "cooldown_after_loss_minutes": "cooldown",
         "order_max_age_seconds": "age",
         "direction_filter": "direction", "timeframe": "settings",
+        "telegram_status_updates": "notify", "telegram_state_alerts": "notify",
+        "telegram_entry_alerts": "notify",
+        "telegram_status_interval_minutes": "notify",
+        "telegram_error_throttle_seconds": "notify",
         "exit_threshold_exit": "exit", "exit_threshold_monitor": "exit",
         "exit_w_reversal": "exitweights", "exit_w_exhaustion": "exitweights",
         "exit_w_continuation": "exitweights", "exit_w_depth": "exitweights",
@@ -83,6 +87,10 @@ class SettingsPanel:
         "first_level_offset": "Send the distance from price to the first level "
                               "(price units). The broker minimum always wins.",
         "max_ladder_depth": "Send the maximum ladder depth used per cycle.",
+        "telegram_status_interval_minutes": "Send how often the periodic status "
+                                            "should be posted, in minutes.",
+        "telegram_error_throttle_seconds": "Send how long an identical error is "
+                                           "suppressed for, in seconds.",
         "exit_threshold_exit": "Send the exit score that closes a cycle (1-100).",
         "exit_threshold_monitor": "Send the score where the cycle moves to "
                                   "MONITOR (below the exit score).",
@@ -304,6 +312,9 @@ class SettingsPanel:
             f"Cycle drawdown: {self._d('max_cycle_drawdown')}",
             "",
             f"🧭 Direction: {DIRECTION_LABELS[s['direction_filter']]}",
+            "🔔 Telegram: cycle events"
+            + (f" + status every {s['telegram_status_interval_minutes']:g}m"
+               if s["telegram_status_updates"] else " only"),
             "",
             "<i>Changes apply to NEW levels only.</i>",
         ])
@@ -313,7 +324,8 @@ class SettingsPanel:
              _btn("🛡 RISK SETTINGS", "settings_risk")],
             [_btn("⚖️ EXIT ENGINE", "settings_exit"),
              _btn("🧭 DIRECTION", "settings_direction")],
-            [_btn("♻️ RESET SETTINGS", "confirm:reset:1")],
+            [_btn("🔔 NOTIFICATIONS", "settings_notify"),
+             _btn("♻️ RESET SETTINGS", "confirm:reset:1")],
             [_btn("🔙 MAIN MENU", "panel")],
         )
         return text, markup
@@ -673,6 +685,40 @@ class SettingsPanel:
             "so stale levels never fire into a different market.")
 
     # ---- direction --------------------------------------------------------
+    def _menu_notify(self):
+        s = self.settings.snapshot()
+        text = "\n".join([
+            "🔔 <b>NOTIFICATIONS</b>", "",
+            f"Status updates: {'ON' if s['telegram_status_updates'] else 'OFF'}"
+            f"  (every {s['telegram_status_interval_minutes']:g} min)",
+            f"State alerts: {'ON' if s['telegram_state_alerts'] else 'OFF'}",
+            f"Per-entry alerts: "
+            f"{'ON' if s['telegram_entry_alerts'] else 'OFF'}",
+            f"Error throttle: {s['telegram_error_throttle_seconds']:g}s", "",
+            "Telegram carries important events only: cycle results, reversals,",
+            "risk and errors. Every level, order, trigger and TP still goes to",
+            "the CSV logs in full.", "",
+            "Per-entry alerts are off by design - this strategy would flood",
+            "the chat.",
+        ])
+        return text, _rows(
+            [_btn(f"STATUS UPDATES: "
+                  f"{'ON' if s['telegram_status_updates'] else 'OFF'}",
+                  f"apply:telegram_status_updates:"
+                  f"{'false' if s['telegram_status_updates'] else 'true'}"),
+             _btn("⏱ INTERVAL", "custom:telegram_status_interval_minutes")],
+            [_btn(f"STATE ALERTS: "
+                  f"{'ON' if s['telegram_state_alerts'] else 'OFF'}",
+                  f"apply:telegram_state_alerts:"
+                  f"{'false' if s['telegram_state_alerts'] else 'true'}")],
+            [_btn(f"ENTRY ALERTS: "
+                  f"{'ON' if s['telegram_entry_alerts'] else 'OFF'}",
+                  f"apply:telegram_entry_alerts:"
+                  f"{'false' if s['telegram_entry_alerts'] else 'true'}")],
+            [_btn("⏳ ERROR THROTTLE", "custom:telegram_error_throttle_seconds")],
+            [_btn(BACK, "settings")],
+        )
+
     def _menu_direction(self):
         current = self.settings.get("direction_filter")
         text = "\n".join([

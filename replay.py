@@ -222,7 +222,8 @@ def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
         "pending stop orders fill at the level unless price gapped past it",
     ]
 
-    def on_cycle(cycle, sequence, assessment, total, reason, kind, lost):
+    def on_cycle(cycle, sequence, assessment, total, reason, kind, lost,
+                 duration=0.0, next_cycle_id=None):
         seq = sequence.snapshot() if sequence else {}
         result.cycles.append({
             "cycle_id": cycle.cycle_id, "realized": total,
@@ -232,6 +233,7 @@ def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
             "exit_score": round(assessment.exit_score, 1) if assessment else 0,
             "state": assessment.state if assessment else "",
             "kind": kind, "reason": reason,
+            "duration_seconds": round(duration, 1),
         })
         label = f"{kind}: {assessment.state if assessment else 'n/a'}"
         result.exit_reasons[label] = result.exit_reasons.get(label, 0) + 1

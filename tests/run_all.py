@@ -16,6 +16,8 @@ SUITES = [
     "test_settings.py",
     "test_exit_engine.py",
     "test_ladder_engine.py",
+    "test_continuous.py",
+    "test_notifications.py",
     "test_replay.py",
     "test_telegram.py",
     "test_app.py",
