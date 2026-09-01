@@ -822,11 +822,12 @@ class LadderBot:
             spread=self.engine.last_tick.spread if self.engine.last_tick else None,
         )
         if not snap.get("telegram_entry_alerts"):
-            return
+            return                        # the default: no per-entry messages
         d = spec.digits
+        target = (f" → {position.tp:.{d}f}" if position.tp else " (basket)")
         self.notify(
             f"🟢 <b>LADDER ENTRY</b>  {position.side} {position.volume}\n"
-            f"{position.price_open:.{d}f} → {position.tp:.{d}f}  "
+            f"{position.price_open:.{d}f}{target}  "
             f"(cycle #{cycle.cycle_id}, level {index:+d})"
         )
 
@@ -919,7 +920,7 @@ class LadderBot:
             duration_seconds=duration,
             next_cycle_id=next_cycle_id if next_cycle_id is not None
             else cycle.cycle_id + 1,
-            next_ladder_seconds=wait)
+            next_ladder_seconds=wait, kind=kind)
 
     def _on_risk_blocked(self, reason):
         self.notifier.risk_event(
@@ -1009,8 +1010,10 @@ class Application:
             f"{'  (simulated fills, no orders sent)' if cfg.TRADING_MODE == 'PAPER' else '  *** REAL ORDERS ***'}")
         log(f"Ladder: spacing {snap['ladder_spacing']} x depth {snap['ladder_depth']} "
             f"| first level {snap['first_level_offset']} | {snap['roll_mode']}")
-        tp_txt = (f"{snap['tp_levels']} level(s) = "
-                  f"{snap['tp_levels'] * snap['ladder_spacing']:g}"
+        tp_txt = ("NONE - the cycle is closed as one basket"
+                  if snap["tp_mode"] == "none"
+                  else f"{snap['tp_levels']} level(s) = "
+                       f"{snap['tp_levels'] * snap['ladder_spacing']:g}"
                   if snap["tp_mode"] == "levels"
                   else f"{snap['tp_mode']} ({snap['tp_distance']})")
         log(f"TP: {tp_txt} | SL: {snap['stop_loss_distance'] or 'none'} | "

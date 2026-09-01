@@ -138,9 +138,13 @@ REARM_LEVELS = _get_bool("REARM_LEVELS", True)
 # ---------------------------------------------------------------------------
 # TAKE PROFIT
 # ---------------------------------------------------------------------------
-# levels = TP_LEVELS x LADDER_SPACING (default) | distance = TP_DISTANCE price
-# units | 1_pip..5_pips = symbol-aware pips
-TP_MODE = _get_str("TP_MODE", "levels").lower()
+# none (default) = NO individual take profit. Ladder positions stay open and
+# the whole cycle is closed as one basket by the exit engine - this is the
+# basket architecture the strategy is built on.
+# levels = TP_LEVELS x LADDER_SPACING | distance = TP_DISTANCE price units |
+# 1_pip..5_pips = symbol-aware pips. Those attach a per-trade TP and turn each
+# ladder level back into an independent trade.
+TP_MODE = _get_str("TP_MODE", "none").lower()
 TP_LEVELS = _get_int("TP_LEVELS", 1)
 TP_DISTANCE = _get_float("TP_DISTANCE", LADDER_SPACING)
 STOP_LOSS_DISTANCE = _get_float("STOP_LOSS_DISTANCE", 0.0)   # 0 = no SL
@@ -210,7 +214,11 @@ def _exit_settings():
 # ---------------------------------------------------------------------------
 LOT_SIZE = _get_float("LOT_SIZE", 0.01)                 # fixed lots, no martingale
 MAX_LOT_SIZE = _get_float("MAX_LOT_SIZE", 0.10)
-MAX_OPEN_POSITIONS = _get_int("MAX_OPEN_POSITIONS", 4)
+# The basket accumulates: with no individual TP, positions stay open until the
+# whole cycle is closed, so this has to allow a full ladder. Too low and the
+# ladder stops after N triggers, which is the "N trades = exit" rule the
+# strategy explicitly does not have.
+MAX_OPEN_POSITIONS = _get_int("MAX_OPEN_POSITIONS", 12)
 MAX_PENDING_ORDERS = _get_int("MAX_PENDING_ORDERS", 10)
 MAX_LADDER_DEPTH = _get_int("MAX_LADDER_DEPTH", 12)     # levels used per cycle
 MAX_SPREAD = _get_float("MAX_SPREAD", 0.50)             # price units, 0 = off
@@ -393,9 +401,14 @@ def validate():
         errors.append("LADDER_SPACING must be greater than 0")
     if LADDER_DEPTH < 1:
         errors.append("LADDER_DEPTH must be at least 1")
-    if TP_MODE not in ("levels", "distance", "1_pip", "2_pips", "3_pips",
-                       "4_pips", "5_pips"):
-        errors.append("TP_MODE must be levels, distance or 1_pip..5_pips")
+    if TP_MODE not in ("none", "levels", "distance", "1_pip", "2_pips",
+                       "3_pips", "4_pips", "5_pips"):
+        errors.append("TP_MODE must be none, levels, distance or 1_pip..5_pips")
+    if TP_MODE != "none":
+        warnings.append(
+            f"TP_MODE={TP_MODE} attaches an individual take profit to every "
+            f"ladder position - the strategy is designed to manage the cycle "
+            f"as ONE basket. Use TP_MODE=none unless you want per-trade exits")
     if TP_MODE == "distance" and TP_DISTANCE <= 0:
         errors.append("TP_DISTANCE must be greater than 0")
     if TP_MODE == "levels" and TP_LEVELS < 1:
@@ -406,6 +419,11 @@ def validate():
         errors.append(f"LOT_SIZE ({LOT_SIZE}) is above MAX_LOT_SIZE ({MAX_LOT_SIZE})")
     if MAX_OPEN_POSITIONS < 1:
         errors.append("MAX_OPEN_POSITIONS must be at least 1")
+    if TP_MODE == "none" and MAX_OPEN_POSITIONS < LADDER_DEPTH:
+        warnings.append(
+            f"MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS} is below LADDER_DEPTH="
+            f"{LADDER_DEPTH}: with no individual TP the basket will stop "
+            f"accumulating before the ladder is fully consumed")
     if MAX_PENDING_ORDERS < 1:
         errors.append("MAX_PENDING_ORDERS must be at least 1")
     if POLL_SECONDS <= 0:
@@ -456,8 +474,9 @@ def strategy_summary():
         "Mode": TRADING_MODE,
         "Spacing": LADDER_SPACING,
         "Depth": LADDER_DEPTH,
-        "TP": f"{TP_LEVELS} level(s)" if TP_MODE == "levels" else (
-            TP_DISTANCE if TP_MODE == "distance" else TP_MODE),
+        "TP": ("none (basket)" if TP_MODE == "none" else
+               f"{TP_LEVELS} level(s)" if TP_MODE == "levels" else (
+                   TP_DISTANCE if TP_MODE == "distance" else TP_MODE)),
         "Lot": LOT_SIZE,
         "Exit": f"score >= {_EXIT_DEFAULTS['threshold_exit']:.0f}",
         "Max Positions": MAX_OPEN_POSITIONS,

@@ -43,7 +43,7 @@ n, sent, clock = notifier()
 n.bot_started("XAUUSDs", "M5", 0.30, 1, "PAPER")
 t.check("start message sent", len(sent) == 1)
 t.check("start message names symbol, TF, spacing and cycle",
-        all(x in sent[0] for x in ("XAUUSDs", "M5", "0.3", "Cycle #1")), sent[0])
+        all(x in sent[0] for x in ("XAUUSDs", "M5", "0.3", "Cycle: #1")), sent[0])
 t.check("start message is compact", len(sent[0]) < 200, str(len(sent[0])))
 n.bot_stopped("XAUUSDs", 18, 0, 0, 2.34)
 t.check("stop message reports the session",

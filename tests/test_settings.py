@@ -8,7 +8,7 @@ from harness import Suite, use_stub_mt5
 use_stub_mt5()
 
 import config as cfg
-from runtime_settings import RuntimeSettings, SettingError
+from runtime_settings import TP_MODES, RuntimeSettings, SettingError
 
 t = Suite("settings")
 TMP = pathlib.Path("/tmp/settings_tests")
@@ -21,17 +21,20 @@ rs = RuntimeSettings(cfg.runtime_defaults(), PATH)
 s = rs.snapshot()
 t.check("ladder defaults",
         (s["ladder_spacing"], s["ladder_depth"], s["tp_mode"], s["tp_levels"],
-         s["lot_size"]) == (0.30, 5, "levels", 1, 0.01),
+         s["lot_size"]) == (0.30, 5, "none", 1, 0.01),
         str({k: s[k] for k in ("ladder_spacing", "ladder_depth", "tp_mode",
                                "tp_levels", "lot_size")}))
-t.check("a 1-level TP equals the ladder spacing",
+t.check("a 1-level TP equals the ladder spacing, if per-trade TPs are used",
         s["tp_levels"] * s["ladder_spacing"] == 0.30)
 t.check("risk defaults",
         (s["max_open_positions"], s["max_pending_orders"], s["max_spread"],
-         s["direction_filter"]) == (4, 10, 0.50, "off"),
+         s["direction_filter"]) == (12, 10, 0.50, "off"),
         str({k: s[k] for k in ("max_open_positions", "max_pending_orders",
                                "max_spread", "direction_filter")}))
-t.check("TP mode default is ladder levels", s["tp_mode"] == "levels")
+t.check("TP mode defaults to NONE - the basket has no individual TPs",
+        s["tp_mode"] == "none", s["tp_mode"])
+t.check("per-trade TP modes are still available for anyone who wants them",
+        set(("levels", "distance", "1_pip")) <= set(TP_MODES), str(TP_MODES))
 t.check("adaptive exit defaults",
         (s["exit_threshold_exit"], s["exit_threshold_monitor"],
          s["exit_w_reversal"]) == (70.0, 40.0, 0.75),

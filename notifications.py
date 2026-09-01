@@ -98,9 +98,9 @@ class TelegramNotifier:
         return self._emit(
             f"🟢 <b>ROLLING LADDER STARTED</b>\n\n"
             f"{symbol}\n"
-            f"TF: {timeframe}   Mode: {mode}\n"
-            f"Spacing: {spacing:g}\n\n"
-            f"Cycle #{cycle_id}\n"
+            f"{timeframe}   [{mode}]\n\n"
+            f"Cycle: #{cycle_id}\n"
+            f"Spacing: {spacing:g}\n"
             f"Ladder deployed"
         )
 
@@ -117,7 +117,7 @@ class TelegramNotifier:
     # --------------------------------------------------------------- cycles
     def cycle_closed(self, symbol, cycle_id, total, buys, sells, reason_word,
                      direction, duration_seconds, next_cycle_id,
-                     next_ladder_seconds=0.0):
+                     next_ladder_seconds=0.0, kind=""):
         """
         One message when the cycle is confirmed closed and flat.
 
@@ -125,16 +125,19 @@ class TelegramNotifier:
         by `cycle_started` when it has actually been deployed. There is no
         countdown in between - one message here, one message there.
         """
-        icon = "⏳" if next_ladder_seconds > 0 else ("🟢" if total >= 0 else "🔴")
+        # 🛡 says a risk rule ended it, not the strategy - that distinction
+        # matters more at a glance than the sign of the result.
+        icon = ("🛡" if str(kind).startswith(("RISK", "OTHER_RISK", "MANUAL"))
+                else "🟢" if total >= 0 else "🔴")
         wait = (f"Next ladder in {_seconds(next_ladder_seconds)}."
                 if next_ladder_seconds > 0 else "Next ladder deploying now.")
         return self._emit(
             f"{icon} <b>CYCLE #{cycle_id} CLOSED</b>\n\n"
-            f"{symbol}\n"
-            f"Exit: {reason_word}\n"
+            f"{symbol}\n\n"
             f"Result: {total:+.2f}\n\n"
             f"BUY: {buys}\n"
             f"SELL: {sells}\n\n"
+            f"Exit: {reason_word}\n"
             f"Direction: {direction or '-'}\n"
             f"Duration: {_duration(duration_seconds)}\n\n"
             f"{wait}"

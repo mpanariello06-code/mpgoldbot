@@ -264,10 +264,14 @@ class TelegramController:
         momentum = s.get("momentum_score", 0.0)
         momentum_word = ("STRONG" if momentum >= 0.66 else
                          "WEAK" if momentum <= 0.33 else "NEUTRAL")
+        # which way the basket is leaning, not just how hard
+        dominant = s.get("dominant_side") or "-"
         reversal = s.get("reversal_score", 0.0)
-        reversal_word = "DETECTED" if s.get("state") == "REVERSAL_DETECTED" or \
-            reversal >= 0.5 else "NOT DETECTED"
+        reversal_word = "YES" if s.get("market_state") == "REVERSAL_DETECTED" or \
+            reversal >= 0.5 else "NO"
         market_state = (s.get("state") or "").replace("_", " ")
+        cycle_word = ("ACTIVE" if s.get("cycle_active", True) else
+                      "COOLDOWN" if s.get("in_reentry_cooldown") else "CLOSED")
 
         lines = [
             "📊 <b>ROLLING LADDER</b>", "",
@@ -276,38 +280,37 @@ class TelegramController:
             f"MT5: {'Connected' if s['mt5_connected'] else 'Disconnected'}",
             f"Price: {price}   Spread: {spread}",
             "",
-            (f"Cycle: #{s.get('cycle_id', 0)} (CLOSED)"
-             if not s.get("cycle_active", True)
-             else f"Cycle: #{s.get('cycle_id', 0)}"),
-            f"State: {market_state or '-'}",
+            f"Cycle: #{s.get('cycle_id', 0)}",
+            f"State: {cycle_word}   ({market_state or '-'})",
             f"Age: {int(s.get('cycle_age_seconds', 0) // 60)} min",
             "",
             *(["⏳ <b>COOLDOWN AFTER EXIT</b>",
                f"No active cycle. Next ladder in "
                f"{s.get('reentry_wait_seconds', 0):.0f}s.", ""]
               if s.get("in_reentry_cooldown") else []),
-            "<b>LIVE IN MT5</b>",
+            "<b>LIVE IN MT5</b>   (what actually exists right now)",
             f"Pending BUY: {s.get('current_pending_buys', 0)}",
             f"Pending SELL: {s.get('current_pending_sells', 0)}",
             f"Open BUY: {s.get('current_open_buys', 0)}",
             f"Open SELL: {s.get('current_open_sells', 0)}",
             "",
-            "<b>THIS CYCLE SO FAR</b>",
+            "<b>THIS CYCLE SO FAR</b>   (history, NOT current exposure)",
             f"Historical BUY triggers: {s.get('historical_buy_triggers', 0)}",
             f"Historical SELL triggers: {s.get('historical_sell_triggers', 0)}",
             f"Directional imbalance: {s.get('imbalance', 0):.2f}x",
             f"Direction changes: {s.get('direction_changes', 0)}",
             f"Ladder depth used: {s.get('ladder_depth_used', 0)}",
             "",
-            f"Basket floating P/L: {_money(s.get('floating_pnl', 0))}",
-            f"Realized this cycle: {_money(s.get('realized_pnl', 0))}",
-            f"Cycle total: {_money(s.get('cycle_total_pnl', 0))}",
+            "<b>BASKET</b>",
+            f"Floating basket P/L: {_money(s.get('basket_floating_pnl', 0))}",
+            f"Realized this cycle: {_money(s.get('basket_realized_pnl', 0))}",
+            f"Cycle total: {_money(s.get('basket_net_pnl', 0))}",
             f"Drawdown: {_money(-abs(s.get('basket_drawdown', 0)))}",
             f"Daily P/L: {_money(s.get('daily_profit', 0))}",
             "",
             f"Spacing: {s.get('spacing')}   TP: {_num(s.get('tp_distance'))}   "
             f"Lot: {s.get('lot')}",
-            f"Momentum: {momentum_word} ({momentum:.2f})",
+            f"Momentum: {dominant} {momentum_word} ({momentum:.2f})",
             f"Reversal: {reversal_word} ({reversal:.2f})",
             f"Exhaustion: {s.get('exhaustion_score', 0):.2f}",
             f"Directional: {s.get('directional_score', 0):.2f}   "

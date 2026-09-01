@@ -35,12 +35,27 @@ COMMENT_RE = re.compile(r"^RL(\d+)([BS])(-?\d+)")
 
 # ---------------------------------------------------------------- states
 class State:
+    """
+    The cycle state machine.
+
+        IDLE -> SAFETY_CHECK -> BUILDING_LADDER -> LADDER_ACTIVE -> TRADING
+             -> CLOSING_CYCLE -> VERIFYING_FLAT -> COOLDOWN_AFTER_EXIT
+             -> NEW_CYCLE -> BUILDING_LADDER ...
+
+    The market reading (continuation / reversal / uncertain / exit evaluation)
+    is the exit engine's own `state`, reported alongside this one: this is what
+    the bot is DOING, that is what it is SEEING.
+    """
     IDLE = "IDLE"
     INITIALIZING = "INITIALIZING"
-    LADDER_ACTIVE = "LADDER_ACTIVE"
-    POSITION_ACTIVE = "POSITION_ACTIVE"
+    SAFETY_CHECK = "SAFETY_CHECK"        # risk + spread gates before deploying
+    BUILDING_LADDER = "BUILDING_LADDER"  # placing the first ladder of a cycle
+    LADDER_ACTIVE = "LADDER_ACTIVE"      # ladder live, no position yet
+    POSITION_ACTIVE = "POSITION_ACTIVE"  # a.k.a. TRADING: the basket is open
+    TRADING = "POSITION_ACTIVE"          # alias, same state
     ROLLING = "ROLLING"
-    CLOSING_CYCLE = "CLOSING_CYCLE"      # closing out, verifying against MT5
+    CLOSING_CYCLE = "CLOSING_CYCLE"      # closing the basket out
+    VERIFYING_FLAT = "VERIFYING_FLAT"    # re-reading MT5 until it confirms flat
     CYCLE_COMPLETE = "CYCLE_COMPLETE"
     COOLDOWN_AFTER_EXIT = "COOLDOWN_AFTER_EXIT"   # flat, settling before re-entry
     NEW_CYCLE = "NEW_CYCLE"
@@ -529,10 +544,16 @@ class RollingLadderEngine:
 
     def tp_distance(self, snap):
         """
-        TP in price units. Levels (the default) tie the target to the ladder
-        spacing, so a 1-level TP is exactly the next rung.
+        Individual TP in price units, or 0 for the basket architecture.
+
+        0 is the default and the point of the strategy: a triggered level is
+        NOT an independent trade with its own target, it is one leg of a basket
+        the exit engine closes as a whole. The other modes exist for anyone who
+        deliberately wants per-trade exits back.
         """
         mode = snap["tp_mode"]
+        if mode == "none":
+            return 0.0
         if mode == "levels":
             return int(snap["tp_levels"]) * float(snap["ladder_spacing"])
         if mode == "distance":
@@ -557,17 +578,105 @@ class RollingLadderEngine:
         return self.spec.money_per_price_unit(snap["lot_size"]) * \
             float(snap["ladder_spacing"])
 
+    # ============================================================ the basket
+    # The cycle - not the individual trade - is the unit of management. Every
+    # order and position the ladder creates carries `RL<cycle><B|S><index>` in
+    # its comment, and the broker adapters already filter by magic and symbol,
+    # so a basket is identified by (symbol, magic, cycle_id).
+    def _mine(self, item, cycle_id):
+        """
+        Does this order/position belong to the given cycle?
+
+        A parsed comment is definitive. An unparseable one is still counted:
+        it reached us through the magic+symbol filter, so it is our exposure -
+        some brokers truncate or strip comments, and silently dropping those
+        positions would understate the basket. Only a comment naming a
+        DIFFERENT cycle is excluded.
+        """
+        parsed = parse_comment(item.comment)
+        return parsed is None or parsed[0] == cycle_id
+
+    def cycle_positions(self, cycle_id=None, positions=None):
+        """Open positions belonging to a cycle (default: the current one)."""
+        cid = self.cycle.cycle_id if cycle_id is None else cycle_id
+        items = self.broker.positions() if positions is None else positions
+        return [p for p in items if self._mine(p, cid)]
+
+    def cycle_orders(self, cycle_id=None, orders=None):
+        """Pending orders belonging to a cycle (default: the current one)."""
+        cid = self.cycle.cycle_id if cycle_id is None else cycle_id
+        items = self.broker.orders() if orders is None else orders
+        return [o for o in items if self._mine(o, cid)]
+
+    def get_cycle_floating_pnl(self, cycle_id=None, positions=None):
+        """
+        Combined floating P/L of every OPEN position in the basket.
+
+        With no open positions this is 0.00 - never the cycle's realized
+        profit wearing a floating label.
+        """
+        return round(sum(p.profit for p in
+                         self.cycle_positions(cycle_id, positions)), 2)
+
+    def get_cycle_realized_pnl(self, cycle_id=None):
+        """Banked P/L for the cycle. Under the basket architecture this stays
+        0.00 until the basket is closed, because nothing closes on its own."""
+        if cycle_id is not None and cycle_id != self.cycle.cycle_id:
+            return 0.0
+        return round(self.cycle.realized, 2)
+
+    def get_cycle_net_pnl(self, cycle_id=None, positions=None):
+        """Realized + floating: what the cycle is actually worth right now."""
+        return round(self.get_cycle_realized_pnl(cycle_id) +
+                     self.get_cycle_floating_pnl(cycle_id, positions), 2)
+
+    def get_cycle_drawdown(self, cycle_id=None):
+        """How far the basket has given back from its own peak."""
+        if self.sequence is None or (cycle_id is not None and
+                                     cycle_id != self.sequence.cycle_id):
+            return 0.0
+        return round(self.sequence.drawdown, 2)
+
+    def basket(self, positions=None, orders=None):
+        """Everything about the current basket, in one call."""
+        cid = self.cycle.cycle_id
+        pos = self.cycle_positions(cid, positions)
+        ords = self.cycle_orders(cid, orders)
+        return {
+            "cycle_id": cid,
+            "active": self.cycle_active,
+            "open_positions": len(pos),
+            "open_buys": len([p for p in pos if p.side == BUY]),
+            "open_sells": len([p for p in pos if p.side == SELL]),
+            "pending_orders": len(ords),
+            "pending_buys": len([o for o in ords if o.side == BUY_STOP]),
+            "pending_sells": len([o for o in ords if o.side == SELL_STOP]),
+            "floating_pnl": self.get_cycle_floating_pnl(cid, pos),
+            "realized_pnl": self.get_cycle_realized_pnl(cid),
+            "net_pnl": self.get_cycle_net_pnl(cid, pos),
+            "drawdown": self.get_cycle_drawdown(cid),
+        }
+
     def evaluate_exit(self, snap, tick, positions):
-        """Update the sequence with the current market and score the cycle."""
+        """
+        Score the CYCLE, not any single trade.
+
+        The exit engine only ever sees the basket's combined P/L: a BUY leg
+        sitting at -1.20 while three SELL legs sit at +2.40 is a basket at
+        +1.20, and that is the number the decision is made on. No position is
+        ever closed for being individually profitable or individually losing.
+        """
         if self.sequence is None:
             return None
+        basket = self.cycle_positions(self.cycle.cycle_id, positions)
         self.sequence.update_price(tick.mid, ts=tick.time or self.clock())
-        self.sequence.update_pnl(sum(p.profit for p in positions))
+        self.sequence.update_pnl(self.get_cycle_floating_pnl(
+            self.cycle.cycle_id, basket))
         self.exit_engine.config = self.exit_config(snap)
         self.assessment = self.exit_engine.assess(
             self.sequence,
             money_per_level=self.money_per_level(snap),
-            has_exposure=bool(positions),
+            has_exposure=bool(basket),
         )
         return self.assessment
 
@@ -686,6 +795,7 @@ class RollingLadderEngine:
             return True
 
         # 5. risk + spread gates
+        self.state = State.SAFETY_CHECK
         allow, reason = self.risk_check(snap, tick, positions, orders)
         if not allow:
             if self.block_reason != reason:
@@ -714,8 +824,12 @@ class RollingLadderEngine:
             self._event("SPREAD_CLEARED", f"spread back to {tick.spread:.2f}")
 
         # 6. reconcile the ladder
+        if not orders and not positions:
+            self.state = State.BUILDING_LADDER
         live_orders = self._reconcile(snap, tick, positions, orders)
 
+        # POSITION_ACTIVE is the TRADING state: the basket is open and being
+        # managed as one unit.
         self.state = (State.POSITION_ACTIVE if positions
                       else State.LADDER_ACTIVE if live_orders else State.ROLLING)
         self.last_update = datetime.now()
@@ -961,6 +1075,9 @@ class RollingLadderEngine:
         self.state = State.CLOSING_CYCLE
         first = info["attempts"] == 1
         cid = info["cycle_id"]
+        # the basket, not "whatever is open": only this cycle's legs are touched
+        orders = self.cycle_orders(cid, orders)
+        positions = self.cycle_positions(cid, positions)
 
         # --- cancel every pending order belonging to the cycle ---------------
         if orders:
@@ -1003,8 +1120,9 @@ class RollingLadderEngine:
                             cycle_id=cid, status="CLOSING")
 
         # --- verify against MT5: the old cycle must be gone ------------------
-        left_orders = self.broker.orders()
-        left_positions = self.broker.positions() if close_positions else []
+        self.state = State.VERIFYING_FLAT
+        left_orders = self.cycle_orders(cid)
+        left_positions = self.cycle_positions(cid) if close_positions else []
         self._event("EXIT_RECONCILED",
                     f"Cycle #{cid}: MT5 reports {len(left_positions)} positions "
                     f"/ {len(left_orders)} orders after attempt "
@@ -1298,15 +1416,16 @@ class RollingLadderEngine:
             tick = self.broker.tick()
         except Exception:
             pass
-        floating = sum(p.profit for p in positions)
         # MT5 is the source of truth for what is live right now; the sequence is
         # the history of what this cycle has already done. They are reported as
         # separate things on purpose - conflating them is how a bot ends up
         # claiming an active ladder it does not have.
-        pending_buys = len([o for o in orders if o.side == BUY_STOP])
-        pending_sells = len([o for o in orders if o.side == SELL_STOP])
-        open_buys = len([p for p in positions if p.side == BUY])
-        open_sells = len([p for p in positions if p.side == SELL])
+        basket = self.basket(positions, orders)
+        floating = basket["floating_pnl"]
+        pending_buys = basket["pending_buys"]
+        pending_sells = basket["pending_sells"]
+        open_buys = basket["open_buys"]
+        open_sells = basket["open_sells"]
         data = {
             "state": self.state,
             "mode": self.broker.name,
@@ -1328,6 +1447,14 @@ class RollingLadderEngine:
             "current_open_buys": open_buys,
             "current_open_sells": open_sells,
             "ladder_live": bool(orders),
+            # --- the basket, as one managed unit ---
+            "basket": basket,
+            "basket_open_positions": basket["open_positions"],
+            "basket_pending_orders": basket["pending_orders"],
+            "basket_floating_pnl": basket["floating_pnl"],
+            "basket_realized_pnl": basket["realized_pnl"],
+            "basket_net_pnl": basket["net_pnl"],
+            "basket_drawdown_now": basket["drawdown"],
             # --- one active cycle at a time ---
             "cycle_active": self.cycle_active,
             "reentry_wait_seconds": round(self._reentry_wait(), 1),
@@ -1337,7 +1464,7 @@ class RollingLadderEngine:
             "cycle_id": self.cycle.cycle_id,
             "tp_count": self.cycle.tp_count,
             "cycle_triggers": self.cycle.trades,
-            "cycle_profit": self.cycle.realized + floating,
+            "cycle_profit": round(self.cycle.realized + floating, 2),
             "cycle_realized": self.cycle.realized,
             "floating": floating,
             "daily_profit": self.daily_profit,
@@ -1361,11 +1488,17 @@ class RollingLadderEngine:
             data["cycle_total_pnl"] = self.sequence.realized_pnl + floating
             data["cycle_profit"] = data["cycle_total_pnl"]
             data["cycle_age_seconds"] = self.clock() - self.cycle.started_at
+        # `engine_state` is what the bot is DOING (the cycle state machine);
+        # `market_state` is what the exit engine is SEEING. They are different
+        # questions and are reported under different names.
+        data["engine_state"] = self.state
         if self.assessment is not None:
             data.update(self.assessment.as_dict())
+            data["market_state"] = self.assessment.state
         else:
             data.update({"exit_score": 0.0, "decision": CONTINUE,
                          "momentum_score": 0.0, "reversal_score": 0.0,
                          "exhaustion_score": 0.0, "continuation_score": 0.0,
                          "reason": "", "phase": self.state})
+            data["market_state"] = self.state
         return data

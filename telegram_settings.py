@@ -280,6 +280,8 @@ class SettingsPanel:
 
     def _tp_line(self):
         snap = self.settings.snapshot()
+        if snap["tp_mode"] == "none":
+            return "NONE - the cycle is closed as one basket"
         if snap["tp_mode"] == "levels":
             n = snap["tp_levels"]
             return (f"{n} level{'s' if n > 1 else ''} "
@@ -344,8 +346,10 @@ class SettingsPanel:
             f"Current: {self._tp_line()}",
             f"Ladder spacing: {self._d('ladder_spacing')}",
             f"{self._pip_line()}", "",
-            "A TP of 1 level targets the next rung of the ladder. Pip and",
-            "absolute-distance modes are there for testing other targets.",
+            "NONE is the strategy's own mode: ladder positions carry no",
+            "individual target and the exit engine closes the whole cycle",
+            "as one basket. The other modes turn every level back into an",
+            "independent trade with its own TP.",
         ])
         level_buttons = [
             _btn(f"{self._mark(mode == 'levels' and levels == n)}{n} LEVEL"
@@ -353,6 +357,8 @@ class SettingsPanel:
             for n in (1, 2, 3, 4, 5)
         ]
         return text, _rows(
+            [_btn(f"{self._mark(mode == 'none')}NONE (BASKET)",
+                  "confirm:tp_mode:none")],
             level_buttons[:3], level_buttons[3:],
             [_btn(f"{self._mark(mode == 'levels')}MODE: LEVELS",
                   "confirm:tp_mode:levels"),

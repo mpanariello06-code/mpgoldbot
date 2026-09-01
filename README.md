@@ -41,7 +41,7 @@ runtime_settings.py     Telegram-controlled settings, persisted as JSON
 telegram_controller.py  control panel (own thread, own event loop)
 telegram_settings.py    the ⚙️ SETTINGS menu tree
 csv_logger.py           trades, events, account snapshots, ladder events, cycles
-tests/                  857 offline checks — python tests/run_all.py
+tests/                  934 offline checks — python tests/run_all.py
 data/                   CSVs + runtime_settings.json + state files (auto-created)
 ```
 
@@ -124,6 +124,55 @@ ticks, but nothing is sent to the broker. Switch to `TRADING_MODE=LIVE` only
 after watching a paper session behave. The startup banner always prints the
 account, the symbol and the mode in force.
 
+## The basket
+
+**A triggered level is not a trade. It is one leg of a basket.**
+
+Ladder positions carry **no individual take profit** (`TP_MODE=none`, the
+default). Nothing closes on its own — the cycle is opened, developed and closed
+as a single managed unit, and the exit engine only ever sees the *combined*
+number:
+
+```
+BUY  @ 4437.76   -1.20
+BUY  @ 4438.06   -0.60
+SELL @ 4437.46   +0.40
+SELL @ 4437.16   +0.90
+SELL @ 4436.86   +1.10
+                 -----
+CYCLE #X basket  +0.60   <- the only P/L the decision is made on
+```
+
+This is the point of the architecture. A BUY that triggers just before price
+reverses will sit negative while the SELLs below it go positive; closing the
+winners and holding the loser is exactly what the strategy must *not* do. The
+basket is allowed to develop, and it is closed in one piece.
+
+A basket is identified by `(symbol, magic, cycle_id)` — the broker adapters
+filter by symbol and magic, and every order carries `RL<cycle><B|S><level>` in
+its comment. The engine exposes it directly:
+
+| Call | Returns |
+| --- | --- |
+| `cycle_positions()` / `cycle_orders()` | this cycle's legs and pending levels |
+| `get_cycle_floating_pnl()` | combined P/L of the open legs — **0.00 when nothing is open** |
+| `get_cycle_realized_pnl()` | banked P/L; stays 0.00 until the basket is closed |
+| `get_cycle_net_pnl()` | realized + floating |
+| `get_cycle_drawdown()` | give-back from the basket's own peak |
+| `basket()` | all of the above, plus open/pending counts split by side |
+
+A position or order whose comment names a *different* cycle is excluded. One
+whose comment cannot be parsed at all is still counted: it reached us through
+the symbol+magic filter, so it is our exposure — some brokers truncate comments,
+and dropping those legs would understate the basket.
+
+Per-trade take profits remain available for anyone who wants them
+(`TP_MODE=levels|distance|1_pip..5_pips`), but that turns each level back into
+an independent trade and the config warns when it is set. **`MAX_OPEN_POSITIONS`
+must allow a full ladder** (12 by default): with no individual TP the basket
+accumulates, and a low cap would stop the ladder after N triggers — which is
+the fixed trade count the strategy explicitly does not have.
+
 ## How the ladder works
 
 * Levels sit on a **grid anchored when the cycle starts** (`anchor + n × spacing`),
@@ -136,7 +185,7 @@ account, the symbol and the mode in force.
   `RL<cycle><B|S><level>`, e.g. `RL127B3` — which is what makes the engine
   idempotent. Every pass compares the ladder it *wants* against the orders and
   positions MT5 actually reports and places or cancels only the difference.
-* An order is replaced when its price, TP or SL no longer matches the settings,
+* Orders carry no TP by default; an order is replaced when its price, TP or SL no longer matches the settings,
   when it belongs to an older cycle, when it duplicates a level, or when it
   exceeds `ORDER_MAX_AGE`.
 * On startup, reconnect or crash recovery the state is rebuilt **from the
@@ -224,6 +273,11 @@ Worked examples from the test suite:
 | BUY ×4, then the move cools | DIRECTIONAL | exit (scenario 1) |
 | BUY ×9, then it stops paying | EXTENDED | exit (scenario 3) |
 | 2 triggers, flat readings, basket +0.70 held 60s | none | exit via `PROFIT_FALLBACK` |
+
+**An exit closes the entire basket.** Every open leg and every pending level of
+the cycle goes at once — the engine never partially closes a basket, and never
+picks off individual winners or losers. The only thing that can close one leg on
+its own is a hard risk mechanism or a per-trade TP you opted into.
 
 When a cycle ends: pending orders are cancelled, remaining positions are closed
 (`CYCLE_CLOSE_POSITIONS`), the cycle is written to `rolling_ladder_cycles.csv`
@@ -383,11 +437,14 @@ you only touch once.
 ## Tests
 
 ```bash
-python tests/run_all.py        # 857 checks, no MT5 or network needed
+python tests/run_all.py        # 934 checks, no MT5 or network needed
 ```
 
-Covers: the exit -> flat -> cooldown -> new ladder sequence and the
-one-active-cycle gate, pip/point conversion, both execution adapters, settings
+Covers: the basket architecture (no individual TP on any ladder order or
+position, combined basket P/L, winners and losers held together, an exit that
+closes everything), the nine scripted scenarios A-I, the exit -> flat ->
+cooldown -> new ladder sequence and the one-active-cycle gate, pip/point
+conversion, both execution adapters, settings
 validation and
 persistence, ladder creation and both-sided stop placement, triggering, TP,
 rolling and replenishment, partial deployment reported as partial (actual vs

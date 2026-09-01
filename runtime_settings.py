@@ -16,12 +16,23 @@ import threading
 from pathlib import Path
 
 # --- allowed values -------------------------------------------------------
-TP_MODES = ("levels", "distance", "1_pip", "2_pips", "3_pips", "4_pips", "5_pips")
+# "none" is the basket mode and the default: ladder positions carry NO
+# individual take profit, and the whole cycle is closed as one basket by the
+# exit engine. The other modes attach a per-trade TP and are kept for anyone
+# who wants the old per-trade behaviour.
+TP_MODES = ("none", "levels", "distance",
+            "1_pip", "2_pips", "3_pips", "4_pips", "5_pips")
 ROLL_MODES = ("extend", "static")
 DIRECTION_MODES = ("off", "both", "buy_bias", "sell_bias", "none")
 TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1")
 
+# Bumped when a change to the DEFAULTS has to reach existing installations.
+# 2 = the basket architecture: ladder positions carry no individual TP.
+SCHEMA_KEY = "_schema"
+BASKET_SCHEMA = 2
+
 TP_MODE_LABELS = {
+    "none": "NONE (BASKET)",
     "levels": "LEVELS",
     "distance": "DISTANCE",
     "1_pip": "1 PIP",
@@ -185,7 +196,19 @@ class RuntimeSettings:
             return [f"{self._path.name} is not a JSON object - using defaults"]
 
         with self._lock:
+            # A settings file written before the basket architecture carries a
+            # per-trade tp_mode as a leftover DEFAULT, not as a choice anyone
+            # made. Migrating it is the difference between shipping the basket
+            # strategy and silently shipping the old one.
+            migrated = None
+            if int(stored.get(SCHEMA_KEY, 0)) < BASKET_SCHEMA and \
+                    stored.get("tp_mode") not in (None, "none"):
+                migrated = stored.get("tp_mode")
+                stored = dict(stored)
+                stored["tp_mode"] = self._defaults.get("tp_mode", "none")
             for key, value in stored.items():
+                if key == SCHEMA_KEY:
+                    continue
                 if key not in self._defaults:
                     problems.append(f"unknown setting '{key}' ignored")
                     continue
@@ -194,12 +217,20 @@ class RuntimeSettings:
                 except SettingError as exc:
                     problems.append(f"{exc} - kept default {self._defaults[key]}")
             problems.extend(self._repair())
+        if migrated:
+            problems.append(
+                f"tp_mode '{migrated}' was an old default and attaches an "
+                f"individual TP to every ladder position - migrated to "
+                f"'{self._values['tp_mode']}' (the cycle is closed as one "
+                f"basket). Set it back under SETTINGS if that was deliberate")
+            self.save()
         return problems
 
     def save(self):
         """Atomic write so a crash mid-save cannot corrupt the file."""
         with self._lock:
             data = dict(self._values)
+            data[SCHEMA_KEY] = BASKET_SCHEMA
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_suffix(".tmp")

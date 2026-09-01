@@ -6,6 +6,7 @@ Each suite is a standalone script that prints PASS/FAIL lines and exits non-zero
 on failure, so they can also be run one at a time while developing.
 """
 import pathlib
+import re
 import subprocess
 import sys
 
@@ -16,6 +17,7 @@ SUITES = [
     "test_settings.py",
     "test_exit_engine.py",
     "test_scenarios.py",
+    "test_basket.py",
     "test_ladder_engine.py",
     "test_continuous.py",
     "test_notifications.py",
@@ -35,15 +37,23 @@ def main():
         out = proc.stdout
         if verbose:
             print(out)
-        passed = out.count("\nPASS |") + (1 if out.startswith("PASS |") else 0)
+        # Count from the suite's own summary, not by scanning for PASS lines:
+        # suites that start background threads interleave log output with test
+        # output, which loses a line here and there and makes the totals drift.
+        summary = re.search(r"^\w+: (\d+) passed, (\d+) failed$",
+                            out, re.M)
         fails = [ln for ln in out.splitlines() if ln.startswith("FAIL |")]
+        if summary:
+            passed, reported_fails = int(summary.group(1)), int(summary.group(2))
+        else:
+            passed, reported_fails = 0, len(fails)
         total += passed
-        failed += len(fails)
-        # a suite that produced no PASS lines crashed before it could run
-        crashed = passed == 0 or proc.returncode not in (0, 1)
-        results.append((suite, passed, len(fails), crashed))
-        print(f"{suite:<28} {passed:>4} passed  {len(fails):>3} failed"
-              f"{'  <-- CRASHED' if crashed else '  <-- FAILURES' if fails else ''}")
+        failed += reported_fails
+        # a suite with no summary line crashed before it could finish
+        crashed = summary is None or proc.returncode not in (0, 1)
+        results.append((suite, passed, reported_fails, crashed))
+        print(f"{suite:<28} {passed:>4} passed  {reported_fails:>3} failed"
+              f"{'  <-- CRASHED' if crashed else '  <-- FAILURES' if reported_fails else ''}")
         for line in fails:
             print("   " + line)
         if crashed:

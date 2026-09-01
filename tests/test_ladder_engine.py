@@ -62,10 +62,13 @@ t.check("every level sits on the cycle grid",
         all(abs((p - engine.cycle.anchor) / 0.30 -
                 round((p - engine.cycle.anchor) / 0.30)) < 1e-6
             for p in buy_prices + sell_prices))
-t.check("every buy stop carries a 0.30 TP",
-        all(abs(o.tp - o.price - 0.30) < 1e-9 for o in orders if o.side == BUY_STOP))
-t.check("every sell stop carries a 0.30 TP",
-        all(abs(o.price - o.tp - 0.30) < 1e-9 for o in orders if o.side == SELL_STOP))
+# The basket architecture: a triggered level is one leg of a cycle, not an
+# independent trade with its own target.
+t.check("NO individual take profit on any ladder order by default",
+        all(o.tp == 0 for o in orders), str([o.tp for o in orders][:4]))
+t.check("the TP distance the engine computes is zero",
+        engine.tp_distance(settings.snapshot()) == 0.0,
+        str(engine.tp_distance(settings.snapshot())))
 t.check("no stop loss by default", all(o.sl == 0 for o in orders))
 t.check("fixed 0.01 lots everywhere", all(o.volume == 0.01 for o in orders))
 t.check("each level has a unique identity",
@@ -75,6 +78,23 @@ t.check("identity encodes cycle, side and level",
 t.check("LADDER_CREATED logged", rec.count("LADDER_CREATED") == 1)
 t.check("ORDER_PLACED logged per level", rec.count("ORDER_PLACED") == 10)
 t.check("state is LADDER_ACTIVE", engine.state == State.LADDER_ACTIVE)
+
+t.section("PER-TRADE TP IS STILL AVAILABLE, BUT OPT-IN")
+tp_engine, tp_broker, tp_feed, tp_settings, _ = build(
+    {"tp_mode": "levels", "tp_levels": 1}, name="pertrade")
+tp_engine.step()
+tp_orders = tp_broker.orders()
+t.check("levels mode attaches a 0.30 TP to every buy stop",
+        all(abs(o.tp - o.price - 0.30) < 1e-9
+            for o in tp_orders if o.side == BUY_STOP))
+t.check("and to every sell stop",
+        all(abs(o.price - o.tp - 0.30) < 1e-9
+            for o in tp_orders if o.side == SELL_STOP))
+t.check("switching back to basket mode strips the TPs",
+        (tp_settings._values.__setitem__("tp_mode", "none"),
+         tp_engine.step(),
+         all(o.tp == 0 for o in tp_broker.orders()))[2],
+        str([o.tp for o in tp_broker.orders()][:4]))
 
 t.section("IDEMPOTENCE / NO DUPLICATES")
 before = [o.ticket for o in broker.orders()]
@@ -359,7 +379,8 @@ t.check("lot size is used verbatim, never scaled",
 
 # ===========================================================================
 t.section("PAUSE (positions still managed)")
-engine, broker, feed, settings, rec = build(name="pause")
+engine, broker, feed, settings, rec = build(
+    {"tp_mode": "levels"}, name="pause")     # a per-trade TP, to fire while paused
 engine.step()
 buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
               key=lambda o: o.price)
@@ -450,7 +471,8 @@ t.check("pip size setting rescales the TP",
         abs(order.tp - order.price - 1.00) < 1e-9, f"{order.tp - order.price:.2f}")
 
 t.section("SETTINGS CHANGE AT RUNTIME")
-engine, broker, feed, settings, rec = build(name="live")
+engine, broker, feed, settings, rec = build(
+    {"tp_mode": "distance", "tp_distance": 0.30}, name="live")
 engine.step()
 old_tp = next(o for o in broker.orders() if o.side == BUY_STOP).tp
 settings._values["tp_distance"] = 0.60

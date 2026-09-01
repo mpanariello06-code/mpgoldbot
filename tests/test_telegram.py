@@ -81,6 +81,9 @@ class FakeEngine:
             "current_open_buys": 0, "current_open_sells": 5,
             "historical_buy_triggers": 2, "historical_sell_triggers": 5,
             "floating_pnl": 0.0, "realized_pnl": 2.31, "cycle_total_pnl": 2.31,
+            # the basket, reported as its own unit
+            "basket_floating_pnl": 0.0, "basket_realized_pnl": 2.31,
+            "basket_net_pnl": 2.31, "cycle_active": True,
             "cycle_age_seconds": 640, "directional_score": 0.12,
             "extended_score": 0.30, "ladder_live": True,
             "cycle_profit": 1.36, "daily_profit": 2.10, "total_tp": 12,
@@ -93,6 +96,7 @@ class FakeEngine:
             "previous_side": "BUY", "imbalance": 2.5, "direction_changes": 1,
             "ladder_depth_used": 5, "basket_drawdown": 0.42,
             "efficiency": 0.62, "state": "REVERSAL_DETECTED",
+            "market_state": "REVERSAL_DETECTED",
             "decision": "EXIT", "exit_score": 81.0, "momentum_score": 0.72,
             "continuation_score": 0.0, "reversal_score": 0.78,
             "exhaustion_score": 0.31,
@@ -212,17 +216,18 @@ async def run():
     t.section("STATUS SCREEN: CURRENT STATE vs HISTORY")
     text, _, _ = await press("status")
     for label in ["ROLLING LADDER", "XAUUSD   M5", "Cycle: #183",
-                  "State: REVERSAL DETECTED", "LIVE IN MT5",
+                  "State: ACTIVE   (REVERSAL DETECTED)", "LIVE IN MT5",
                   "Pending BUY: 5", "Pending SELL: 6", "Open BUY: 0",
                   "Open SELL: 5", "THIS CYCLE SO FAR",
                   "Historical BUY triggers: 2", "Historical SELL triggers: 5",
                   "Directional imbalance: 2.50x", "Ladder depth used: 5",
-                  "Basket floating P/L", "Realized this cycle", "Cycle total",
+                  "BASKET", "Floating basket P/L", "Realized this cycle",
+                  "Cycle total",
                   "Exit score: 81"]:
         t.check(f"status shows {label!r}", label in text,
                 "" if label in text else text.replace("\n", " | ")[:220])
     t.check("floating and realized are reported separately",
-            "Basket floating P/L: $0.00" in text and
+            "Floating basket P/L: $0.00" in text and
             "Realized this cycle: $2.31" in text,
             text.replace("\n", " | ")[:240])
     t.check("current orders are not confused with historical triggers",
