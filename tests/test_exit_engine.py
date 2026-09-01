@@ -132,8 +132,11 @@ trend = walk([(BUY, 1)] * 5)
 rich = assess(trend, money_per_level=1.0)
 trend.update_pnl(50.0)                      # a very profitable basket
 rich_after = assess(trend, money_per_level=1.0)
+# MONITOR is allowed here - it closes nothing, it only watches more closely.
+# What must never happen is the profit pushing the cycle over the exit line.
 t.check("a big profit alone does not close a trending cycle",
-        rich_after.decision == CONTINUE,
+        rich_after.decision != EXIT and
+        rich_after.exit_score < ExitConfig().threshold_exit,
         f"{rich_after.decision} score={rich_after.exit_score:.1f}")
 t.check("profit does raise readiness a little",
         rich_after.exit_score >= rich.exit_score,
@@ -165,8 +168,13 @@ b_cycle.update_pnl(3.50)
 big_profit_trend = assess(b_cycle)
 t.check("+1.20 with a reversal closes", small_profit_reversal.decision == EXIT,
         f"{small_profit_reversal.exit_score:.1f}")
-t.check("+3.50 with momentum continues", big_profit_trend.decision == CONTINUE,
-        f"{big_profit_trend.exit_score:.1f}")
+t.check("+3.50 with momentum does not close",
+        big_profit_trend.decision != EXIT and
+        big_profit_trend.exit_score < ExitConfig().threshold_exit,
+        f"{big_profit_trend.decision} {big_profit_trend.exit_score:.1f}")
+t.check("and the profitable trend still ranks below the small-profit reversal",
+        big_profit_trend.exit_score < small_profit_reversal.exit_score,
+        f"{big_profit_trend.exit_score:.1f} vs {small_profit_reversal.exit_score:.1f}")
 
 t.section("DRAWDOWN AWARENESS")
 seq = walk([(BUY, 1)] * 4)

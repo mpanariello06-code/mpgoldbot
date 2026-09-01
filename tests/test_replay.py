@@ -102,9 +102,10 @@ t.check("a reversal series completes cycles", len(res.cycles) > 0,
         str(len(res.cycles)))
 t.check("cycle endings are attributed", bool(res.exit_reasons),
         str(res.exit_reasons))
-t.check("endings name the market state, not a trade count",
-        all("EXIT_ENGINE" in k or "RISK" in k for k in res.exit_reasons),
-        str(res.exit_reasons))
+t.check("endings name an explicit reason, never a trade count",
+        all(any(tag in k for tag in ("SCENARIO_", "PROFIT_FALLBACK", "RISK_",
+                                     "EXIT_ENGINE"))
+            for k in res.exit_reasons), str(res.exit_reasons))
 t.check("cycle rows carry the sequence",
         all({"buy", "sell", "triggers", "exit_score"} <= set(c)
             for c in res.cycles))
@@ -140,5 +141,43 @@ bars = replay.load_bars_csv(path)
 t.check("valid rows loaded", len(bars) == 2, str(len(bars)))
 t.check("malformed rows skipped", all("open" in b for b in bars))
 t.check("per-bar spread read", bars[0]["spread"] == 0.08)
+
+# A bar file exported for a human to read is the normal case, not an error:
+# every row here has a timestamp string where an epoch would be.
+dated = TMP / "dated.csv"
+dated.write_text("time,open,high,low,close,spread\n"
+                 "2026-01-05 00:00:00,4010.0,4010.5,4009.8,4010.4,0.08\n"
+                 "2026-01-05 00:05:00,4010.4,4011.0,4010.2,4010.9,0.09\n"
+                 "2026-01-05T00:10:00,4010.9,4011.4,4010.6,4011.2,0.09\n"
+                 "2026.01.05 00:15,4011.2,4011.6,4011.0,4011.5,0.09\n")
+dated_bars = replay.load_bars_csv(dated)
+t.check("timestamp strings load", len(dated_bars) == 4, str(len(dated_bars)))
+t.check("they are converted to epoch seconds",
+        all(isinstance(b["time"], float) and b["time"] > 1_600_000_000
+            for b in dated_bars), str([b["time"] for b in dated_bars]))
+t.check("and stay in order and 5 minutes apart",
+        [round(dated_bars[i + 1]["time"] - dated_bars[i]["time"])
+         for i in range(3)] == [300, 300, 300],
+        str([b["time"] for b in dated_bars]))
+t.check("an epoch is still an epoch", replay.parse_bar_time("1000", 0) == 1000.0)
+t.check("an unreadable time falls back to the row index",
+        replay.parse_bar_time("not a time", 7) == 7.0)
+
+t.section("SIMULATED TIME DRIVES THE DAILY GUARD")
+# The daily drawdown guard resets on the engine's own clock. On the wall clock
+# a multi-day replay would spend the whole run blocked after its first bad day.
+from ladder_engine import RollingLadderEngine
+from runtime_settings import RuntimeSettings
+from fakes import make_paper
+import config as cfg
+now = [1_700_000_000.0]
+settings = RuntimeSettings(cfg.runtime_defaults(), TMP / "daily_set.json")
+broker, _feed = make_paper(state_path=TMP / "daily_paper.json")
+broker.clock = lambda: now[0]
+eng = RollingLadderEngine(broker, settings, state_path=None, clock=lambda: now[0])
+day_one = eng._today()
+now[0] += 26 * 3600
+t.check("the simulated day rolls with the data", eng._today() != day_one,
+        f"{day_one} -> {eng._today()}")
 
 t.done()

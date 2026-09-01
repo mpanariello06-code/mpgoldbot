@@ -80,6 +80,14 @@ t.check("cancel uses TRADE_ACTION_REMOVE",
 mt5.STATE["reject_orders"] = True
 ok, ticket3, msg = b.place_stop_order(BUY_STOP, 4011.0, 0.01, comment="RL1B4")
 t.check("rejection reported, not raised", not ok and "rejected" in msg, msg)
+# A refused order is a fact about the broker's constraints. The report has to
+# say enough to diagnose it without reproducing the failure by hand.
+for fragment in ("retcode=", "requested=4011.0", "volume=0.01", "bid=", "ask=",
+                 "spread=", "stops_level=", "freeze=", "tick_size=", "point=",
+                 "digits=", "volume_min=", "step=", "symbol="):
+    t.check(f"rejection report carries {fragment!r}", fragment in msg, msg)
+t.check("the retcode is named, not just numbered",
+        "(" in msg and "UNKNOWN" not in msg.split("|")[0], msg.split("|")[0])
 mt5.STATE["reject_orders"] = False
 
 t.section("LIVE CLOSE")

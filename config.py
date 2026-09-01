@@ -156,6 +156,18 @@ PIP_POINTS = _get_int("PIP_POINTS", 0)
 # historical XAUUSD data, not a discovered truth.
 CYCLE_CLOSE_POSITIONS = _get_bool("CYCLE_CLOSE_POSITIONS", True)
 
+# --- profit recovery fallback ---
+# A basket that quietly came good is taken rather than held forever waiting for
+# a scenario that may never arrive. NOT a dollar target: the buffer is a
+# fraction of what one ladder level is worth, so it scales with lot and
+# spacing, and the profit must hold for the confirmation period.
+PROFIT_FALLBACK_ENABLED = _get_bool("PROFIT_FALLBACK_ENABLED", True)
+PROFIT_FALLBACK_BUFFER_LEVELS = _get_float("PROFIT_FALLBACK_BUFFER_LEVELS", 0.5)
+PROFIT_CONFIRMATION_SECONDS = _get_float("PROFIT_CONFIRMATION_SECONDS", 60.0)
+# strong continuation above this is left to run rather than harvested
+PROFIT_FALLBACK_CONTINUATION_GUARD = _get_float(
+    "PROFIT_FALLBACK_CONTINUATION_GUARD", 0.60)
+
 _EXIT_DEFAULTS = {
     "recent_window": 5,
     "progress_intervals": 2,
@@ -164,8 +176,12 @@ _EXIT_DEFAULTS = {
     "gap_reference": 60.0,
     "min_triggers_for_exhaustion": 3,
     "min_triggers_for_reversal": 2,
+    "min_triggers_for_directional": 3,
+    "min_triggers_for_extended": 5,
     "w_reversal": 0.75,
     "w_exhaustion": 0.45,
+    "w_directional": 0.65,
+    "w_extended": 0.50,
     "w_depth": 0.20,
     "w_drawdown": 0.25,
     "w_continuation": 0.45,
@@ -209,6 +225,8 @@ MAX_CYCLE_DRAWDOWN = _get_float("MAX_CYCLE_DRAWDOWN",
                                 _get_float("MAX_CYCLE_LOSS", 20.0))
 MAX_CONSECUTIVE_LOSING_CYCLES = _get_int("MAX_CONSECUTIVE_LOSING_CYCLES", 3)
 COOLDOWN_AFTER_LOSS = _get_float("COOLDOWN_AFTER_LOSS", 15.0)   # minutes
+# No cycle may stay open forever: past this it is closed as RISK_TIMEOUT
+MAX_CYCLE_DURATION = _get_float("MAX_CYCLE_DURATION", 120.0)    # minutes, 0 = off
 
 # ---------------------------------------------------------------------------
 # ORDER HYGIENE
@@ -307,6 +325,10 @@ def runtime_defaults():
         "pip_points": PIP_POINTS,
         # cycle / adaptive exit
         "cycle_close_positions": CYCLE_CLOSE_POSITIONS,
+        "profit_fallback_enabled": PROFIT_FALLBACK_ENABLED,
+        "profit_fallback_buffer_levels": PROFIT_FALLBACK_BUFFER_LEVELS,
+        "profit_confirmation_seconds": PROFIT_CONFIRMATION_SECONDS,
+        "profit_fallback_continuation_guard": PROFIT_FALLBACK_CONTINUATION_GUARD,
         # risk
         "lot_size": LOT_SIZE,
         "max_lot_size": MAX_LOT_SIZE,
@@ -319,6 +341,7 @@ def runtime_defaults():
         "max_cycle_drawdown": MAX_CYCLE_DRAWDOWN,
         "max_consecutive_losing_cycles": MAX_CONSECUTIVE_LOSING_CYCLES,
         "cooldown_after_loss_minutes": COOLDOWN_AFTER_LOSS,
+        "max_cycle_duration_minutes": MAX_CYCLE_DURATION,
         # hygiene
         "order_max_age_seconds": ORDER_MAX_AGE,
         "m5_candle_reset": M5_CANDLE_RESET,
@@ -393,6 +416,9 @@ def validate():
         warnings.append("MAX_DAILY_DRAWDOWN is 0 - the daily guard is disabled")
     if MAX_CYCLE_DRAWDOWN <= 0:
         warnings.append("MAX_CYCLE_DRAWDOWN is 0 - the cycle guard is disabled")
+    if MAX_CYCLE_DURATION <= 0:
+        warnings.append(
+            "MAX_CYCLE_DURATION is 0 - a cycle can stay open indefinitely")
     exits = _exit_settings()
     if exits["exit_threshold_exit"] <= exits["exit_threshold_monitor"]:
         errors.append("EXIT_THRESHOLD_EXIT must be above EXIT_THRESHOLD_MONITOR")

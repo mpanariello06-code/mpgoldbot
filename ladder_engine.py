@@ -26,7 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from broker import BUY, BUY_STOP, SELL, SELL_STOP
-from exit_engine import (CONTINUE, EXIT, ExitConfig, LadderSequence,
+from exit_engine import (CONTINUE, EXIT, PROFIT_FALLBACK, RISK_DRAWDOWN,
+                         RISK_TIMEOUT, ExitConfig, LadderSequence,
                          RollingLadderExitEngine)
 
 COMMENT_RE = re.compile(r"^RL(\d+)([BS])(-?\d+)")
@@ -166,12 +167,16 @@ class RollingLadderEngine:
         self._levels_open = set()         # (side, index) currently holding a position
         self._levels_done = set()         # (side, index) consumed this cycle
         self._triggered_keys = set()      # (side, index) already in the sequence
+        self._depth_capped_logged = False
+        self._profit_since = None         # when the basket first cleared the buffer
         self._last_place_error = 0.0
 
     # =================================================================== utils
-    @staticmethod
-    def _today():
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    def _today(self):
+        # Read from the engine's own clock, not the wall clock: under a
+        # simulated clock (replay) the day has to roll with the data, or the
+        # daily drawdown guard becomes a permanent stop after the first bad day.
+        return datetime.fromtimestamp(self.clock(), timezone.utc).strftime("%Y-%m-%d")
 
     def _emit(self, name, *args, **kwargs):
         fn = self.hooks.get(name)
@@ -277,7 +282,8 @@ class RollingLadderEngine:
             # on the broker.
             self.sequence = LadderSequence(
                 self.cycle.cycle_id, self.cycle.anchor,
-                float(self.settings.get("ladder_spacing")))
+                float(self.settings.get("ladder_spacing")),
+                started_at=self.clock())
 
         for p in positions:
             self._known_positions[p.ticket] = p
@@ -310,13 +316,19 @@ class RollingLadderEngine:
         self.max_cycle_id = max(self.max_cycle_id, self.cycle.cycle_id)
         cid = new_id if new_id is not None else self.max_cycle_id + 1
         self.max_cycle_id = max(self.max_cycle_id, cid)
-        self.cycle = Cycle(cycle_id=cid, anchor=anchor)
+        # started_at must come from the engine's clock, not the wall clock, or
+        # cycle age (and therefore the timeout) is meaningless under replay.
+        self.cycle = Cycle(cycle_id=cid, anchor=anchor,
+                           started_at=self.clock())
         self.sequence = LadderSequence(cid, anchor,
-                                       float(self.settings.get("ladder_spacing")))
+                                       float(self.settings.get("ladder_spacing")),
+                                       started_at=self.clock())
         self.assessment = None
         self._levels_open.clear()
         self._levels_done.clear()
         self._triggered_keys.clear()
+        self._depth_capped_logged = False
+        self._profit_since = None
         self._event("CYCLE_STARTED",
                     f"Cycle #{cid} anchored at {anchor} ({reason})",
                     cycle_id=cid, entry_price=anchor)
@@ -519,11 +531,6 @@ class RollingLadderEngine:
         max_daily = float(snap["max_daily_drawdown"])
         if max_daily > 0 and self.daily_profit <= -abs(max_daily):
             return False, f"daily drawdown limit hit ({self.daily_profit:.2f})"
-
-        max_depth = int(snap["max_ladder_depth"])
-        used = self.sequence.ladder_depth_used if self.sequence else 0
-        if max_depth > 0 and used >= max_depth:
-            return False, f"ladder depth cap reached ({used}/{max_depth})"
 
         # Losing streak: a circuit breaker, not a kill switch. It pauses for the
         # cooldown and then lets the bot try again with a clean count - the
@@ -762,23 +769,110 @@ class RollingLadderEngine:
 
             assessment = self.evaluate_exit(snap, tick, positions)
             basket = self.sequence.basket_pnl if self.sequence else 0.0
-
-            max_dd = float(snap["max_cycle_drawdown"])
-            forced = max_dd > 0 and basket <= -abs(max_dd)
-
-            if not forced and (assessment is None or assessment.decision != EXIT):
+            reason_code, detail = self._exit_reason(snap, assessment, basket,
+                                                    positions)
+            if reason_code is None:
                 return False
 
+            # What the cycle looked like at the moment the exit was decided.
+            # Captured here, not after the close, so the CSV records the state
+            # that caused the exit rather than the empty state that follows it.
             self._closing_cycle = {
                 "cycle_id": self.cycle.cycle_id,
-                "forced": forced,
-                "kind": "RISK" if forced else "EXIT_ENGINE",
-                "reason": (f"cycle drawdown limit hit ({basket:+.2f})" if forced
-                           else assessment.reason),
+                "forced": reason_code.startswith("RISK"),
+                "kind": reason_code,
+                "reason": detail,
                 "assessment": assessment,
                 "attempts": 0,
+                "context": {
+                    "exit_price": tick.mid if tick else "",
+                    "exit_bid": tick.bid if tick else "",
+                    "exit_ask": tick.ask if tick else "",
+                    "exit_spread": tick.spread if tick else "",
+                    "open_positions_at_exit": len(positions),
+                    "open_buys_at_exit": len([p for p in positions
+                                              if p.side == BUY]),
+                    "open_sells_at_exit": len([p for p in positions
+                                               if p.side == SELL]),
+                    "pending_orders_at_exit": len(orders),
+                    "floating_pnl_at_exit": sum(p.profit for p in positions),
+                },
             }
             return self._advance_close(snap, positions, orders)
+
+    def _exit_reason(self, snap, assessment, basket, positions):
+        """
+        Decide whether the cycle ends, and name the reason.
+
+        Priority, highest first:
+          1. hard risk - drawdown, then cycle timeout;
+          2. the adaptive exit engine (directional / reversal / extended);
+          3. the profit-recovery fallback, so a basket that quietly came good
+             is not held forever waiting for a scenario that never arrives.
+
+        Returns (reason_code, detail) or (None, "") to keep the cycle running.
+        """
+        # --- 1. hard risk ----------------------------------------------------
+        max_dd = float(snap["max_cycle_drawdown"])
+        if max_dd > 0 and basket <= -abs(max_dd):
+            return RISK_DRAWDOWN, f"cycle drawdown limit hit ({basket:+.2f})"
+
+        max_minutes = float(snap["max_cycle_duration_minutes"])
+        age = self.clock() - self.cycle.started_at
+        if max_minutes > 0 and age >= max_minutes * 60 and \
+                (positions or (self.sequence and self.sequence.total_triggers)):
+            return RISK_TIMEOUT, (f"cycle open for {age / 60:.0f} min "
+                                  f"(limit {max_minutes:.0f}) - closing out")
+
+        # --- 2. the strategy's own reading ------------------------------------
+        if assessment is not None and assessment.decision == EXIT:
+            return (assessment.scenario or "EXIT_ENGINE"), assessment.reason
+
+        # --- 3. profit recovery fallback --------------------------------------
+        code, detail = self._profit_fallback(snap, assessment, basket)
+        if code:
+            return code, detail
+        return None, ""
+
+    def _profit_fallback(self, snap, assessment, basket):
+        """
+        A basket that has recovered into confirmed profit is taken, rather than
+        held indefinitely waiting for a scenario that may never come.
+
+        This is NOT a dollar target: the buffer is a fraction of what one ladder
+        level is worth, so it scales with lot size and spacing, and the profit
+        has to hold for a confirmation period before it counts. Strong
+        continuation still wins - a run that is working is not cut short for a
+        few cents.
+        """
+        if not snap["profit_fallback_enabled"]:
+            self._profit_since = None
+            return None, ""
+        if self.sequence is None or self.sequence.total_triggers == 0:
+            return None, ""
+
+        buffer_money = float(snap["profit_fallback_buffer_levels"]) * \
+            self.money_per_level(snap)
+        if basket < buffer_money or buffer_money <= 0:
+            self._profit_since = None
+            return None, ""
+
+        now = self.clock()
+        if self._profit_since is None:
+            self._profit_since = now
+            return None, ""
+
+        held = now - self._profit_since
+        if held < float(snap["profit_confirmation_seconds"]):
+            return None, ""
+
+        guard = float(snap["profit_fallback_continuation_guard"])
+        if assessment is not None and assessment.continuation_score >= guard:
+            return None, ""          # the move is still working; let it run
+
+        return PROFIT_FALLBACK, (f"basket recovered to {basket:+.2f} "
+                                 f"(buffer {buffer_money:.2f}) and held for "
+                                 f"{held:.0f}s with no primary exit")
 
     def _advance_close(self, snap, positions, orders):
         """
@@ -849,7 +943,7 @@ class RollingLadderEngine:
         self._start_cycle(reason=info["reason"])
         self._emit("cycle_complete", closed_cycle, sequence, assessment, total,
                    info["reason"], info["kind"], lost, duration,
-                   self.cycle.cycle_id)
+                   self.cycle.cycle_id, info.get("context") or {})
         return "restarted"
 
     # ---------------------------------------------------------- reconciliation
@@ -895,7 +989,31 @@ class RollingLadderEngine:
             seen.add(key)
 
         # --- place missing levels -------------------------------------------
-        room_orders = int(snap["max_pending_orders"]) - len(seen)
+        # The depth cap limits how far a cycle may EXTEND. It deliberately does
+        # not cancel the live ladder: pulling every pending order while
+        # positions are still open removes the strategy's eyes without reducing
+        # exposure, and leaves the cycle with nothing left to react to.
+        max_depth = int(snap["max_ladder_depth"])
+        used = self.sequence.ladder_depth_used if self.sequence else 0
+        depth_capped = max_depth > 0 and used >= max_depth
+        if depth_capped and not self._depth_capped_logged:
+            self._depth_capped_logged = True
+            self._event("LADDER_DEPTH_CAP",
+                        f"depth {used}/{max_depth} reached - no further levels "
+                        f"this cycle; the live ladder and the exit logic carry on",
+                        cycle_id=self.cycle.cycle_id, status="CAPPED")
+        room_orders = 0 if depth_capped else \
+            int(snap["max_pending_orders"]) - len(seen)
+        failures = 0
+        first_deploy = not orders and room_orders > 0
+        if first_deploy:
+            self._event("LADDER_DEPLOY_START",
+                        f"{self.broker.symbol} bid={tick.bid} ask={tick.ask} "
+                        f"spacing={snap['ladder_spacing']} "
+                        f"levels={snap['ladder_depth']}/side "
+                        f"lot={snap['lot_size']} cycle=#{self.cycle.cycle_id} "
+                        f"min_stop={self.spec.min_stop_distance:g}",
+                        cycle_id=self.cycle.cycle_id, spread=tick.spread)
         lot = self.spec.normalize_volume(min(float(snap["lot_size"]),
                                              float(snap["max_lot_size"])))
         placed = 0
@@ -927,18 +1045,31 @@ class RollingLadderEngine:
                             entry_price=level.price, tp=level.tp, sl=level.sl,
                             lot_size=lot, order_ticket=ticket, spread=tick.spread)
             else:
+                failures += 1
+                # A refused order is never swallowed: the first one carries the
+                # broker's full diagnosis, the rest are throttled.
                 if self.clock() - self._last_place_error > 30:
                     self._last_place_error = self.clock()
-                    self._event("ERROR",
-                                f"place {level.side} @ {level.price} failed: {msg}",
+                    self._event("ORDER_REJECTED",
+                                f"place {level.side} {lot} @ {level.price} "
+                                f"(level {level.index:+d}) refused: {msg}",
+                                cycle_id=self.cycle.cycle_id,
+                                direction=level.side, level=level.index,
+                                entry_price=level.price, tp=level.tp,
+                                sl=level.sl, lot_size=lot, spread=tick.spread,
                                 status="ERROR")
                 break                        # stop hammering a rejecting broker
 
-        if placed and not orders:
+        if first_deploy:
+            # what was actually accepted, never what was intended
+            intended = len([d for d in desired_by_key.values() if d.placeable])
             self._event("LADDER_CREATED",
-                        f"Cycle #{self.cycle.cycle_id}: {placed} levels around "
-                        f"{tick.mid:.2f} (spacing {snap['ladder_spacing']})",
-                        cycle_id=self.cycle.cycle_id)
+                        f"Cycle #{self.cycle.cycle_id}: {placed} of "
+                        f"{intended} levels live around {tick.mid:.2f} "
+                        f"(spacing {snap['ladder_spacing']}"
+                        + (f", {failures} rejected" if failures else "") + ")",
+                        cycle_id=self.cycle.cycle_id,
+                        status="PARTIAL" if placed < intended else "OK")
         return len(seen)
 
     def _cancel(self, order, reason):
@@ -969,6 +1100,14 @@ class RollingLadderEngine:
         except Exception:
             pass
         floating = sum(p.profit for p in positions)
+        # MT5 is the source of truth for what is live right now; the sequence is
+        # the history of what this cycle has already done. They are reported as
+        # separate things on purpose - conflating them is how a bot ends up
+        # claiming an active ladder it does not have.
+        pending_buys = len([o for o in orders if o.side == BUY_STOP])
+        pending_sells = len([o for o in orders if o.side == SELL_STOP])
+        open_buys = len([p for p in positions if p.side == BUY])
+        open_sells = len([p for p in positions if p.side == SELL])
         data = {
             "state": self.state,
             "mode": self.broker.name,
@@ -982,8 +1121,16 @@ class RollingLadderEngine:
             "tp_distance": self.tp_distance(snap) if self.spec else snap["tp_distance"],
             "tp_mode": snap["tp_mode"],
             "lot": snap["lot_size"],
+            # --- CURRENT MT5 STATE ---
             "positions": len(positions),
             "orders": len(orders),
+            "current_pending_buys": pending_buys,
+            "current_pending_sells": pending_sells,
+            "current_open_buys": open_buys,
+            "current_open_sells": open_sells,
+            "ladder_live": bool(orders),
+            # --- P/L, kept distinct ---
+            "floating_pnl": floating,
             "cycle_id": self.cycle.cycle_id,
             "tp_count": self.cycle.tp_count,
             "cycle_triggers": self.cycle.trades,
@@ -1003,7 +1150,14 @@ class RollingLadderEngine:
         # everything the exit engine is currently reading
         if self.sequence is not None:
             data.update(self.sequence.snapshot())
-            data["cycle_profit"] = self.sequence.basket_pnl
+            # --- HISTORICAL, this cycle: triggers that already happened ---
+            data["historical_buy_triggers"] = self.sequence.buy_triggers
+            data["historical_sell_triggers"] = self.sequence.sell_triggers
+            data["realized_pnl"] = self.sequence.realized_pnl
+            data["floating_pnl"] = floating
+            data["cycle_total_pnl"] = self.sequence.realized_pnl + floating
+            data["cycle_profit"] = data["cycle_total_pnl"]
+            data["cycle_age_seconds"] = self.clock() - self.cycle.started_at
         if self.assessment is not None:
             data.update(self.assessment.as_dict())
         else:

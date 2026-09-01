@@ -94,8 +94,10 @@ engine.step()
 feed.set(buys[0].price - 0.90)
 engine.step()
 t.check("risk close armed the cooldown", engine.cooldown_until > 0)
-t.check("attributed to risk",
-        any(c.kind == "RISK" for c in rec.cycles if c.kind_of == "complete"))
+t.check("attributed to risk drawdown",
+        any(c.kind == "RISK_DRAWDOWN" for c in rec.cycles
+            if c.kind_of == "complete"),
+        str([c.kind for c in rec.cycles if c.kind_of == "complete"]))
 engine.step()
 t.check("no new ladder while the cooldown holds", not broker.orders())
 t.check("cooldown is the stated reason", "cooldown" in engine.block_reason.lower(),

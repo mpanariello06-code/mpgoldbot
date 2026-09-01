@@ -206,8 +206,11 @@ t.check("the cycle closed on the reversal",
 t.check("CYCLE_COMPLETED or CYCLE_LOSS logged",
         rec.count("CYCLE_COMPLETED") + rec.count("CYCLE_LOSS") == 1)
 closes = [c for c in rec.cycles if c.kind_of == "complete"]
-t.check("the close was attributed to the exit engine",
-        any(c.kind == "EXIT_ENGINE" for c in closes), str(closes))
+t.check("the close names an explicit exit reason",
+        any(c.kind in ("SCENARIO_1_DIRECTIONAL", "SCENARIO_2_REVERSAL",
+                       "SCENARIO_3_EXTENDED_LADDER", "PROFIT_FALLBACK",
+                       "EXIT_ENGINE") for c in closes),
+        str([c.kind for c in closes]))
 t.check("the reason names the structure",
         any("reversal" in c.reason or "exhaustion" in c.reason for c in closes),
         str([c.reason for c in closes]))
@@ -241,8 +244,9 @@ engine.step()
 t.check("cycle force-closed on drawdown", not broker.positions())
 t.check("logged as a cycle loss", rec.count("CYCLE_LOSS") == 1)
 t.check("attributed to risk, not the exit engine",
-        any(c.kind == "RISK" for c in rec.cycles if c.kind_of == "complete"),
-        str([c for c in rec.cycles if c.kind_of == "complete"]))
+        any(c.kind == "RISK_DRAWDOWN" for c in rec.cycles
+            if c.kind_of == "complete"),
+        str([c.kind for c in rec.cycles if c.kind_of == "complete"]))
 t.check("losing streak counted", engine.consecutive_losing_cycles == 1)
 t.check("cooldown armed", engine.cooldown_until > time.time())
 
@@ -304,7 +308,7 @@ t.check("SPREAD_CLEARED logged", rec.count("SPREAD_CLEARED") == 1)
 t.check("spread block logged only once while blocked",
         rec.count("SPREAD_BLOCK") == 1)
 
-t.section("RISK: LADDER DEPTH CAP")
+t.section("LADDER DEPTH CAP LIMITS GROWTH, IT DOES NOT BLIND THE BOT")
 engine, broker, feed, settings, rec = build({"max_ladder_depth": 2}, name="depthcap")
 engine.step()
 buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
@@ -312,11 +316,21 @@ buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
 trigger_buy(feed, buys[1].price)
 engine.step()
 engine.step()
-t.check("depth cap stops new levels",
-        not broker.orders() or engine.block_reason,
-        f"{len(broker.orders())} orders, reason: {engine.block_reason}")
-t.check("depth cap is the stated reason", "depth" in engine.block_reason.lower(),
+live = broker.orders()
+t.check("the live ladder is NOT cancelled by the cap", len(live) > 0,
+        f"{len(live)} orders")
+t.check("the cap is logged once",
+        len([e for e in rec.events if e[0] == "LADDER_DEPTH_CAP"]) == 1,
+        str([e[0] for e in rec.events if e[0] == "LADDER_DEPTH_CAP"]))
+t.check("no risk block is raised for depth", "depth" not in engine.block_reason.lower(),
         engine.block_reason)
+before = len(broker.orders())
+for _ in range(5):
+    engine.step()
+t.check("no further levels are added beyond the cap",
+        len(broker.orders()) <= before, f"{before} -> {len(broker.orders())}")
+t.check("the cycle can still reach an exit decision",
+        engine.assessment is not None)
 
 t.section("RISK: LOSING CYCLE STREAK")
 engine, broker, feed, settings, rec = build(
@@ -484,6 +498,50 @@ broker.place_stop_order(BUY_STOP, feed().ask + 4.0, 0.01, comment="manual trade"
 engine.step()
 t.check("unrecognised orders are cancelled",
         all(o.comment.startswith("RL") for o in broker.orders()))
+
+t.section("A PARTIAL DEPLOYMENT IS REPORTED AS PARTIAL")
+# The log must say what the broker ACCEPTED, never what the bot intended: a
+# ladder that is half live has to be visible as half live.
+engine, broker, feed, settings, rec = build(name="partial")
+real_place = broker.place_stop_order
+accepted = [0]
+
+
+def flaky_place(*args, **kwargs):
+    if accepted[0] >= 3:
+        return False, None, ("retcode=10016 (INVALID_STOPS) comment='too close' | "
+                             "requested=? volume=0.01 | stops_level=50pts")
+    accepted[0] += 1
+    return real_place(*args, **kwargs)
+
+
+broker.place_stop_order = flaky_place
+engine.step()
+t.check("only what the broker accepted is live", len(broker.orders()) == 3,
+        f"{len(broker.orders())} orders")
+created = [e for e in rec.events if e[0] == "LADDER_CREATED"]
+t.check("LADDER_CREATED reports actual of intended",
+        created and created[-1][1].startswith("Cycle #1: 3 of 10 levels live"),
+        created[-1][1] if created else "none")
+t.check("the deployment is flagged PARTIAL",
+        created and created[-1][2].get("status") == "PARTIAL",
+        str(created[-1][2].get("status") if created else None))
+t.check("the rejection count is reported",
+        created and "1 rejected" in created[-1][1], created[-1][1] if created else "")
+rejected = [e for e in rec.events if e[0] == "ORDER_REJECTED"]
+t.check("the refusal itself is logged, never swallowed", len(rejected) == 1,
+        str(len(rejected)))
+t.check("with the broker's own diagnosis attached",
+        rejected and "INVALID_STOPS" in rejected[0][1] and
+        "stops_level" in rejected[0][1], rejected[0][1] if rejected else "")
+t.check("a partial ladder does not stop the cycle",
+        engine.cycle.cycle_id == 1 and not engine.block_reason,
+        f"#{engine.cycle.cycle_id} {engine.block_reason!r}")
+
+broker.place_stop_order = real_place        # the broker recovers
+engine.step()
+t.check("the missing levels are filled in on the next pass",
+        len(broker.orders()) == 10, f"{len(broker.orders())} orders")
 
 t.section("LEVEL IDENTITY")
 t.check("comment round trip",

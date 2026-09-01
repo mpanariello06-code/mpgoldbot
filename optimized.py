@@ -321,6 +321,21 @@ class LadderBot:
             self._connected = True
             self._build_broker()
 
+        ok, why = self.broker.tradable()
+        if not ok:
+            log(f"⚠ {why}")
+            log_event("SYMBOL_NOT_TRADABLE", why, symbol=SYMBOL, status="ERROR")
+        spec = self.broker.symbol_spec()
+        log(spec.describe())
+        if spec.min_stop_distance > float(self.settings.get("ladder_spacing")):
+            msg = (f"broker minimum stop distance {spec.min_stop_distance:g} is "
+                   f"wider than the ladder spacing "
+                   f"{self.settings.get('ladder_spacing')} - levels will be "
+                   f"pushed further out than configured")
+            log(f"⚠ {msg}")
+            log_event("SPACING_BELOW_MIN_STOP", msg, symbol=SYMBOL,
+                      status="WARNING")
+
         account = account_info()
         log_event("MT5_CONNECTED",
                   f"Account {getattr(account, 'login', '?')} | "
@@ -711,6 +726,10 @@ class LadderBot:
             log(f"[{event}] {message}")
         if event == "ERROR":
             self.notifier.error(message, action="Retrying")
+        elif event == "ORDER_REJECTED":
+            # the broker refusing an order is never silent - throttled per side
+            self.notifier.error(message, action="Retrying the level",
+                                key=f"rejected:{fields.get('direction')}")
         elif event == "CYCLE_CLOSE_PENDING":
             self.notifier.error(message, action="Reconciling before the next cycle",
                                 key=f"pending:{fields.get('cycle_id')}")
@@ -815,9 +834,12 @@ class LadderBot:
         log(f"🪜 Cycle #{cycle.cycle_id} anchored at {anchor}")
 
     def _on_cycle_complete(self, cycle, sequence, assessment, total, reason,
-                           kind, lost, duration=0.0, next_cycle_id=None):
+                           kind, lost, duration=0.0, next_cycle_id=None,
+                           context=None):
         seq = sequence.snapshot() if sequence is not None else {}
         spec = self.engine.spec if self.engine else None
+        # the market/exposure state at the moment the exit was decided
+        ctx = context or {}
         CSV.log_cycle(
             digits=spec.digits if spec else 2,
             symbol=SYMBOL,
@@ -826,6 +848,9 @@ class LadderBot:
                 "%Y-%m-%d %H:%M:%S"),
             duration_seconds=round(time.time() - cycle.started_at, 1),
             anchor=cycle.anchor,
+            initial_price=cycle.anchor,
+            exit_price=ctx.get("exit_price", ""),
+            exit_spread=ctx.get("exit_spread", ""),
             spacing=self.settings.get("ladder_spacing"),
             triggers=seq.get("total_triggers", cycle.trades),
             buy_triggers=seq.get("buy_triggers", ""),
@@ -837,25 +862,39 @@ class LadderBot:
             path_levels=seq.get("path_levels", ""),
             efficiency=seq.get("efficiency", ""),
             tp_count=cycle.tp_count,
+            positions_at_exit=ctx.get("open_positions_at_exit", ""),
+            open_buys_at_exit=ctx.get("open_buys_at_exit", ""),
+            open_sells_at_exit=ctx.get("open_sells_at_exit", ""),
+            pending_orders_at_exit=ctx.get("pending_orders_at_exit", ""),
+            floating_pnl_at_exit=ctx.get("floating_pnl_at_exit", ""),
             realized_pnl=total,
             peak_pnl=seq.get("peak_pnl", ""),
             drawdown=seq.get("basket_drawdown", ""),
             momentum_score=round(assessment.momentum_score, 3) if assessment else "",
+            continuation_score=round(assessment.continuation_score, 3) if assessment else "",
             reversal_score=round(assessment.reversal_score, 3) if assessment else "",
             exhaustion_score=round(assessment.exhaustion_score, 3) if assessment else "",
+            directional_score=round(assessment.directional_score, 3) if assessment else "",
+            extended_score=round(assessment.extended_score, 3) if assessment else "",
             exit_score=round(assessment.exit_score, 1) if assessment else "",
             market_state=assessment.state if assessment else "",
+            exit_scenario=assessment.scenario if assessment else "",
             end_kind=kind,
             end_reason=reason,
             daily_profit=self.engine.daily_profit if self.engine else "",
         )
 
         reason_word = {
-            "REVERSAL_DETECTED": "Reversal",
-            "MOMENTUM_EXHAUSTION": "Exhaustion",
-            "MOMENTUM_CONTINUATION": "Continuation",
-        }.get(assessment.state if assessment else "", "Risk limit"
-              if kind == "RISK" else "Exit engine")
+            "SCENARIO_1_DIRECTIONAL": "Directional move",
+            "SCENARIO_2_REVERSAL": "Reversal",
+            "SCENARIO_3_EXTENDED_LADDER": "Extended ladder",
+            "PROFIT_FALLBACK": "Profit fallback",
+            "RISK_DRAWDOWN": "Risk drawdown",
+            "RISK_TIMEOUT": "Risk timeout",
+            "RISK_SPREAD": "Risk spread",
+            "OTHER_RISK_EXIT": "Risk exit",
+            "EXIT_ENGINE": "Exit engine",
+        }.get(kind, kind.replace("_", " ").title())
         log(f"🔄 Cycle #{cycle.cycle_id} closed ({reason_word}, {total:+.2f}) "
             f"-> cycle #{next_cycle_id} deployed immediately")
         self.notifier.cycle_closed(
@@ -940,7 +979,7 @@ class Application:
         account = account_info()
         snap = SETTINGS.snapshot()
         log("=" * 70)
-        log("XAUUSD ROLLING LADDER SCALPER - MT5 + TELEGRAM")
+        log(f"{SYMBOL} ROLLING LADDER SCALPER - MT5 + TELEGRAM")
         log("=" * 70)
         if account:
             log(f"MT5 Account: {account.login}")

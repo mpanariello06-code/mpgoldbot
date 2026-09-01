@@ -38,6 +38,7 @@ class FakeEngine:
         self.calls = []
         self.state_name = "STOPPED"
         self.explode = False
+        self.state_overrides = {}
 
     def symbol_info_live(self):
         return mt5.symbol_info("XAUUSD")
@@ -75,7 +76,13 @@ class FakeEngine:
             "spacing": snap["ladder_spacing"], "depth": snap["ladder_depth"],
             "tp_distance": snap["tp_levels"] * snap["ladder_spacing"],
             "tp_mode": snap["tp_mode"], "lot": snap["lot_size"],
-            "positions": 5, "orders": 6, "cycle_id": 183, "tp_count": 3,
+            "positions": 5, "orders": 11, "cycle_id": 183, "tp_count": 3,
+            "current_pending_buys": 5, "current_pending_sells": 6,
+            "current_open_buys": 0, "current_open_sells": 5,
+            "historical_buy_triggers": 2, "historical_sell_triggers": 5,
+            "floating_pnl": 0.0, "realized_pnl": 2.31, "cycle_total_pnl": 2.31,
+            "cycle_age_seconds": 640, "directional_score": 0.12,
+            "extended_score": 0.30, "ladder_live": True,
             "cycle_profit": 1.36, "daily_profit": 2.10, "total_tp": 12,
             "total_trades": 15, "anchor": 4010.04, "block_reason": "",
             "spread_blocked": False, "losing_streak": 0,
@@ -90,6 +97,7 @@ class FakeEngine:
             "continuation_score": 0.0, "reversal_score": 0.78,
             "exhaustion_score": 0.31,
             "reason": "reversal: 2B/5S imbalance 2.50x eff 0.62",
+            **self.state_overrides,
         }
 
     def account(self):
@@ -201,19 +209,38 @@ async def run():
     t.check("stop reports the cancelled pendings",
             "pending orders cancelled" in (await press("stop"))[0])
 
-    t.section("STATUS SCREEN (spec section 24)")
+    t.section("STATUS SCREEN: CURRENT STATE vs HISTORY")
     text, _, _ = await press("status")
-    for label in ["ROLLING LADDER SCALPER", "Symbol: XAUUSD", "Timeframe: M5",
-                  "Ladder spacing: 0.3", "Cycle: #183", "BUY triggers: 2",
-                  "SELL triggers: 5", "Last direction: SELL",
-                  "Directional imbalance: 2.50x", "Open positions: 5",
-                  "Pending orders: 6", "Basket P/L", "Basket drawdown",
-                  "Momentum: STRONG", "Reversal: DETECTED", "Exit score: 81",
-                  "State: REVERSAL DETECTED", "Last ladder update"]:
+    for label in ["ROLLING LADDER", "XAUUSD   M5", "Cycle: #183",
+                  "State: REVERSAL DETECTED", "LIVE IN MT5",
+                  "Pending BUY: 5", "Pending SELL: 6", "Open BUY: 0",
+                  "Open SELL: 5", "THIS CYCLE SO FAR",
+                  "Historical BUY triggers: 2", "Historical SELL triggers: 5",
+                  "Directional imbalance: 2.50x", "Ladder depth used: 5",
+                  "Basket floating P/L", "Realized this cycle", "Cycle total",
+                  "Exit score: 81"]:
         t.check(f"status shows {label!r}", label in text,
-                "" if label in text else text.replace("\n", " | ")[:200])
+                "" if label in text else text.replace("\n", " | ")[:220])
+    t.check("floating and realized are reported separately",
+            "Basket floating P/L: $0.00" in text and
+            "Realized this cycle: $2.31" in text,
+            text.replace("\n", " | ")[:240])
+    t.check("current orders are not confused with historical triggers",
+            text.index("Pending BUY: 5") < text.index("Historical BUY triggers: 2"))
+    t.check("cycle age is shown", "Age: 10 min" in text)
     t.check("status explains the decision", "Why: reversal" in text)
     t.check("status never leaks the token", "TESTTOKEN" not in text)
+
+    t.section("STATUS FLAGS A LADDER THAT IS NOT LIVE")
+    engine.state_overrides = {"orders": 0, "positions": 0,
+                              "current_pending_buys": 0,
+                              "current_pending_sells": 0,
+                              "current_open_buys": 0, "current_open_sells": 0}
+    text, _, _ = await press("status")
+    t.check("an empty ladder with past triggers is called out",
+            "No live orders or positions" in text,
+            text.replace("\n", " | ")[-160:])
+    engine.state_overrides = {}
 
     t.section("LADDER VIEW")
     text, _, _ = await press("ladder")

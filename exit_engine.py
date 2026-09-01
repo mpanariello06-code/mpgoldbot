@@ -36,6 +36,17 @@ CONTINUE = "CONTINUE"
 MONITOR = "MONITOR"
 EXIT = "EXIT"
 
+# ------------------------------------------------------------- exit reasons
+SCENARIO_1_DIRECTIONAL = "SCENARIO_1_DIRECTIONAL"
+SCENARIO_2_REVERSAL = "SCENARIO_2_REVERSAL"
+SCENARIO_3_EXTENDED_LADDER = "SCENARIO_3_EXTENDED_LADDER"
+PROFIT_FALLBACK = "PROFIT_FALLBACK"
+RISK_DRAWDOWN = "RISK_DRAWDOWN"
+RISK_TIMEOUT = "RISK_TIMEOUT"
+RISK_SPREAD = "RISK_SPREAD"
+MANUAL_STOP = "MANUAL_STOP"
+OTHER_RISK_EXIT = "OTHER_RISK_EXIT"
+
 # --------------------------------------------------------- structural states
 IDLE = "IDLE"
 LADDER_ACTIVE = "LADDER_ACTIVE"
@@ -349,9 +360,13 @@ class ExitConfig:
     gap_reference: float = 60.0       # seconds between triggers treated as brisk
     min_triggers_for_exhaustion: int = 3
     min_triggers_for_reversal: int = 2
+    min_triggers_for_directional: int = 3
+    min_triggers_for_extended: int = 5
 
     w_reversal: float = 0.75
     w_exhaustion: float = 0.45
+    w_directional: float = 0.65
+    w_extended: float = 0.50
     w_depth: float = 0.20
     w_drawdown: float = 0.25
     w_continuation: float = 0.45      # momentum suppresses exiting
@@ -375,6 +390,9 @@ class ExitAssessment:
     continuation_score: float = 0.0
     reversal_score: float = 0.0
     exhaustion_score: float = 0.0
+    directional_score: float = 0.0
+    extended_score: float = 0.0
+    scenario: str = ""            # which reading drove the exit
     harvest: float = 0.0
     drawdown_pressure: float = 0.0
     reason: str = ""
@@ -384,8 +402,8 @@ class ExitAssessment:
         data = dict(self.__dict__)
         data.pop("contributions", None)
         for key in ("exit_score", "momentum_score", "continuation_score",
-                    "reversal_score", "exhaustion_score", "harvest",
-                    "drawdown_pressure"):
+                    "reversal_score", "exhaustion_score", "directional_score",
+                    "extended_score", "harvest", "drawdown_pressure"):
             data[key] = round(data[key], 3)
         return data
 
@@ -422,8 +440,15 @@ class RollingLadderExitEngine:
         idle = seq.time_since_last_trigger
         if idle > cfg.gap_reference:
             speed *= clamp01(cfg.gap_reference / idle)
+        # Progress is measured between triggers, so a market that simply stops
+        # would otherwise keep momentum pinned at whatever the last two levels
+        # covered - and continuation would suppress the exit forever. The
+        # reading is only as good as it is recent.
         rate = seq.recent_progress_rate(cfg.progress_intervals)
-        return clamp01(0.55 * rate + 0.20 * seq.efficiency +
+        freshness = 1.0
+        if idle > cfg.gap_reference:
+            freshness = clamp01(cfg.gap_reference / idle)
+        return clamp01(0.55 * rate * freshness + 0.20 * seq.efficiency +
                        0.10 * run + 0.15 * speed)
 
     def continuation(self, seq, momentum):
@@ -476,6 +501,48 @@ class RollingLadderExitEngine:
         score = (0.34 * run + 0.24 * retrace + 0.16 * recent_share +
                  0.16 * dominance + 0.10 * opp_momentum)
         return clamp01(score)
+
+    def directional(self, seq, momentum, harvest):
+        """
+        Scenario 1: a clean same-direction run that has actually paid.
+
+        Not "four trades and out" - a run only reads as complete when the moves
+        were one-way, the distance is real, and the basket has banked something
+        for it. A run that is still accelerating keeps its momentum and is held
+        by the continuation term instead.
+        """
+        cfg = self.config
+        if seq.total_triggers < cfg.min_triggers_for_directional:
+            return 0.0
+        if seq.dominant_side != seq.initial_side:
+            return 0.0                      # that is a reversal, not a run
+        run = clamp01(max(seq.consecutive_buy, seq.consecutive_sell) /
+                      cfg.consecutive_norm)
+        distance = clamp01(abs(seq.net_levels) / max(cfg.depth_norm, 1e-9))
+        paid = clamp01(harvest)
+        raw = (0.40 * run + 0.25 * seq.efficiency + 0.20 * distance +
+               0.15 * paid)
+        # A run only reads as FINISHED once it stops accelerating. While
+        # momentum is still strong this stays near zero, so a big clean move is
+        # ridden rather than cut short - it is the cooling that ends it.
+        return clamp01(raw * clamp01(1.0 - momentum))
+
+    def extended(self, seq, momentum):
+        """
+        Scenario 3: a substantial part of the ladder has been consumed and the
+        market has travelled a long way with it - and that move is now easing.
+        """
+        cfg = self.config
+        if seq.total_triggers < cfg.min_triggers_for_extended:
+            return 0.0
+        consumed = clamp01(seq.ladder_depth_used / max(cfg.depth_norm, 1e-9))
+        distance = clamp01(abs(seq.net_levels) / max(cfg.depth_norm, 1e-9))
+        persistence = clamp01(max(seq.buy_triggers, seq.sell_triggers) /
+                              max(1.0, seq.total_triggers))
+        raw = 0.45 * consumed + 0.35 * distance + 0.20 * persistence
+        # same rule: a deep ladder in a still-running move is not a reason to
+        # leave, a deep ladder in a stalling one is
+        return clamp01(raw * clamp01(1.0 - momentum))
 
     def exhaustion(self, seq):
         """
@@ -562,6 +629,8 @@ class RollingLadderExitEngine:
         reversal = self.reversal(seq, momentum)
         exhaustion = self.exhaustion(seq)
         harvest = self.harvest(seq, money_per_level)
+        directional = self.directional(seq, momentum, harvest)
+        extended = self.extended(seq, momentum)
         loss_hold = self.loss_hold(seq, money_per_level)
         dd = self.drawdown_pressure(seq, money_per_level)
         depth = clamp01(seq.ladder_depth_used / cfg.depth_norm)
@@ -569,10 +638,13 @@ class RollingLadderExitEngine:
         contributions = {
             "reversal": cfg.w_reversal * reversal,
             "exhaustion": cfg.w_exhaustion * exhaustion,
+            "directional": cfg.w_directional * directional,
+            "extended": cfg.w_extended * extended,
             "depth": cfg.w_depth * depth,
             "drawdown": cfg.w_drawdown * dd,
             # banked profit only amplifies structure that is already there
-            "harvest": cfg.w_harvest * harvest * max(reversal, exhaustion),
+            "harvest": cfg.w_harvest * harvest * max(reversal, exhaustion,
+                                                      directional, extended),
             "continuation": -cfg.w_continuation * continuation,
             "loss_hold": -cfg.w_loss_hold * loss_hold * (1.0 - reversal),
         }
@@ -587,6 +659,8 @@ class RollingLadderExitEngine:
         out.continuation_score = continuation
         out.reversal_score = reversal
         out.exhaustion_score = exhaustion
+        out.directional_score = directional
+        out.extended_score = extended
         out.harvest = harvest
         out.drawdown_pressure = dd
         out.exit_score = score
@@ -597,16 +671,27 @@ class RollingLadderExitEngine:
             out.state = REVERSAL_DETECTED
         elif exhaustion >= max(reversal, continuation) and exhaustion > 0.35:
             out.state = MOMENTUM_EXHAUSTION
-        elif continuation > 0.35:
+        elif continuation > 0.35 and score < cfg.threshold_exit:
             out.state = MOMENTUM_CONTINUATION
         else:
             out.state = EXIT_EVALUATION
 
         # `state` stays the structural reading of the market; `phase` is what
         # the cycle is about to do about it.
+        # which of the observed scenarios best explains this exit
+        scenarios = {
+            SCENARIO_2_REVERSAL: contributions["reversal"],
+            SCENARIO_1_DIRECTIONAL: contributions["directional"],
+            SCENARIO_3_EXTENDED_LADDER: contributions["extended"],
+        }
+        best, best_value = max(scenarios.items(), key=lambda kv: kv[1])
+        out.scenario = best if best_value > 0 else ""
+
         if score >= cfg.threshold_exit:
             out.decision = EXIT
             out.phase = CLOSING_CYCLE if has_exposure else RESETTING
+            if not out.scenario:
+                out.scenario = OTHER_RISK_EXIT
         elif score >= cfg.threshold_monitor:
             out.decision = MONITOR
             out.phase = EXIT_EVALUATION

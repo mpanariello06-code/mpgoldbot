@@ -41,7 +41,7 @@ runtime_settings.py     Telegram-controlled settings, persisted as JSON
 telegram_controller.py  control panel (own thread, own event loop)
 telegram_settings.py    the ⚙️ SETTINGS menu tree
 csv_logger.py           trades, events, account snapshots, ladder events, cycles
-tests/                  613 offline checks — python tests/run_all.py
+tests/                  804 offline checks — python tests/run_all.py
 data/                   CSVs + runtime_settings.json + state files (auto-created)
 ```
 
@@ -116,19 +116,55 @@ it — the behaviour visible in the reference recording.
 
 **There is no "close after N trades" and no "close at $X".** A cycle ends when
 the market structure says the move is over. `exit_engine.py` turns the trigger
-sequence and the price path into three readings:
+sequence and the price path into readings:
 
 | Reading | What it means |
 | --- | --- |
 | **CONTINUATION** | the original direction is still working — levels keep paying a full level of movement |
-| **REVERSAL** | the original direction failed: opposite-side runs, dominance, and give-back of the favourable excursion |
+| **REVERSAL** (scenario 2) | the original direction failed: opposite-side runs, dominance, and give-back of the favourable excursion |
 | **EXHAUSTION** | levels keep firing but price has stopped paying — chop, decaying progress, stretching gaps, stalling |
+| **DIRECTIONAL** (scenario 1) | a clean same-direction run that has actually paid — and has now stopped accelerating |
+| **EXTENDED** (scenario 3) | a large part of the ladder has been consumed, price travelled a long way with it, and that move is easing |
 
-They blend into an **exit score (0-100)**: reversal, exhaustion, ladder depth
-and basket drawdown push it up; the momentum still carrying the move holds it
-down. Below `EXIT_THRESHOLD_MONITOR` the cycle continues, above
-`EXIT_THRESHOLD_EXIT` it closes, in between it is watched. Every component,
-weight and threshold is configurable and reported.
+Both scenario readings are multiplied by `1 - momentum`: a run only reads as
+*finished* once it stops accelerating, so a big clean move is ridden rather than
+cut short. It is the cooling that ends it, never the trigger count.
+
+They blend into an **exit score (0-100)**: reversal, exhaustion, directional,
+extended, ladder depth and basket drawdown push it up; the momentum still
+carrying the move holds it down. Below `EXIT_THRESHOLD_MONITOR` the cycle
+continues, above `EXIT_THRESHOLD_EXIT` it closes, in between it is watched.
+Every component, weight and threshold is configurable and reported.
+
+### Order of precedence
+
+A cycle ends for exactly one reason, and they are checked in this order:
+
+1. `MAX_CYCLE_DRAWDOWN` — the basket is too deep under water (`RISK_DRAWDOWN`)
+2. `MAX_CYCLE_DURATION` — the cycle has been open too long (`RISK_TIMEOUT`).
+   **A cycle can never stay open indefinitely.** Set it to 0 and it can.
+3. the exit engine (`SCENARIO_1_DIRECTIONAL`, `SCENARIO_2_REVERSAL`,
+   `SCENARIO_3_EXTENDED_LADDER`, or `OTHER_RISK_EXIT` when the score is high
+   with no dominant reading)
+4. the **profit fallback** (`PROFIT_FALLBACK`) — last, and only when nothing
+   above explains the basket
+
+### The profit fallback
+
+A basket can recover into profit in a market no scenario ever describes — the
+ladder stalls, the readings stay flat, and the cycle would otherwise sit there
+forever. The fallback takes that profit, under three conditions:
+
+* the basket is above `PROFIT_FALLBACK_BUFFER_LEVELS × (one ladder level)` —
+  **a fraction of a level, not a dollar target**: it scales with lot size and
+  spacing, so changing either changes it automatically;
+* it has *held* there for `PROFIT_CONFIRMATION_SECONDS`; any dip back under the
+  buffer restarts the clock from zero;
+* the move is not still working — a continuation reading at or above
+  `PROFIT_FALLBACK_CONTINUATION_GUARD` overrides the fallback entirely.
+
+Set `PROFIT_FALLBACK_ENABLED=false` to remove it and let the exit engine and
+the risk limits be the only ways a cycle ends.
 
 **P/L is context, never the trigger.** Profit already banked (normalised against
 the cycle's own activity, so it is never a fixed dollar amount) makes the engine
@@ -147,8 +183,11 @@ Worked examples from the test suite:
 | SELL ×2 then BUY ×3 | REVERSAL | exit / monitor |
 | BUY ×4 then price dies | EXHAUSTION | monitor, rising |
 | BUY/SELL alternating ×6 | EXHAUSTION (chop) | exit / monitor |
-| +$3.50 with momentum | CONTINUATION | continue |
+| +$3.50 with momentum | CONTINUATION | continue — profit alone never closes |
 | +$1.20 with a reversal | REVERSAL | exit |
+| BUY ×4, then the move cools | DIRECTIONAL | exit (scenario 1) |
+| BUY ×9, then it stops paying | EXTENDED | exit (scenario 3) |
+| 2 triggers, flat readings, basket +0.70 held 60s | none | exit via `PROFIT_FALLBACK` |
 
 When a cycle ends: pending orders are cancelled, remaining positions are closed
 (`CYCLE_CLOSE_POSITIONS`), the cycle is written to `rolling_ladder_cycles.csv`
@@ -229,8 +268,9 @@ broker quotes gold differently — that one setting rescales all five pip target
 
 Fixed lots only — **no martingale, no size increase after a loss, no recovery
 doubling.** `MAX_OPEN_POSITIONS`, `MAX_PENDING_ORDERS`, `MAX_LOT_SIZE`,
-`MAX_DAILY_LOSS`, `MAX_CYCLE_LOSS`, `MAX_CONSECUTIVE_LOSING_CYCLES`,
-`MAX_SPREAD`, `MAX_SLIPPAGE` and `COOLDOWN_AFTER_LOSS` are all enforced. When a
+`MAX_DAILY_LOSS`, `MAX_CYCLE_LOSS`, `MAX_CYCLE_DURATION`,
+`MAX_CONSECUTIVE_LOSING_CYCLES`, `MAX_SPREAD`, `MAX_SLIPPAGE` and
+`COOLDOWN_AFTER_LOSS` are all enforced. When a
 limit trips: new entries stop and pending orders are cancelled (they would breach
 the limit the moment they trigger); **open positions keep running** under their
 own TP/SL. The bot resumes by itself once the condition clears — the spread
@@ -243,14 +283,21 @@ filter in particular blocks and un-blocks automatically.
 * `data/rolling_ladder_events.csv` — one row per ladder event
   (`LADDER_CREATED`, `ORDER_PLACED`, `ORDER_CANCELLED`, `ORDER_TRIGGERED`,
   `TP_HIT`, `SL_HIT`, `LEVEL_ROLLED`, `CYCLE_STARTED`, `CYCLE_COMPLETED`,
-  `CYCLE_LOSS`, `RISK_BLOCK`, `SPREAD_BLOCK`, `ERROR`) with the **full market
+  `CYCLE_LOSS`, `LADDER_DEPLOY_START`, `LADDER_DEPTH_CAP`, `ORDER_REJECTED`,
+  `RISK_BLOCK`, `SPREAD_BLOCK`, `ERROR`) with the **full market
   state at that moment**: trigger counts, consecutive runs, last/previous side,
   direction changes, ratios, imbalance, depth used, distance travelled,
   efficiency, gap since the previous trigger, volatility, basket P/L and
   drawdown, and the momentum / reversal / exhaustion / exit scores. This is the
   data the exit rules are meant to be re-fitted against.
 * `data/rolling_ladder_cycles.csv` — one row per finished cycle: how it ran and
-  exactly why it ended
+  exactly why it ended, including the state **at the moment the exit was
+  decided** (`exit_price`, `positions_at_exit`, `open_buys_at_exit`,
+  `open_sells_at_exit`, `pending_orders_at_exit`, `floating_pnl_at_exit`) rather
+  than the empty state that follows the close, plus every reading
+  (`continuation_score`, `reversal_score`, `exhaustion_score`,
+  `directional_score`, `extended_score`, `exit_score`, `exit_scenario`,
+  `end_kind`, `end_reason`)
 * `data/trades.csv` — one row per open and close, with cycle and level context
 * `data/events.csv` — bot events (start/stop/pause/settings/errors)
 * `data/account_snapshots.csv` — periodic balance/equity/margin
@@ -293,18 +340,20 @@ you only touch once.
 ## Tests
 
 ```bash
-python tests/run_all.py        # 613 checks, no MT5 or network needed
+python tests/run_all.py        # 804 checks, no MT5 or network needed
 ```
 
 Covers: pip/point conversion, both execution adapters, settings validation and
 persistence, ladder creation and both-sided stop placement, triggering, TP,
-rolling and replenishment, the six exit scenarios (continuation, reversal both
-ways, continuing momentum, exhaustion, chop), the guarantees that the exit is
-neither a trade count nor a dollar amount, adaptive and risk-forced cycle ends,
-duplicate prevention, restart and reconnect recovery, spread blocking, daily and
-cycle drawdown guards, depth and position caps, pause/resume/stop, every
-Telegram button and settings screen, replay determinism and costing, and a
-paper-mode run end to end.
+rolling and replenishment, partial deployment reported as partial (actual vs
+intended levels) and the full broker diagnosis on a refused order, the three
+observed exit scenarios plus continuation, exhaustion and chop, the guarantees
+that the exit is neither a trade count nor a dollar amount, the profit fallback
+(buffer, confirmation, reset on a dip, continuation guard), the stuck-cycle
+timeout, adaptive and risk-forced cycle ends, duplicate prevention, restart and
+reconnect recovery, spread blocking, daily and cycle drawdown guards, depth and
+position caps, pause/resume/stop, every Telegram button and settings screen,
+replay determinism and costing, and a paper-mode run end to end.
 
 ## What still needs fitting
 

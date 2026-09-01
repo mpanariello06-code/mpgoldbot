@@ -97,6 +97,10 @@ VALIDATORS = {
     "pip_points":          (lambda v: _num(v, int, "Pip size", 0, 10000), "Pip Size", False),
     # --- cycle ---
     "cycle_close_positions": (lambda v: _flag(v, "Close positions on cycle end"), "Close On Cycle End", True),
+    "profit_fallback_enabled": (lambda v: _flag(v, "Profit fallback"), "Profit Fallback", True),
+    "profit_fallback_buffer_levels": (lambda v: _num(v, float, "Profit buffer", 0.01, 50.0), "Profit Buffer", True),
+    "profit_confirmation_seconds": (lambda v: _num(v, float, "Profit confirmation", 0.0, 3600.0), "Profit Confirmation", False),
+    "profit_fallback_continuation_guard": (lambda v: _num(v, float, "Continuation guard", 0.0, 1.0), "Continuation Guard", False),
     # --- risk ---
     "lot_size":            (lambda v: _num(v, float, "Lot size", 0.001, 100.0), "Lot Size", True),
     "max_lot_size":        (lambda v: _num(v, float, "Max lot size", 0.001, 100.0), "Max Lot", True),
@@ -109,6 +113,7 @@ VALIDATORS = {
     "max_cycle_drawdown":  (lambda v: _num(v, float, "Max cycle drawdown", 0.0, 1e6), "Cycle Drawdown", True),
     "max_consecutive_losing_cycles": (lambda v: _num(v, int, "Max losing cycles", 0, 100), "Losing Cycles", False),
     "cooldown_after_loss_minutes": (lambda v: _num(v, float, "Cooldown after loss", 0.0, 1440.0), "Cooldown", False),
+    "max_cycle_duration_minutes": (lambda v: _num(v, float, "Max cycle duration", 0.0, 10080.0), "Max Cycle Duration", True),
     # --- hygiene ---
     "order_max_age_seconds": (lambda v: _num(v, float, "Order max age", 0.0, 86400.0), "Order Max Age", False),
     "m5_candle_reset":     (lambda v: _flag(v, "Candle reset"), "Candle Reset", False),
@@ -128,6 +133,10 @@ VALIDATORS = {
     "exit_threshold_monitor": (lambda v: _num(v, float, "Monitor threshold", 0.0, 99.0), "Monitor Score", False),
     "exit_w_reversal":     (lambda v: _num(v, float, "Reversal weight", 0.0, 3.0), "Reversal Weight", False),
     "exit_w_exhaustion":   (lambda v: _num(v, float, "Exhaustion weight", 0.0, 3.0), "Exhaustion Weight", False),
+    "exit_w_directional":  (lambda v: _num(v, float, "Directional weight", 0.0, 3.0), "Directional Weight", False),
+    "exit_w_extended":     (lambda v: _num(v, float, "Extended weight", 0.0, 3.0), "Extended Weight", False),
+    "exit_min_triggers_for_directional": (lambda v: _num(v, int, "Min triggers (directional)", 1, 50), "Min Directional Triggers", False),
+    "exit_min_triggers_for_extended": (lambda v: _num(v, int, "Min triggers (extended)", 1, 50), "Min Extended Triggers", False),
     "exit_w_continuation": (lambda v: _num(v, float, "Continuation weight", 0.0, 3.0), "Continuation Weight", False),
     "exit_w_depth":        (lambda v: _num(v, float, "Depth weight", 0.0, 3.0), "Depth Weight", False),
     "exit_w_drawdown":     (lambda v: _num(v, float, "Drawdown weight", 0.0, 3.0), "Drawdown Weight", False),
@@ -260,8 +269,12 @@ class RuntimeSettings:
             return "OFF" if not value else f"${float(value):,.2f}"
         if key == "pip_points":
             return "AUTO" if not value else f"{value} pts"
-        if key == "cooldown_after_loss_minutes":
+        if key in ("cooldown_after_loss_minutes", "max_cycle_duration_minutes"):
             return "OFF" if not value else f"{float(value):g} min"
+        if key == "profit_confirmation_seconds":
+            return "OFF" if not value else f"{float(value):g}s"
+        if key == "profit_fallback_buffer_levels":
+            return f"{float(value):g} levels"
         if key == "telegram_status_interval_minutes":
             return f"{float(value):g} min"
         if key == "telegram_error_throttle_seconds":

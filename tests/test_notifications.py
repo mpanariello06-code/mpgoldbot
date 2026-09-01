@@ -122,19 +122,23 @@ t.check("it repeats after the window", len(sent) == 2)
 
 t.section("PERIODIC STATUS")
 status = {"symbol": "XAUUSDs", "cycle_id": 18, "state": "LADDER_ACTIVE",
-          "buy_triggers": 3, "sell_triggers": 1, "last_side": "BUY",
-          "momentum_score": 0.8, "positions": 2, "orders": 8,
-          "cycle_profit": 1.18}
+          "historical_buy_triggers": 3, "historical_sell_triggers": 1,
+          "current_pending_buys": 4, "current_pending_sells": 4,
+          "current_open_buys": 2, "current_open_sells": 0,
+          "last_side": "BUY", "momentum_score": 0.8, "positions": 2,
+          "orders": 8, "floating_pnl": 1.18, "realized_pnl": 0.42}
 n, sent, clock = notifier()
 n.periodic_status(status)
 t.check("no heartbeat right after startup", not sent, str(sent))
 clock.advance(20 * 60 + 1)
 n.periodic_status(status)
 t.check("the first heartbeat arrives one interval in", len(sent) == 1)
-t.check("status is compact and complete",
-        all(x in sent[0] for x in ("Cycle: #18", "BUY: 3", "SELL: 1",
-                                   "Momentum: STRONG", "Open: 2", "Pending: 8",
-                                   "+1.18")), sent[0])
+t.check("status separates live state from history",
+        all(x in sent[0] for x in ("Cycle: #18", "Pending: 4B / 4S",
+                                   "Open: 2B / 0S", "Triggers so far: 3B / 1S",
+                                   "Momentum: STRONG")), sent[0])
+t.check("floating and realized are reported apart",
+        "Floating: +1.18" in sent[0] and "Realized: +0.42" in sent[0], sent[0])
 for _ in range(50):
     n.periodic_status(status)
 t.check("no repeats inside the interval", len(sent) == 1, str(len(sent)))

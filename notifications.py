@@ -204,13 +204,16 @@ class TelegramNotifier:
             f"{status.get('symbol', '')}\n"
             f"Cycle: #{status.get('cycle_id', 0)}\n"
             f"State: {(status.get('state') or 'ACTIVE').replace('_', ' ')}\n\n"
-            f"BUY: {status.get('buy_triggers', 0)}\n"
-            f"SELL: {status.get('sell_triggers', 0)}\n\n"
+            f"Pending: {status.get('current_pending_buys', 0)}B / "
+            f"{status.get('current_pending_sells', 0)}S\n"
+            f"Open: {status.get('current_open_buys', 0)}B / "
+            f"{status.get('current_open_sells', 0)}S\n\n"
+            f"Triggers so far: {status.get('historical_buy_triggers', 0)}B / "
+            f"{status.get('historical_sell_triggers', 0)}S\n"
             f"Direction: {status.get('last_side') or '-'}\n"
             f"Momentum: {word}\n\n"
-            f"Open: {status.get('positions', 0)}\n"
-            f"Pending: {status.get('orders', 0)}\n\n"
-            f"Basket: {status.get('cycle_profit', 0):+.2f}"
+            f"Floating: {status.get('floating_pnl', 0):+.2f}\n"
+            f"Realized: {status.get('realized_pnl', 0):+.2f}"
         )
 
     # --------------------------------------------------------------- metrics

@@ -270,39 +270,53 @@ class TelegramController:
         market_state = (s.get("state") or "").replace("_", " ")
 
         lines = [
-            "🪜 <b>ROLLING LADDER SCALPER</b>", "",
+            "📊 <b>ROLLING LADDER</b>", "",
+            f"{s['symbol']}   {s.get('timeframe', '')}",
             f"Bot: {s['icon']} {s['lifecycle']}   [{s.get('mode', '?')}]",
-            f"Symbol: {s['symbol']}",
-            f"Timeframe: {s.get('timeframe', '')}",
             f"MT5: {'Connected' if s['mt5_connected'] else 'Disconnected'}",
             f"Price: {price}   Spread: {spread}",
             "",
-            f"Ladder spacing: {s.get('spacing')}",
-            f"TP: {_num(s.get('tp_distance'))}   Lot: {s.get('lot')}",
-            "",
             f"Cycle: #{s.get('cycle_id', 0)}",
-            f"BUY triggers: {s.get('buy_triggers', 0)}",
-            f"SELL triggers: {s.get('sell_triggers', 0)}",
-            f"Last direction: {s.get('last_side') or '-'}",
+            f"State: {market_state or '-'}",
+            f"Age: {int(s.get('cycle_age_seconds', 0) // 60)} min",
+            "",
+            "<b>LIVE IN MT5</b>",
+            f"Pending BUY: {s.get('current_pending_buys', 0)}",
+            f"Pending SELL: {s.get('current_pending_sells', 0)}",
+            f"Open BUY: {s.get('current_open_buys', 0)}",
+            f"Open SELL: {s.get('current_open_sells', 0)}",
+            "",
+            "<b>THIS CYCLE SO FAR</b>",
+            f"Historical BUY triggers: {s.get('historical_buy_triggers', 0)}",
+            f"Historical SELL triggers: {s.get('historical_sell_triggers', 0)}",
             f"Directional imbalance: {s.get('imbalance', 0):.2f}x",
             f"Direction changes: {s.get('direction_changes', 0)}",
-            "",
-            f"Open positions: {s.get('positions', 0)}",
-            f"Pending orders: {s.get('orders', 0)}",
             f"Ladder depth used: {s.get('ladder_depth_used', 0)}",
             "",
-            f"Basket P/L: {_money(s.get('cycle_profit', 0))}",
-            f"Basket drawdown: {_money(s.get('basket_drawdown', 0))}",
+            f"Basket floating P/L: {_money(s.get('floating_pnl', 0))}",
+            f"Realized this cycle: {_money(s.get('realized_pnl', 0))}",
+            f"Cycle total: {_money(s.get('cycle_total_pnl', 0))}",
+            f"Drawdown: {_money(-abs(s.get('basket_drawdown', 0)))}",
             f"Daily P/L: {_money(s.get('daily_profit', 0))}",
             "",
+            f"Spacing: {s.get('spacing')}   TP: {_num(s.get('tp_distance'))}   "
+            f"Lot: {s.get('lot')}",
             f"Momentum: {momentum_word} ({momentum:.2f})",
             f"Reversal: {reversal_word} ({reversal:.2f})",
             f"Exhaustion: {s.get('exhaustion_score', 0):.2f}",
+            f"Directional: {s.get('directional_score', 0):.2f}   "
+            f"Extended: {s.get('extended_score', 0):.2f}",
             f"Exit score: {s.get('exit_score', 0):.0f}"
-            f" / {s.get('settings', {}).get('exit_threshold_exit', 70):.0f}",
-            f"Decision: {s.get('decision', '-')}",
-            f"State: {market_state or '-'}",
+            f" / {s.get('settings', {}).get('exit_threshold_exit', 70):.0f}"
+            f"   ({s.get('decision', '-')})",
+            f"Last ladder update: "
+            f"{updated.strftime('%H:%M:%S') if updated else 'n/a'}",
         ]
+        if s.get("orders", 0) == 0 and s.get("positions", 0) == 0 and \
+                s.get("historical_buy_triggers", 0) + \
+                s.get("historical_sell_triggers", 0) > 0:
+            lines.append("\n⚠️ No live orders or positions - "
+                         + (s.get("block_reason") or "waiting to redeploy"))
         if s.get("reason"):
             lines.append(f"Why: {s['reason']}")
         lines += ["",
@@ -438,7 +452,7 @@ class TelegramController:
         s = await asyncio.to_thread(self.engine.status)
         price = f"{s['bid']:.2f}" if s.get("bid") else "n/a"
         return "\n".join([
-            "🤖 <b>XAUUSD ROLLING LADDER</b>", "",
+            f"🤖 <b>{s['symbol']} ROLLING LADDER</b>", "",
             f"State: {s['icon']} {s['state']}   [{s.get('mode', '?')}]",
             f"Symbol: {s['symbol']} {s.get('timeframe', '')}   Price: {price}",
             f"MT5: {'Connected' if s['mt5_connected'] else 'Disconnected'}",

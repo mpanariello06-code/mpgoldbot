@@ -140,6 +140,23 @@ class Mt5Broker:
             raise BrokerError(f"no tick for {self.symbol}")
         return Tick(bid=float(t.bid), ask=float(t.ask), time=float(t.time))
 
+    def tradable(self):
+        """(ok, reason) - is this symbol actually tradable right now?"""
+        with MT5_LOCK:
+            info = mt5.symbol_info(self.symbol)
+        if info is None:
+            return False, f"symbol {self.symbol} not found"
+        mode = getattr(info, "trade_mode", None)
+        disabled = getattr(mt5, "SYMBOL_TRADE_MODE_DISABLED", 0)
+        close_only = getattr(mt5, "SYMBOL_TRADE_MODE_CLOSEONLY", 3)
+        if mode == disabled:
+            return False, f"{self.symbol} trading is disabled by the broker"
+        if mode == close_only:
+            return False, f"{self.symbol} is close-only right now"
+        if not getattr(info, "visible", True):
+            return False, f"{self.symbol} is not in Market Watch"
+        return True, "OK"
+
     def account(self):
         with MT5_LOCK:
             a = mt5.account_info()
@@ -201,6 +218,42 @@ class Mt5Broker:
         self._filling = mode
         return mode
 
+    RETCODES = {
+        10004: "REQUOTE", 10006: "REJECTED", 10007: "CANCELED",
+        10013: "INVALID_REQUEST", 10014: "INVALID_VOLUME",
+        10015: "INVALID_PRICE", 10016: "INVALID_STOPS",
+        10017: "TRADE_DISABLED", 10018: "MARKET_CLOSED",
+        10019: "NO_MONEY", 10020: "PRICE_CHANGED", 10021: "PRICE_OFF",
+        10024: "TOO_MANY_REQUESTS", 10027: "AUTOTRADING_DISABLED",
+        10030: "UNSUPPORTED_FILLING_MODE", 10031: "NO_CONNECTION",
+        10034: "LIMIT_VOLUME", 10036: "POSITION_CLOSED",
+    }
+
+    def _rejection_report(self, request, result, spec, tick):
+        """
+        Everything needed to understand a refused order, in one line.
+
+        An order that MT5 would not accept is a fact about the broker's
+        constraints, not noise to swallow: price vs market, the minimum stop
+        distance, freeze level, tick size, digits and volume all go in.
+        """
+        retcode = getattr(result, "retcode", None)
+        name = self.RETCODES.get(retcode, "UNKNOWN")
+        return (
+            f"retcode={retcode} ({name}) "
+            f"comment={getattr(result, 'comment', 'no result')!r} | "
+            f"requested={request.get('price')} volume={request.get('volume')} "
+            f"type={request.get('type')} | "
+            f"bid={tick.bid} ask={tick.ask} spread={tick.spread:.{spec.digits}f} | "
+            f"stops_level={spec.stops_level_points}pts "
+            f"(={spec.min_stop_distance:g}) "
+            f"freeze={spec.freeze_level_points}pts | "
+            f"tick_size={spec.tick_size} point={spec.point} "
+            f"digits={spec.digits} | "
+            f"volume_min={spec.volume_min} step={spec.volume_step} | "
+            f"symbol={self.symbol}"
+        )
+
     def place_stop_order(self, side, price, volume, tp=0.0, sl=0.0, comment=""):
         spec = self.symbol_spec()
         request = {
@@ -221,8 +274,11 @@ class Mt5Broker:
             result = mt5.order_send(request)
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             return True, int(result.order), "OK"
-        msg = f"retcode={getattr(result, 'retcode', '?')} {getattr(result, 'comment', 'no result')}"
-        return False, None, msg
+        try:
+            tick = self.tick()
+        except BrokerError:
+            tick = Tick(bid=0.0, ask=0.0)
+        return False, None, self._rejection_report(request, result, spec, tick)
 
     def cancel_order(self, ticket):
         with MT5_LOCK:
@@ -230,7 +286,10 @@ class Mt5Broker:
                                      "order": int(ticket)})
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             return True, "OK"
-        return False, f"retcode={getattr(result, 'retcode', '?')} {getattr(result, 'comment', '')}"
+        retcode = getattr(result, "retcode", None)
+        return False, (f"cancel {ticket} failed: retcode={retcode} "
+                       f"({self.RETCODES.get(retcode, 'UNKNOWN')}) "
+                       f"{getattr(result, 'comment', '')}")
 
     def close_position(self, ticket, comment="cycle"):
         with MT5_LOCK:
@@ -258,7 +317,10 @@ class Mt5Broker:
             result = mt5.order_send(request)
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             return True, "OK"
-        return False, f"retcode={getattr(result, 'retcode', '?')} {getattr(result, 'comment', '')}"
+        retcode = getattr(result, "retcode", None)
+        return False, (f"close {ticket} failed: retcode={retcode} "
+                       f"({self.RETCODES.get(retcode, 'UNKNOWN')}) "
+                       f"{getattr(result, 'comment', '')}")
 
     # --------------------------------------------------------- closed trades
     def poll_closed(self):
@@ -382,6 +444,9 @@ class PaperBroker:
             print(f"[paper] state save failed: {exc}")
 
     # ------------------------------------------------------------ market data
+    def tradable(self):
+        return True, "OK (paper)"
+
     def symbol_spec(self):
         return self._spec_provider()
 
@@ -425,6 +490,42 @@ class PaperBroker:
             return [PendingOrder(**asdict(o)) for o in self._orders.values()]
 
     # -------------------------------------------------------------- execution
+    RETCODES = {
+        10004: "REQUOTE", 10006: "REJECTED", 10007: "CANCELED",
+        10013: "INVALID_REQUEST", 10014: "INVALID_VOLUME",
+        10015: "INVALID_PRICE", 10016: "INVALID_STOPS",
+        10017: "TRADE_DISABLED", 10018: "MARKET_CLOSED",
+        10019: "NO_MONEY", 10020: "PRICE_CHANGED", 10021: "PRICE_OFF",
+        10024: "TOO_MANY_REQUESTS", 10027: "AUTOTRADING_DISABLED",
+        10030: "UNSUPPORTED_FILLING_MODE", 10031: "NO_CONNECTION",
+        10034: "LIMIT_VOLUME", 10036: "POSITION_CLOSED",
+    }
+
+    def _rejection_report(self, request, result, spec, tick):
+        """
+        Everything needed to understand a refused order, in one line.
+
+        An order that MT5 would not accept is a fact about the broker's
+        constraints, not noise to swallow: price vs market, the minimum stop
+        distance, freeze level, tick size, digits and volume all go in.
+        """
+        retcode = getattr(result, "retcode", None)
+        name = self.RETCODES.get(retcode, "UNKNOWN")
+        return (
+            f"retcode={retcode} ({name}) "
+            f"comment={getattr(result, 'comment', 'no result')!r} | "
+            f"requested={request.get('price')} volume={request.get('volume')} "
+            f"type={request.get('type')} | "
+            f"bid={tick.bid} ask={tick.ask} spread={tick.spread:.{spec.digits}f} | "
+            f"stops_level={spec.stops_level_points}pts "
+            f"(={spec.min_stop_distance:g}) "
+            f"freeze={spec.freeze_level_points}pts | "
+            f"tick_size={spec.tick_size} point={spec.point} "
+            f"digits={spec.digits} | "
+            f"volume_min={spec.volume_min} step={spec.volume_step} | "
+            f"symbol={self.symbol}"
+        )
+
     def place_stop_order(self, side, price, volume, tp=0.0, sl=0.0, comment=""):
         spec = self.symbol_spec()
         with self._lock:

@@ -73,11 +73,17 @@ LADDER_HEADER = [
 # One row per completed cycle: how it ran and why it ended.
 CYCLE_HEADER = [
     "timestamp", "symbol", "cycle_id", "started_at", "duration_seconds",
-    "anchor", "spacing", "triggers", "buy_triggers", "sell_triggers",
+    "anchor", "initial_price", "exit_price", "exit_spread", "spacing",
+    "triggers", "buy_triggers", "sell_triggers",
     "direction_changes", "imbalance", "ladder_depth_used", "net_levels",
-    "path_levels", "efficiency", "tp_count", "realized_pnl", "peak_pnl",
-    "drawdown", "momentum_score", "reversal_score", "exhaustion_score",
-    "exit_score", "market_state", "end_kind", "end_reason", "daily_profit",
+    "path_levels", "efficiency", "tp_count",
+    "positions_at_exit", "open_buys_at_exit", "open_sells_at_exit",
+    "pending_orders_at_exit", "floating_pnl_at_exit",
+    "realized_pnl", "peak_pnl", "drawdown",
+    "momentum_score", "continuation_score", "reversal_score",
+    "exhaustion_score", "directional_score", "extended_score",
+    "exit_score", "market_state", "exit_scenario", "end_kind", "end_reason",
+    "daily_profit",
 ]
 
 ACCOUNT_HEADER = [
@@ -310,10 +316,10 @@ class CsvLogger:
         row = []
         for column in CYCLE_HEADER:
             value = fields.get(column, "")
-            if column in ("anchor", "spacing"):
+            if column in ("anchor", "spacing", "initial_price", "exit_price"):
                 row.append(_fmt(value, digits))
             elif column in ("realized_pnl", "peak_pnl", "drawdown",
-                            "daily_profit"):
+                            "floating_pnl_at_exit", "daily_profit"):
                 row.append(_fmt(value, 2))
             else:
                 row.append(_fmt(value))

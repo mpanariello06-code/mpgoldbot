@@ -80,7 +80,13 @@ for column in ("timestamp", "symbol", "cycle_id", "candle_time", "event_type",
 cycle_header = open(TMP / "rolling_ladder_cycles.csv").readline().strip().split(",")
 for column in ("cycle_id", "triggers", "buy_triggers", "sell_triggers",
                "imbalance", "realized_pnl", "exit_score", "end_kind",
-               "end_reason"):
+               "end_reason",
+               # the state that caused the exit, not the empty state after it
+               "initial_price", "exit_price", "positions_at_exit",
+               "open_buys_at_exit", "open_sells_at_exit",
+               "pending_orders_at_exit", "floating_pnl_at_exit",
+               "peak_pnl", "drawdown", "exit_scenario", "duration_seconds",
+               "continuation_score", "directional_score", "extended_score"):
     t.check(f"cycle log has {column!r}", column in cycle_header)
 events = [e["event_type"] for e in rows("events.csv")]
 t.check("startup recorded", "BOT_STARTED" in events and "MT5_CONNECTED" in events,

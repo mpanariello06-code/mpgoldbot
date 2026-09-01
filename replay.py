@@ -23,6 +23,7 @@ import json
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import config as cfg
@@ -80,20 +81,58 @@ def bar_path(bar, steps_per_leg=4, adverse_first=True):
 # ===========================================================================
 # BAR SOURCES
 # ===========================================================================
+# What a bar export actually contains: an epoch, or a date/time the exporter
+# wrote for a human to read.
+_TIME_FORMATS = (
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M", "%Y.%m.%d %H:%M:%S", "%Y.%m.%d %H:%M",
+    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%d",
+)
+
+
+def parse_bar_time(value, fallback):
+    """Epoch seconds from an epoch, a timestamp string, or `fallback`."""
+    if value in (None, ""):
+        return float(fallback)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(text, fmt).timestamp()
+        except ValueError:
+            continue
+    try:                                   # anything else ISO-8601 shaped
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return float(fallback)
+
+
 def load_bars_csv(path):
-    """time,open,high,low,close[,spread] - header required."""
+    """time,open,high,low,close[,spread] - header required.
+
+    `time` may be epoch seconds or a timestamp string; a bar file exported for
+    a human to read is the normal case, not an error.
+    """
     out = []
+    skipped = 0
     with open(path, newline="", encoding="utf-8") as fh:
         for row in csv_module.DictReader(fh):
             try:
                 out.append({
-                    "time": float(row.get("time") or row.get("timestamp") or len(out)),
+                    "time": parse_bar_time(row.get("time") or row.get("timestamp"),
+                                           len(out)),
                     "open": float(row["open"]), "high": float(row["high"]),
                     "low": float(row["low"]), "close": float(row["close"]),
                     "spread": float(row["spread"]) if row.get("spread") else None,
                 })
             except (KeyError, TypeError, ValueError):
+                skipped += 1
                 continue
+    if skipped:
+        print(f"[replay] {skipped} unreadable rows skipped in {path}")
     return out
 
 
@@ -223,7 +262,7 @@ def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
     ]
 
     def on_cycle(cycle, sequence, assessment, total, reason, kind, lost,
-                 duration=0.0, next_cycle_id=None):
+                 duration=0.0, next_cycle_id=None, context=None):
         seq = sequence.snapshot() if sequence else {}
         result.cycles.append({
             "cycle_id": cycle.cycle_id, "realized": total,
@@ -234,6 +273,9 @@ def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
             "state": assessment.state if assessment else "",
             "kind": kind, "reason": reason,
             "duration_seconds": round(duration, 1),
+            "exit_price": (context or {}).get("exit_price", ""),
+            "open_positions_at_exit": (context or {}).get(
+                "open_positions_at_exit", ""),
         })
         label = f"{kind}: {assessment.state if assessment else 'n/a'}"
         result.exit_reasons[label] = result.exit_reasons.get(label, 0) + 1
