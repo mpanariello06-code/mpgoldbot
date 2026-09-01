@@ -225,6 +225,10 @@ MAX_CYCLE_DRAWDOWN = _get_float("MAX_CYCLE_DRAWDOWN",
                                 _get_float("MAX_CYCLE_LOSS", 20.0))
 MAX_CONSECUTIVE_LOSING_CYCLES = _get_int("MAX_CONSECUTIVE_LOSING_CYCLES", 3)
 COOLDOWN_AFTER_LOSS = _get_float("COOLDOWN_AFTER_LOSS", 15.0)   # minutes
+# Mandatory settle time between one cycle closing and the next ladder going
+# out. It applies AFTER a complete cycle exit only - never between ladder
+# levels, triggers or orders inside a running cycle. 0 = re-enter immediately.
+CYCLE_REENTRY_COOLDOWN = _get_float("CYCLE_REENTRY_COOLDOWN", 10.0)   # seconds
 # No cycle may stay open forever: past this it is closed as RISK_TIMEOUT
 MAX_CYCLE_DURATION = _get_float("MAX_CYCLE_DURATION", 120.0)    # minutes, 0 = off
 
@@ -341,6 +345,7 @@ def runtime_defaults():
         "max_cycle_drawdown": MAX_CYCLE_DRAWDOWN,
         "max_consecutive_losing_cycles": MAX_CONSECUTIVE_LOSING_CYCLES,
         "cooldown_after_loss_minutes": COOLDOWN_AFTER_LOSS,
+        "cycle_reentry_cooldown_seconds": CYCLE_REENTRY_COOLDOWN,
         "max_cycle_duration_minutes": MAX_CYCLE_DURATION,
         # hygiene
         "order_max_age_seconds": ORDER_MAX_AGE,
@@ -416,6 +421,11 @@ def validate():
         warnings.append("MAX_DAILY_DRAWDOWN is 0 - the daily guard is disabled")
     if MAX_CYCLE_DRAWDOWN <= 0:
         warnings.append("MAX_CYCLE_DRAWDOWN is 0 - the cycle guard is disabled")
+    if not CYCLE_CLOSE_POSITIONS:
+        warnings.append(
+            "CYCLE_CLOSE_POSITIONS=false - positions left running after a cycle "
+            "ends keep the next ladder waiting, because only one cycle may be "
+            "active at a time")
     if MAX_CYCLE_DURATION <= 0:
         warnings.append(
             "MAX_CYCLE_DURATION is 0 - a cycle can stay open indefinitely")

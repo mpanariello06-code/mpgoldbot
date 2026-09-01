@@ -177,8 +177,11 @@ t.check("exit score stayed below the threshold",
         f"{engine.assessment.exit_score:.1f}")
 
 t.section("ADAPTIVE EXIT: A REVERSAL ENDS THE CYCLE")
+# the re-entry cooldown has its own section in test_continuous; here the
+# question is only whether the reversal ends the cycle cleanly
 engine, broker, feed, settings, rec = build(
-    {"tp_mode": "distance", "tp_distance": 0.20}, name="reverse")
+    {"tp_mode": "distance", "tp_distance": 0.20,
+     "cycle_reentry_cooldown_seconds": 0}, name="reverse")
 engine.step()
 buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
               key=lambda o: o.price)
@@ -197,12 +200,14 @@ for _ in range(6):
     target = max(sells, key=lambda o: o.price)
     trigger_sell(feed, target.price)
     engine.step()
-    if engine.cycle.cycle_id != start_cycle:
+    if not engine.cycle_active or engine.cycle.cycle_id != start_cycle:
         break
 
+# Closing a cycle no longer starts the next one: the re-entry cooldown sits in
+# between, so "closed" is `cycle_active`, not a bumped id.
 t.check("the cycle closed on the reversal",
-        engine.cycle.cycle_id != start_cycle,
-        f"cycle #{engine.cycle.cycle_id} vs #{start_cycle}")
+        not engine.cycle_active or engine.cycle.cycle_id != start_cycle,
+        f"cycle #{engine.cycle.cycle_id} active={engine.cycle_active}")
 t.check("CYCLE_COMPLETED or CYCLE_LOSS logged",
         rec.count("CYCLE_COMPLETED") + rec.count("CYCLE_LOSS") == 1)
 closes = [c for c in rec.cycles if c.kind_of == "complete"]
@@ -218,6 +223,7 @@ t.check("the assessment is handed to the logger",
         any(c.assessment is not None and c.assessment.exit_score > 0
             for c in closes))
 t.check("positions were closed out", not broker.positions())
+engine.step()          # the (zero-length) re-entry cooldown is served
 t.check("pending orders were cancelled or rebuilt for the new cycle",
         all(parse_comment(o.comment)[0] == engine.cycle.cycle_id
             for o in broker.orders()))

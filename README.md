@@ -41,7 +41,7 @@ runtime_settings.py     Telegram-controlled settings, persisted as JSON
 telegram_controller.py  control panel (own thread, own event loop)
 telegram_settings.py    the ⚙️ SETTINGS menu tree
 csv_logger.py           trades, events, account snapshots, ladder events, cycles
-tests/                  804 offline checks — python tests/run_all.py
+tests/                  857 offline checks — python tests/run_all.py
 data/                   CSVs + runtime_settings.json + state files (auto-created)
 ```
 
@@ -58,20 +58,56 @@ long as it is RUNNING and risk is OK:
 
 ```
 deploy ladder → levels trigger → roll and replenish → exit engine decides
-   → close positions → cancel orders → VERIFY against MT5 → record cycle
+   → cancel orders → close positions → VERIFY against MT5 → record cycle
+   → CYCLE CLOSED → re-entry cooldown → verify flat
    → new cycle id → new ladder at the CURRENT price → repeat
 ```
 
-The handoff happens **in the same pass** that closed the old cycle: a cycle
-ending at 13:42:17 has its successor live at 13:42:17, anchored on the price
-right then, not on the old grid and not at the next M5 open. There is **no
-cooldown after a normal cycle** — only a risk-forced close arms one.
+### One active cycle, ever
+
+`MAX_ACTIVE_CYCLES = 1`. Closing a cycle does **not** start the next one. In
+between, the engine is deliberately cycle-less — state `COOLDOWN_AFTER_EXIT` —
+and creates nothing: no ladder, no pending orders, no cycle, and the closed one
+is never reopened. A new ladder is built only when **both** are true:
+
+* `CYCLE_REENTRY_COOLDOWN` (10s by default) has elapsed since the close, and
+* the account is verified flat — 0 strategy positions and 0 pending orders.
+
+If either fails the engine waits and reconciles again, so cycle #7 still being
+alive can never coexist with #8 and #9. `_start_cycle()` refuses outright while
+anything from a previous cycle is live, and logs `CYCLE_REENTRY_BLOCKED`.
+
+The new ladder is anchored on the price **at the end of the cooldown**, not on
+the old grid and not at the next M5 open.
+
+**The cooldown is between cycles, never between trades.** It is not a delay
+between ladder levels, triggers or pending orders — inside an active cycle the
+ladder triggers and replenishes at the poll rate. Set
+`CYCLE_REENTRY_COOLDOWN=0` for the previous behaviour (re-enter on the next
+pass). A risk-forced close also arms the much longer `COOLDOWN_AFTER_LOSS`; the
+gate waits for whichever runs longer.
+
+### Auditing an exit
+
+A cycle can open and close in seconds, so every step of the exit is logged to
+`rolling_ladder_events.csv` and the console:
+
+```
+EXIT_TRIGGERED → EXIT_ORDERS_FOUND → EXIT_CANCEL_SENT → ORDER_CANCELLED
+  → EXIT_POSITIONS_FOUND → EXIT_CLOSE_SENT → EXIT_CLOSE_CONFIRMED
+  → EXIT_RECONCILED → CYCLE_FLAT → CYCLE_COMPLETED → CYCLE_COOLDOWN_STARTED
+  → CYCLE_COOLDOWN_COMPLETE → LADDER_DEPLOY_START → LADDER_CREATED
+  → CYCLE_ACTIVE
+```
+
+Anything the broker refuses is logged with its exact MT5 retcode.
 
 The transition is guarded: it is driven by a single state machine under a lock,
 so one exit event can only ever produce one new cycle. If the broker refuses a
 cancel or a close, the engine keeps retrying and **will not build a second
 ladder** until MT5 confirms the old one is gone. Cycle ids are persisted and
-never reused, including across restarts and adopted cycles.
+never reused, including across restarts and adopted cycles — and a restart
+inside a cooldown serves out what is left of it.
 
 ## Setup
 
@@ -222,7 +258,8 @@ event-based, deduplicated and throttled:
 | Sent | Not sent |
 | --- | --- |
 | bot started / stopped (compact) | individual level triggers |
-| one message per cycle close: result, BUY/SELL counts, reason, duration, next cycle | individual TPs |
+| one message when a cycle closes: exit, result, BUY/SELL counts, duration, and how long until the next ladder | individual TPs |
+| one message when the next ladder is **actually deployed** (`CYCLE #N STARTED`) | any countdown in between |
 | a state **transition** into reversal / strong continuation / fading — once, not per trigger | order placement or replenishment |
 | risk events and errors (identical errors suppressed for `TELEGRAM_ERROR_THROTTLE`) | repeats of a state the chat already knows |
 | optional periodic status every `TELEGRAM_STATUS_INTERVAL` minutes | anything already visible in the CSVs |
@@ -230,7 +267,9 @@ event-based, deduplicated and throttled:
 Measured on a 5-day replay (109 level triggers, 109 closes, 15 cycles): the old
 one-message-per-event style would have sent **233** messages; the policy sends
 **29** (15 cycle closes + 14 state transitions), an 88% reduction, with ~15,600
-would-be messages suppressed. The optional heartbeat is separate and toggleable
+would-be messages suppressed. The cycle-start message adds one per cycle after
+the first — a cycle costs two messages in total, at its close and at the next
+ladder's confirmed deployment, and nothing in between. The optional heartbeat is separate and toggleable
 — at the default 20 minutes that is 3/hour.
 
 State alerts are capped at two per cycle, so a cycle whose reading oscillates
@@ -269,8 +308,8 @@ broker quotes gold differently — that one setting rescales all five pip target
 Fixed lots only — **no martingale, no size increase after a loss, no recovery
 doubling.** `MAX_OPEN_POSITIONS`, `MAX_PENDING_ORDERS`, `MAX_LOT_SIZE`,
 `MAX_DAILY_LOSS`, `MAX_CYCLE_LOSS`, `MAX_CYCLE_DURATION`,
-`MAX_CONSECUTIVE_LOSING_CYCLES`, `MAX_SPREAD`, `MAX_SLIPPAGE` and
-`COOLDOWN_AFTER_LOSS` are all enforced. When a
+`MAX_CONSECUTIVE_LOSING_CYCLES`, `MAX_SPREAD`, `MAX_SLIPPAGE`,
+`COOLDOWN_AFTER_LOSS` and `CYCLE_REENTRY_COOLDOWN` are all enforced. When a
 limit trips: new entries stop and pending orders are cancelled (they would breach
 the limit the moment they trigger); **open positions keep running** under their
 own TP/SL. The bot resumes by itself once the condition clears — the spread
@@ -284,6 +323,10 @@ filter in particular blocks and un-blocks automatically.
   (`LADDER_CREATED`, `ORDER_PLACED`, `ORDER_CANCELLED`, `ORDER_TRIGGERED`,
   `TP_HIT`, `SL_HIT`, `LEVEL_ROLLED`, `CYCLE_STARTED`, `CYCLE_COMPLETED`,
   `CYCLE_LOSS`, `LADDER_DEPLOY_START`, `LADDER_DEPTH_CAP`, `ORDER_REJECTED`,
+  the exit trail (`EXIT_TRIGGERED`, `EXIT_ORDERS_FOUND`, `EXIT_CANCEL_SENT`,
+  `EXIT_POSITIONS_FOUND`, `EXIT_CLOSE_SENT`, `EXIT_CLOSE_CONFIRMED`,
+  `EXIT_RECONCILED`, `CYCLE_FLAT`, `CYCLE_COOLDOWN_STARTED`,
+  `CYCLE_COOLDOWN_COMPLETE`, `CYCLE_REENTRY_BLOCKED`, `CYCLE_ACTIVE`),
   `RISK_BLOCK`, `SPREAD_BLOCK`, `ERROR`) with the **full market
   state at that moment**: trigger counts, consecutive runs, last/previous side,
   direction changes, ratios, imbalance, depth used, distance travelled,
@@ -340,10 +383,12 @@ you only touch once.
 ## Tests
 
 ```bash
-python tests/run_all.py        # 804 checks, no MT5 or network needed
+python tests/run_all.py        # 857 checks, no MT5 or network needed
 ```
 
-Covers: pip/point conversion, both execution adapters, settings validation and
+Covers: the exit -> flat -> cooldown -> new ladder sequence and the
+one-active-cycle gate, pip/point conversion, both execution adapters, settings
+validation and
 persistence, ladder creation and both-sided stop placement, triggering, TP,
 rolling and replenishment, partial deployment reported as partial (actual vs
 intended levels) and the full broker diagnosis on a refused order, the three

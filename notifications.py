@@ -31,6 +31,15 @@ def _duration(seconds):
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
+def _seconds(value):
+    """A wait, written the way a person reads it: 10s, 90s, 15m 30s."""
+    value = max(0.0, float(value))
+    if value < 120:
+        return f"{value:.0f}s"
+    minutes, rest = divmod(int(round(value)), 60)
+    return f"{minutes}m" if not rest else f"{minutes}m {rest}s"
+
+
 class TelegramNotifier:
     """
     Wraps the raw send function with a policy.
@@ -107,18 +116,37 @@ class TelegramNotifier:
 
     # --------------------------------------------------------------- cycles
     def cycle_closed(self, symbol, cycle_id, total, buys, sells, reason_word,
-                     direction, duration_seconds, next_cycle_id):
-        icon = "🟢" if total >= 0 else "🔴"
+                     direction, duration_seconds, next_cycle_id,
+                     next_ladder_seconds=0.0):
+        """
+        One message when the cycle is confirmed closed and flat.
+
+        It announces the wait, not the next cycle: the next ladder is announced
+        by `cycle_started` when it has actually been deployed. There is no
+        countdown in between - one message here, one message there.
+        """
+        icon = "⏳" if next_ladder_seconds > 0 else ("🟢" if total >= 0 else "🔴")
+        wait = (f"Next ladder in {_seconds(next_ladder_seconds)}."
+                if next_ladder_seconds > 0 else "Next ladder deploying now.")
         return self._emit(
             f"{icon} <b>CYCLE #{cycle_id} CLOSED</b>\n\n"
             f"{symbol}\n"
+            f"Exit: {reason_word}\n"
             f"Result: {total:+.2f}\n\n"
             f"BUY: {buys}\n"
             f"SELL: {sells}\n\n"
-            f"Reason: {reason_word}\n"
             f"Direction: {direction or '-'}\n"
             f"Duration: {_duration(duration_seconds)}\n\n"
-            f"Cycle #{next_cycle_id} deployed"
+            f"{wait}"
+        )
+
+    def cycle_started(self, symbol, timeframe, cycle_id, levels=0):
+        """One message when the new ladder is actually live in MT5."""
+        return self._emit(
+            f"🟢 <b>CYCLE #{cycle_id} STARTED</b>\n\n"
+            f"{symbol}\n"
+            f"{timeframe}\n"
+            f"Ladder deployed." + (f" {levels} levels live." if levels else "")
         )
 
     # ------------------------------------------------- state transitions only

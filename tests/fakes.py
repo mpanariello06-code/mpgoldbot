@@ -77,6 +77,7 @@ class CycleRecord:
     duration: float = 0.0
     next_id: int = None
     context: dict = None
+    next_ladder_seconds: float = 0.0
 
     def __getitem__(self, i):
         return (self.kind_of, self.cycle_id, self.total, self.reason,
@@ -101,11 +102,13 @@ class Recorder:
             "cycle_started": lambda c, a: self.cycles.append(
                 CycleRecord("start", c.cycle_id, 0.0, "", "", False)),
             "cycle_complete": lambda c, seq, assessment, tot, reason, kind, lost,
-                                     duration=0.0, next_id=None, context=None:
+                                     duration=0.0, next_id=None, context=None,
+                                     next_ladder_seconds=0.0:
                 self.cycles.append(CycleRecord("complete", c.cycle_id, tot,
                                                reason, kind, lost, assessment,
                                                seq, duration, next_id,
-                                               context or {})),
+                                               context or {},
+                                               next_ladder_seconds)),
             "risk_blocked": lambda r: self.blocks.append(r),
         }
 

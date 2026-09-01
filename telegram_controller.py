@@ -276,10 +276,16 @@ class TelegramController:
             f"MT5: {'Connected' if s['mt5_connected'] else 'Disconnected'}",
             f"Price: {price}   Spread: {spread}",
             "",
-            f"Cycle: #{s.get('cycle_id', 0)}",
+            (f"Cycle: #{s.get('cycle_id', 0)} (CLOSED)"
+             if not s.get("cycle_active", True)
+             else f"Cycle: #{s.get('cycle_id', 0)}"),
             f"State: {market_state or '-'}",
             f"Age: {int(s.get('cycle_age_seconds', 0) // 60)} min",
             "",
+            *(["⏳ <b>COOLDOWN AFTER EXIT</b>",
+               f"No active cycle. Next ladder in "
+               f"{s.get('reentry_wait_seconds', 0):.0f}s.", ""]
+              if s.get("in_reentry_cooldown") else []),
             "<b>LIVE IN MT5</b>",
             f"Pending BUY: {s.get('current_pending_buys', 0)}",
             f"Pending SELL: {s.get('current_pending_sells', 0)}",

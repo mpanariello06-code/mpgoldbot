@@ -262,7 +262,8 @@ def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
     ]
 
     def on_cycle(cycle, sequence, assessment, total, reason, kind, lost,
-                 duration=0.0, next_cycle_id=None, context=None):
+                 duration=0.0, next_cycle_id=None, context=None,
+                 next_ladder_seconds=0.0):
         seq = sequence.snapshot() if sequence else {}
         result.cycles.append({
             "cycle_id": cycle.cycle_id, "realized": total,

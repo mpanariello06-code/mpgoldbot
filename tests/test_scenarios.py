@@ -225,7 +225,7 @@ settings._values["direction_filter"] = "off"      # entries allowed again
 now[0] += 61
 eng.step()
 t.check("confirmed profit with no primary exit closes the cycle",
-        eng.cycle.cycle_id != start_cycle, f"#{eng.cycle.cycle_id}")
+        not eng.cycle_active, f"#{eng.cycle.cycle_id} active={eng.cycle_active}")
 closes = [c for c in rec.cycles if c.kind_of == "complete"]
 t.check("recorded as PROFIT_FALLBACK",
         closes and closes[-1].kind == PROFIT_FALLBACK,
@@ -241,8 +241,13 @@ t.check("with the price it exited at", ctx.get("exit_price"), str(ctx.get("exit_
 t.check("and the floating P/L it was carrying",
         ctx.get("floating_pnl_at_exit", 0) > 0,
         str(ctx.get("floating_pnl_at_exit")))
-t.check("a new ladder follows immediately",
-        len(broker.orders()) > 0 or eng.block_reason,
+t.check("nothing is left live while the cycle is closed",
+        not broker.orders() and not broker.positions(),
+        f"{len(broker.orders())} orders, {len(broker.positions())} positions")
+now[0] += 11                                  # the re-entry cooldown elapses
+eng.step()
+t.check("a new ladder follows the cooldown",
+        eng.cycle_active and (len(broker.orders()) > 0 or eng.block_reason),
         f"{len(broker.orders())} orders, block {eng.block_reason!r}")
 t.check("the fallback is not a dollar target - the buffer scales with the lot",
         settings.get("profit_fallback_buffer_levels") *
@@ -288,8 +293,8 @@ closes = [c for c in rec.cycles if c.kind_of == "complete"]
 t.check("with the guard disabled the profit is taken",
         closes and closes[-1].kind == PROFIT_FALLBACK,
         str([c.kind for c in closes]))
-t.check("the control cycle did close", eng.cycle.cycle_id != first,
-        f"#{eng.cycle.cycle_id}")
+t.check("the control cycle did close", not eng.cycle_active,
+        f"#{eng.cycle.cycle_id} active={eng.cycle_active}")
 continuation = held.continuation_score
 t.check("the move was reading as continuing at the time", continuation > 0,
         f"{continuation:.2f}")
@@ -301,7 +306,8 @@ t.check("the same reading is produced",
         abs(held.continuation_score - continuation) < 1e-6,
         f"{held.continuation_score:.4f} vs {continuation:.4f}")
 t.check("a strongly continuing run is held despite a confirmed profit",
-        eng.cycle.cycle_id == first, f"#{eng.cycle.cycle_id}")
+        eng.cycle_active and eng.cycle.cycle_id == first,
+        f"#{eng.cycle.cycle_id} active={eng.cycle_active}")
 t.check("nothing was closed", not [c for c in rec.cycles if c.kind_of == "complete"],
         str([c.kind for c in rec.cycles]))
 t.check("and the basket is still open, profit and all", bool(broker.positions())
@@ -329,13 +335,22 @@ t.check("still open before the limit", eng.cycle.cycle_id == start_cycle,
 now[0] += 31 * 60
 eng.step()
 t.check("the cycle is closed once the limit passes",
-        eng.cycle.cycle_id != start_cycle, f"#{eng.cycle.cycle_id}")
+        not eng.cycle_active, f"#{eng.cycle.cycle_id} active={eng.cycle_active}")
 closes = [c for c in rec.cycles if c.kind_of == "complete"]
 t.check("recorded as RISK_TIMEOUT",
         closes and closes[-1].kind == RISK_TIMEOUT,
         str([c.kind for c in closes]))
 t.check("nothing is left open", not broker.positions())
-t.check("a new cycle starts after the timeout", eng.sequence.total_triggers == 0)
+now[0] += 11                                  # the 10s re-entry cooldown alone
+eng.step()
+t.check("a risk-forced close waits out the LONGER loss cooldown too",
+        not eng.cycle_active and "cooldown" in eng.block_reason.lower(),
+        f"#{eng.cycle.cycle_id} {eng.block_reason!r}")
+now[0] += settings.get("cooldown_after_loss_minutes") * 60 + 1
+eng.step()
+t.check("a new cycle starts once both cooldowns are served",
+        eng.cycle_active and eng.sequence.total_triggers == 0,
+        f"#{eng.cycle.cycle_id}")
 
 t.section("A CYCLE CAN NEVER STAY OPEN INDEFINITELY")
 t.check("the timeout is on by default",

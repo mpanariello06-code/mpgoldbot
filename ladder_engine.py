@@ -42,6 +42,7 @@ class State:
     ROLLING = "ROLLING"
     CLOSING_CYCLE = "CLOSING_CYCLE"      # closing out, verifying against MT5
     CYCLE_COMPLETE = "CYCLE_COMPLETE"
+    COOLDOWN_AFTER_EXIT = "COOLDOWN_AFTER_EXIT"   # flat, settling before re-entry
     NEW_CYCLE = "NEW_CYCLE"
     RISK_BLOCKED = "RISK_BLOCKED"
     ERROR = "ERROR"
@@ -76,6 +77,15 @@ class DirectionFilter:
         if mode == Direction.SELL_BIAS:
             return False, True
         return False, False
+
+
+def _seconds(value):
+    """A wait, written the way a person reads it: 10s, 90s, 15m 30s."""
+    value = max(0.0, float(value))
+    if value < 120:
+        return f"{value:.0f}s"
+    minutes, rest = divmod(int(round(value)), 60)
+    return f"{minutes}m" if not rest else f"{minutes}m {rest}s"
 
 
 def level_comment(cycle_id, side, index):
@@ -170,6 +180,13 @@ class RollingLadderEngine:
         self._depth_capped_logged = False
         self._profit_since = None         # when the basket first cleared the buffer
         self._last_place_error = 0.0
+        # There is exactly one active cycle at a time. Between a cycle closing
+        # and the next ladder going out the engine is deliberately cycle-less:
+        # no ladder, no orders, no new cycle, until the re-entry cooldown has
+        # elapsed AND the account is verified flat.
+        self.cycle_active = True
+        self.reentry_until = 0.0
+        self._cycle_announced = False     # the new ladder's one deploy message
 
     # =================================================================== utils
     def _today(self):
@@ -203,6 +220,8 @@ class RollingLadderEngine:
                 "max_cycle_id": self.max_cycle_id,
                 "consecutive_losing_cycles": self.consecutive_losing_cycles,
                 "cooldown_until": self.cooldown_until,
+                "cycle_active": self.cycle_active,
+                "reentry_until": self.reentry_until,
                 "streak_paused": self._streak_paused,
                 "total_tp": self.total_tp,
                 "total_trades": self.total_trades,
@@ -230,6 +249,9 @@ class RollingLadderEngine:
         self.max_cycle_id = int(data.get("max_cycle_id", 0))
         self.consecutive_losing_cycles = int(data.get("consecutive_losing_cycles", 0))
         self.cooldown_until = float(data.get("cooldown_until", 0.0))
+        # A restart inside the re-entry cooldown honours what is left of it.
+        self.cycle_active = bool(data.get("cycle_active", True))
+        self.reentry_until = float(data.get("reentry_until", 0.0))
         self._streak_paused = bool(data.get("streak_paused", False))
         self.total_tp = int(data.get("total_tp", 0))
         self.total_trades = int(data.get("total_trades", 0))
@@ -270,13 +292,24 @@ class RollingLadderEngine:
                 self.cycle.cycle_id = adopted
             if not self.cycle.anchor:
                 self.cycle.anchor = self._anchor_from(orders, positions)
+            self.cycle_active = True
+            self.reentry_until = 0.0
             self._event("LADDER_RECOVERED",
                         f"Adopted cycle #{adopted} from {len(orders)} orders / "
                         f"{len(positions)} positions")
-        elif not self.cycle.anchor:
-            self._start_cycle(new_id=self.cycle.cycle_id, reason="startup")
+        elif not self.cycle_active and self._reentry_wait() > 0:
+            # restarted inside a re-entry cooldown: serve out what is left of it
+            self.state = State.COOLDOWN_AFTER_EXIT
+            self._event("CYCLE_COOLDOWN_STARTED",
+                        f"restart during the re-entry cooldown - next ladder in "
+                        f"{_seconds(self._reentry_wait())}", status="COOLDOWN")
+        elif not self.cycle.anchor or not self.cycle_active:
+            self._start_cycle(new_id=self.cycle.cycle_id if not self.cycle.anchor
+                              else None, reason="startup")
 
-        if self.sequence is None or self.sequence.cycle_id != self.cycle.cycle_id:
+        if self.cycle_active and (
+                self.sequence is None or
+                self.sequence.cycle_id != self.cycle.cycle_id):
             # after a restart the sequence restarts empty: only what MT5 can
             # still show us is trustworthy, and trigger history is not stored
             # on the broker.
@@ -309,7 +342,25 @@ class RollingLadderEngine:
         tick = self.broker.tick()
         return tick.mid
 
-    def _start_cycle(self, new_id=None, reason=""):
+    def _start_cycle(self, new_id=None, reason="", require_flat=True):
+        """
+        Open a new cycle. Returns True when one was started.
+
+        MAX_ACTIVE_CYCLES = 1. A new cycle is refused outright while anything
+        from a previous one is still live - that is the only way #7, #8 and #9
+        can never exist at the same time.
+        """
+        if require_flat:
+            leftovers = [item for item in
+                         list(self.broker.positions()) + list(self.broker.orders())
+                         if parse_comment(item.comment)]
+            if leftovers:
+                self._event("CYCLE_REENTRY_BLOCKED",
+                            f"refusing to start a new cycle: {len(leftovers)} "
+                            f"positions/orders from cycle(s) "
+                            f"{sorted({parse_comment(i.comment)[0] for i in leftovers})} "
+                            f"are still live", status="RETRY")
+                return False
         tick = self.last_tick or self.broker.tick()
         anchor = self.spec.normalize_price(tick.mid) if self.spec else tick.mid
         # a cycle id is never reused, even after a restart or an adopted cycle
@@ -329,11 +380,15 @@ class RollingLadderEngine:
         self._triggered_keys.clear()
         self._depth_capped_logged = False
         self._profit_since = None
+        self.cycle_active = True
+        self.reentry_until = 0.0
+        self._cycle_announced = False
         self._event("CYCLE_STARTED",
                     f"Cycle #{cid} anchored at {anchor} ({reason})",
                     cycle_id=cid, entry_price=anchor)
         self._emit("cycle_started", self.cycle, anchor)
         self.save()
+        return True
 
     def reanchor(self, reason="reset"):
         """
@@ -615,6 +670,13 @@ class RollingLadderEngine:
             positions = self.broker.positions()
             orders = self.broker.orders()
 
+        # belt and braces: with no active cycle nothing may be placed, whatever
+        # else happened above
+        if not self.cycle_active:
+            self.state = State.COOLDOWN_AFTER_EXIT
+            self.last_update = datetime.now()
+            return True
+
         # 4. paused: no NEW entries, existing positions still managed
         if self.paused:
             if orders:
@@ -767,6 +829,11 @@ class RollingLadderEngine:
             if self._closing_cycle is not None:
                 return self._advance_close(snap, positions, orders)
 
+            # Between cycles there is no ladder to evaluate: the only thing to
+            # do is verify the account is flat and wait out the cooldown.
+            if not self.cycle_active:
+                return self._advance_reentry(snap, tick, positions, orders)
+
             assessment = self.evaluate_exit(snap, tick, positions)
             basket = self.sequence.basket_pnl if self.sequence else 0.0
             reason_code, detail = self._exit_reason(snap, assessment, basket,
@@ -777,6 +844,11 @@ class RollingLadderEngine:
             # What the cycle looked like at the moment the exit was decided.
             # Captured here, not after the close, so the CSV records the state
             # that caused the exit rather than the empty state that follows it.
+            self._event("EXIT_TRIGGERED",
+                        f"Cycle #{self.cycle.cycle_id} exit [{reason_code}]: "
+                        f"{detail} - {len(positions)} positions / "
+                        f"{len(orders)} pending orders to clear",
+                        cycle_id=self.cycle.cycle_id, status="CLOSING")
             self._closing_cycle = {
                 "cycle_id": self.cycle.cycle_id,
                 "forced": reason_code.startswith("RISK"),
@@ -876,40 +948,82 @@ class RollingLadderEngine:
 
     def _advance_close(self, snap, positions, orders):
         """
-        Close the cycle out and only then start the next one.
+        Close the cycle out. The next cycle is NOT started here.
 
-        Cancel -> close -> VERIFY against what MT5 actually reports -> record ->
-        new cycle. If the broker refused something, the leftovers are retried on
-        the next pass instead of building a second ladder on top of the first.
+        EXIT -> cancel -> close -> VERIFY against what MT5 actually reports ->
+        record -> FLAT -> cooldown. Every step is logged, because a cycle that
+        opens and closes in seconds is otherwise impossible to audit. If the
+        broker refused something, the leftovers are retried on the next pass
+        instead of building a second ladder on top of the first.
         """
         info = self._closing_cycle
         info["attempts"] += 1
         self.state = State.CLOSING_CYCLE
+        first = info["attempts"] == 1
+        cid = info["cycle_id"]
 
-        self._cancel_all(orders, f"cycle end: {info['reason']}")
-        if info["forced"] or snap["cycle_close_positions"]:
+        # --- cancel every pending order belonging to the cycle ---------------
+        if orders:
+            if first:
+                self._event("EXIT_ORDERS_FOUND",
+                            f"Cycle #{cid}: {len(orders)} pending orders to "
+                            f"cancel ({', '.join(str(o.ticket) for o in orders)})",
+                            cycle_id=cid, status="CLOSING")
+            self._event("EXIT_CANCEL_SENT",
+                        f"Cycle #{cid}: cancel requests sent for "
+                        f"{len(orders)} orders", cycle_id=cid, status="CLOSING")
+            self._cancel_all(orders, f"cycle end: {info['reason']}")
+
+        # --- close every open position belonging to the cycle ----------------
+        close_positions = info["forced"] or snap["cycle_close_positions"]
+        if close_positions and positions:
+            if first:
+                self._event("EXIT_POSITIONS_FOUND",
+                            f"Cycle #{cid}: {len(positions)} open positions to "
+                            f"close ({', '.join(str(p.ticket) for p in positions)})",
+                            cycle_id=cid, status="CLOSING")
+            self._event("EXIT_CLOSE_SENT",
+                        f"Cycle #{cid}: close requests sent for "
+                        f"{len(positions)} positions",
+                        cycle_id=cid, status="CLOSING")
             for pos in positions:
                 ok, msg = self.broker.close_position(pos.ticket, comment="cycle end")
                 if not ok:
+                    # the broker's own retcode, never a bare failure
                     self._event("ERROR", f"close {pos.ticket} failed: {msg}",
+                                cycle_id=cid, position_ticket=pos.ticket,
                                 status="ERROR")
-            for trade in self.broker.poll_closed():
+            closed = self.broker.poll_closed()
+            for trade in closed:
                 self._on_closed(trade, snap)
+            if closed:
+                self._event("EXIT_CLOSE_CONFIRMED",
+                            f"Cycle #{cid}: {len(closed)} closes confirmed, "
+                            f"P/L {sum(t.profit for t in closed):+.2f}",
+                            cycle_id=cid, status="CLOSING")
 
-        # --- verify: the old cycle must be gone from the broker --------------
+        # --- verify against MT5: the old cycle must be gone ------------------
         left_orders = self.broker.orders()
-        left_positions = self.broker.positions() if (
-            info["forced"] or snap["cycle_close_positions"]) else []
+        left_positions = self.broker.positions() if close_positions else []
+        self._event("EXIT_RECONCILED",
+                    f"Cycle #{cid}: MT5 reports {len(left_positions)} positions "
+                    f"/ {len(left_orders)} orders after attempt "
+                    f"{info['attempts']}", cycle_id=cid,
+                    status="CLOSING" if (left_orders or left_positions) else "OK")
         if left_orders or left_positions:
             if info["attempts"] in (3, 10) or info["attempts"] % 50 == 0:
                 self._event(
                     "CYCLE_CLOSE_PENDING",
-                    f"Cycle #{info['cycle_id']} still has "
+                    f"Cycle #{cid} still has "
                     f"{len(left_positions)} positions / {len(left_orders)} orders "
                     f"after {info['attempts']} attempts - retrying, no new "
                     f"ladder until it is clean",
-                    cycle_id=info["cycle_id"], status="RETRY")
+                    cycle_id=cid, status="RETRY")
             return "pending"
+
+        self._event("CYCLE_FLAT",
+                    f"Cycle #{cid} confirmed FLAT: 0 positions, 0 pending orders",
+                    cycle_id=cid, status="OK")
 
         # --- record ----------------------------------------------------------
         total = self.cycle.realized
@@ -921,29 +1035,105 @@ class RollingLadderEngine:
             self.consecutive_losing_cycles += 1
         else:
             self.consecutive_losing_cycles = 0
-        # Continuous mode: a normal cycle is followed immediately by the next
-        # one. Only a risk-forced close arms the cooldown.
+        # A risk-forced close arms the (much longer) loss cooldown on top of the
+        # ordinary re-entry cooldown; the re-entry gate waits for whichever runs
+        # longer.
         if info["forced"]:
             cooldown = float(snap["cooldown_after_loss_minutes"]) * 60.0
             if cooldown > 0:
                 self.cooldown_until = self.clock() + cooldown
 
         self._event("CYCLE_LOSS" if lost else "CYCLE_COMPLETED",
-                    f"Cycle #{info['cycle_id']}: {self.cycle.trades} triggers, "
+                    f"Cycle #{cid}: {self.cycle.trades} triggers, "
                     f"{self.cycle.tp_count} TPs, P/L {total:+.2f} "
                     f"[{info['kind']}] {info['reason']}",
-                    cycle_id=info["cycle_id"], profit=total,
+                    cycle_id=cid, profit=total,
                     cycle_profit=total, daily_profit=self.daily_profit,
                     status="LOSS" if lost else "OK")
 
         duration = self.clock() - self.cycle.started_at
         closed_cycle = self.cycle
         self._closing_cycle = None
-        # the next cycle is anchored on the CURRENT price, never the old grid
-        self._start_cycle(reason=info["reason"])
+
+        # --- the cycle is CLOSED; there is now no active cycle ---------------
+        self.cycle_active = False
+        self.sequence = None
+        self.reentry_until = self.clock() + self._reentry_cooldown(snap)
+        self.state = State.COOLDOWN_AFTER_EXIT
+        wait = self._reentry_wait()
+        self._event("CYCLE_COOLDOWN_STARTED",
+                    f"Cycle #{cid} closed - no active cycle. Next ladder in "
+                    f"{_seconds(wait)}.",
+                    cycle_id=cid, status="COOLDOWN")
+        self.save()
         self._emit("cycle_complete", closed_cycle, sequence, assessment, total,
                    info["reason"], info["kind"], lost, duration,
-                   self.cycle.cycle_id, info.get("context") or {})
+                   self.max_cycle_id + 1, info.get("context") or {}, wait)
+        return "pending"
+
+    def _reentry_cooldown(self, snap):
+        """Mandatory settle time between one cycle closing and the next ladder."""
+        return max(0.0, float(snap.get("cycle_reentry_cooldown_seconds", 0.0)))
+
+    def _reentry_wait(self):
+        """Seconds left before a new ladder may be built. 0 = go now."""
+        return max(0.0, max(self.reentry_until, self.cooldown_until) - self.clock())
+
+    def _advance_reentry(self, snap, tick, positions, orders):
+        """
+        EXIT -> RESET -> COOLDOWN -> NEW LADDER, the last two steps.
+
+        Nothing is created here until the cooldown has elapsed AND the account
+        is verified flat: no ladder, no pending orders, no cycle. Anything the
+        close left behind is cleaned up and re-verified instead.
+        """
+        self.state = State.COOLDOWN_AFTER_EXIT
+
+        # Leftovers cannot exist at this point, but if the broker produced one
+        # anyway (a late fill, a manual order) it is cleared before re-entry
+        # rather than being adopted by the new cycle.
+        if orders:
+            self._event("EXIT_ORDERS_FOUND",
+                        f"{len(orders)} pending orders survived the close - "
+                        f"cancelling before re-entry", status="RETRY")
+            self._cancel_all(orders, "left over from the previous cycle")
+        if positions and snap["cycle_close_positions"]:
+            self._event("EXIT_POSITIONS_FOUND",
+                        f"{len(positions)} positions survived the close - "
+                        f"closing before re-entry", status="RETRY")
+            for pos in positions:
+                ok, msg = self.broker.close_position(pos.ticket,
+                                                     comment="cycle end")
+                if not ok:
+                    self._event("ERROR", f"close {pos.ticket} failed: {msg}",
+                                position_ticket=pos.ticket, status="ERROR")
+            for trade in self.broker.poll_closed():
+                self._on_closed(trade, snap)
+
+        wait = self._reentry_wait()
+        if wait > 0:
+            self.block_reason = f"cycle re-entry cooldown ({_seconds(wait)} left)"
+            return "pending"
+
+        # MAX_ACTIVE_CYCLES = 1: the new ladder is only built from a flat book.
+        live_positions = self.broker.positions()
+        live_orders = self.broker.orders()
+        if live_positions or live_orders:
+            self.block_reason = (
+                f"waiting to go flat before the next cycle: "
+                f"{len(live_positions)} positions / {len(live_orders)} orders")
+            self._event("CYCLE_REENTRY_BLOCKED", self.block_reason, status="RETRY")
+            return "pending"
+
+        self._event("CYCLE_COOLDOWN_COMPLETE",
+                    "cooldown elapsed and the account is flat - building the "
+                    "next ladder at the current price", status="OK")
+        if self.block_reason.startswith(("cycle re-entry cooldown",
+                                         "waiting to go flat")):
+            self.block_reason = ""
+        # anchored on the CURRENT price, never the old grid
+        if not self._start_cycle(reason="continuous re-entry"):
+            return "pending"
         return "restarted"
 
     # ---------------------------------------------------------- reconciliation
@@ -1070,6 +1260,15 @@ class RollingLadderEngine:
                         + (f", {failures} rejected" if failures else "") + ")",
                         cycle_id=self.cycle.cycle_id,
                         status="PARTIAL" if placed < intended else "OK")
+            # the deployment is verified against what the broker accepted, and
+            # only then is the cycle announced as running - once
+            if placed > 0 and not self._cycle_announced:
+                self._cycle_announced = True
+                self._event("CYCLE_ACTIVE",
+                            f"Cycle #{self.cycle.cycle_id} ACTIVE: ladder "
+                            f"deployed, {placed} levels live",
+                            cycle_id=self.cycle.cycle_id, levels_live=placed,
+                            entry_price=self.cycle.anchor, status="OK")
         return len(seen)
 
     def _cancel(self, order, reason):
@@ -1129,6 +1328,10 @@ class RollingLadderEngine:
             "current_open_buys": open_buys,
             "current_open_sells": open_sells,
             "ladder_live": bool(orders),
+            # --- one active cycle at a time ---
+            "cycle_active": self.cycle_active,
+            "reentry_wait_seconds": round(self._reentry_wait(), 1),
+            "in_reentry_cooldown": (not self.cycle_active) and self._reentry_wait() > 0,
             # --- P/L, kept distinct ---
             "floating_pnl": floating,
             "cycle_id": self.cycle.cycle_id,

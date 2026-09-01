@@ -62,6 +62,7 @@ class SettingsPanel:
         "max_daily_drawdown": "daily", "max_cycle_drawdown": "cycleloss",
         "max_consecutive_losing_cycles": "streak",
         "cooldown_after_loss_minutes": "cooldown",
+        "cycle_reentry_cooldown_seconds": "reentry",
         "order_max_age_seconds": "age",
         "direction_filter": "direction", "timeframe": "settings",
         "telegram_status_updates": "notify", "telegram_state_alerts": "notify",
@@ -112,6 +113,9 @@ class SettingsPanel:
                                          "the bot (0 = off).",
         "cooldown_after_loss_minutes": "Send the cooldown after a losing cycle, in "
                                        "minutes (0 = off).",
+        "cycle_reentry_cooldown_seconds": "Send the settle time between one cycle "
+                                          "closing and the next ladder, in "
+                                          "seconds (0 = re-enter at once).",
         "order_max_age_seconds": "Send the maximum pending order age in seconds "
                                  "(0 = never expire).",
         "max_slippage": "Send the maximum slippage/deviation in points.",
@@ -602,6 +606,7 @@ class SettingsPanel:
             f"Cycle drawdown limit: {self._d('max_cycle_drawdown')}",
             f"Losing cycles allowed: {s['max_consecutive_losing_cycles']}",
             f"Cooldown after loss: {self._d('cooldown_after_loss_minutes')}",
+            f"Re-entry cooldown: {self._d('cycle_reentry_cooldown_seconds')}",
             f"Order max age: {self._d('order_max_age_seconds')}", "",
             "When a limit trips: new entries stop and pending orders are",
             "cancelled. Open positions keep running under their own rules.",
@@ -614,7 +619,8 @@ class SettingsPanel:
             [_btn("🔁 CYCLE DRAWDOWN", "settings_cycleloss"),
              _btn("🚫 LOSING CYCLES", "settings_streak")],
             [_btn("⏳ COOLDOWN", "settings_cooldown"),
-             _btn("🕒 ORDER AGE", "settings_age")],
+             _btn("🔁 RE-ENTRY", "settings_reentry")],
+            [_btn("🕒 ORDER AGE", "settings_age")],
             [_btn(BACK, "settings")],
         )
 
@@ -676,6 +682,14 @@ class SettingsPanel:
             "cooldown_after_loss_minutes", "⏳ <b>COOLDOWN AFTER LOSS</b>",
             (0, 5, 15, 30), "settings_risk",
             "Pause after a losing cycle before the ladder is rebuilt.")
+
+    def _menu_reentry(self):
+        return self._simple_menu(
+            "cycle_reentry_cooldown_seconds", "🔁 <b>CYCLE RE-ENTRY COOLDOWN</b>",
+            (0, 5, 10, 30), "settings_risk",
+            "Settle time AFTER a cycle has fully exited, before the next\n"
+            "ladder is built. It never applies between ladder levels or\n"
+            "triggers inside a running cycle.")
 
     def _menu_age(self):
         return self._simple_menu(

@@ -113,6 +113,7 @@ VALIDATORS = {
     "max_cycle_drawdown":  (lambda v: _num(v, float, "Max cycle drawdown", 0.0, 1e6), "Cycle Drawdown", True),
     "max_consecutive_losing_cycles": (lambda v: _num(v, int, "Max losing cycles", 0, 100), "Losing Cycles", False),
     "cooldown_after_loss_minutes": (lambda v: _num(v, float, "Cooldown after loss", 0.0, 1440.0), "Cooldown", False),
+    "cycle_reentry_cooldown_seconds": (lambda v: _num(v, float, "Cycle re-entry cooldown", 0.0, 3600.0), "Re-entry Cooldown", False),
     "max_cycle_duration_minutes": (lambda v: _num(v, float, "Max cycle duration", 0.0, 10080.0), "Max Cycle Duration", True),
     # --- hygiene ---
     "order_max_age_seconds": (lambda v: _num(v, float, "Order max age", 0.0, 86400.0), "Order Max Age", False),
@@ -271,7 +272,7 @@ class RuntimeSettings:
             return "AUTO" if not value else f"{value} pts"
         if key in ("cooldown_after_loss_minutes", "max_cycle_duration_minutes"):
             return "OFF" if not value else f"{float(value):g} min"
-        if key == "profit_confirmation_seconds":
+        if key in ("profit_confirmation_seconds", "cycle_reentry_cooldown_seconds"):
             return "OFF" if not value else f"{float(value):g}s"
         if key == "profit_fallback_buffer_levels":
             return f"{float(value):g} levels"

@@ -124,6 +124,21 @@ t.check("level triggered", wait_for(lambda: len(app.bot.positions()) >= 1),
         f"{len(app.bot.positions())} positions")
 t.check("start message sent once", sum("STARTED" in n for n in notes) == 1,
         str(notes[:1]))
+# The first ladder of a run is announced by the START message; a CYCLE_ACTIVE
+# for it must not add a second one.
+app.bot._on_event("CYCLE_ACTIVE", "Cycle #1 ACTIVE: ladder deployed",
+                  {"cycle_id": 1, "levels_live": 10, "status": "OK"})
+t.check("the first ladder does not get a duplicate STARTED message",
+        sum("STARTED" in n for n in notes) == 1, str(notes[-1:]))
+# after a cycle has closed, the next deployment gets its own message
+app.bot._cycles_closed = 1
+app.bot._on_event("CYCLE_ACTIVE", "Cycle #2 ACTIVE: ladder deployed",
+                  {"cycle_id": 2, "levels_live": 10, "status": "OK"})
+t.check("a ladder that follows a close is announced once",
+        sum("CYCLE #2 STARTED" in n for n in notes) == 1, str(notes[-1:]))
+t.check("it confirms the deployment, not an intention",
+        any("Ladder deployed." in n for n in notes), str(notes[-1:]))
+app.bot._cycles_closed = 0
 t.check("NO per-entry Telegram message (low-spam policy)",
         not any("LADDER ENTRY" in n for n in notes), str(notes))
 # the position is visible to the broker a moment before the hook writes the

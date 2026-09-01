@@ -454,6 +454,9 @@ class LadderBot:
                                  f"({self.broker.name})", symbol=SYMBOL)
         log("🟢 Rolling ladder engine started - deploying the ladder now")
         snap = self.settings.snapshot()
+        # the START message already announces the first ladder; only cycles
+        # that follow a close get their own deploy message
+        self._cycles_closed = 0
         self.notifier.bot_started(SYMBOL, snap["timeframe"],
                                   snap["ladder_spacing"],
                                   self.engine.cycle.cycle_id, cfg.TRADING_MODE)
@@ -726,6 +729,15 @@ class LadderBot:
             log(f"[{event}] {message}")
         if event == "ERROR":
             self.notifier.error(message, action="Retrying")
+        elif event == "CYCLE_ACTIVE" and getattr(self, "_cycles_closed", 0):
+            # the new ladder is confirmed live in MT5 - the second and last
+            # message of the exit -> cooldown -> re-entry sequence. The first
+            # ladder of a run is already covered by the START message.
+            self.notifier.cycle_started(
+                symbol=SYMBOL,
+                timeframe=self.settings.get("timeframe"),
+                cycle_id=fields.get("cycle_id", ""),
+                levels=fields.get("levels_live", 0))
         elif event == "ORDER_REJECTED":
             # the broker refusing an order is never silent - throttled per side
             self.notifier.error(message, action="Retrying the level",
@@ -835,7 +847,7 @@ class LadderBot:
 
     def _on_cycle_complete(self, cycle, sequence, assessment, total, reason,
                            kind, lost, duration=0.0, next_cycle_id=None,
-                           context=None):
+                           context=None, next_ladder_seconds=0.0):
         seq = sequence.snapshot() if sequence is not None else {}
         spec = self.engine.spec if self.engine else None
         # the market/exposure state at the moment the exit was decided
@@ -895,15 +907,19 @@ class LadderBot:
             "OTHER_RISK_EXIT": "Risk exit",
             "EXIT_ENGINE": "Exit engine",
         }.get(kind, kind.replace("_", " ").title())
+        self._cycles_closed = getattr(self, "_cycles_closed", 0) + 1
+        wait = float(next_ladder_seconds or 0.0)
         log(f"🔄 Cycle #{cycle.cycle_id} closed ({reason_word}, {total:+.2f}) "
-            f"-> cycle #{next_cycle_id} deployed immediately")
+            + (f"-> next ladder in {wait:.0f}s" if wait > 0
+               else "-> next ladder deploying now"))
         self.notifier.cycle_closed(
             symbol=SYMBOL, cycle_id=cycle.cycle_id, total=total,
             buys=seq.get("buy_triggers", 0), sells=seq.get("sell_triggers", 0),
             reason_word=reason_word, direction=seq.get("dominant_side", ""),
             duration_seconds=duration,
             next_cycle_id=next_cycle_id if next_cycle_id is not None
-            else cycle.cycle_id + 1)
+            else cycle.cycle_id + 1,
+            next_ladder_seconds=wait)
 
     def _on_risk_blocked(self, reason):
         self.notifier.risk_event(

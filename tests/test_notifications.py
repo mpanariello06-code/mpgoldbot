@@ -59,11 +59,39 @@ t.check("carries the result", "+2.34" in msg)
 t.check("carries the sequence", "BUY: 2" in msg and "SELL: 5" in msg)
 t.check("carries the reason", "Reversal" in msg)
 t.check("carries the duration", "01:42" in msg, msg)
-t.check("announces the next cycle", "Cycle #13 deployed" in msg)
+t.check("announces the wait, not a cycle that is not deployed yet",
+        "Next ladder deploying now." in msg and "deployed" not in msg, msg)
+t.check("names the exit", "Exit: Reversal" in msg, msg)
 t.check("does not list individual trades", msg.count("Entry") == 0)
 t.check("stays compact", len(msg) < 260, str(len(msg)))
 n.cycle_closed("XAUUSDs", 13, -0.80, 4, 1, "Exhaustion", "BUY", 60, 14)
 t.check("a losing cycle is marked", sent[1].startswith("🔴"), sent[1][:12])
+
+t.section("EXIT -> COOLDOWN -> NEW LADDER: EXACTLY TWO MESSAGES")
+n, sent, clock = notifier()
+n.cycle_closed("XAUUSDs", 7, 1.24, 3, 4, "Reversal", "SELL", 95, 8,
+               next_ladder_seconds=10)
+t.check("one message when the cooldown starts", len(sent) == 1, str(len(sent)))
+close_msg = sent[0]
+t.check("it names the cycle", "CYCLE #7 CLOSED" in close_msg, close_msg)
+t.check("it names the exit", "Exit: Reversal" in close_msg, close_msg)
+t.check("it names the result", "+1.24" in close_msg, close_msg)
+t.check("it names the wait", "Next ladder in 10s." in close_msg, close_msg)
+t.check("it does not claim the next ladder is live",
+        "deployed" not in close_msg, close_msg)
+n.cycle_started("XAUUSDs", "M5", 8, levels=10)
+t.check("one message when the new ladder is live", len(sent) == 2, str(len(sent)))
+start_msg = sent[1]
+t.check("it names the new cycle", "CYCLE #8 STARTED" in start_msg, start_msg)
+t.check("it names the symbol and timeframe",
+        "XAUUSDs" in start_msg and "M5" in start_msg, start_msg)
+t.check("it confirms the deployment", "Ladder deployed." in start_msg, start_msg)
+t.check("no countdown messages in between", len(sent) == 2, str(sent))
+import notifications
+t.check("a long wait is written for a person, not in raw seconds",
+        (notifications._seconds(10), notifications._seconds(900),
+         notifications._seconds(930)) == ("10s", "15m", "15m 30s"),
+        str([notifications._seconds(v) for v in (10, 900, 930)]))
 
 t.section("STATE CHANGES ONLY ON TRANSITION")
 n, sent, clock = notifier()

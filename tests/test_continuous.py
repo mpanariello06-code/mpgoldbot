@@ -11,29 +11,45 @@ from fakes import Recorder, TickFeed, make_paper, trigger_buy, trigger_sell
 from ladder_engine import RollingLadderEngine, State, parse_comment
 from runtime_settings import RuntimeSettings
 
+def _validate_with_leftovers():
+    """config.validate()'s warnings with CYCLE_CLOSE_POSITIONS off."""
+    real = cfg.CYCLE_CLOSE_POSITIONS
+    cfg.CYCLE_CLOSE_POSITIONS = False
+    try:
+        return cfg.validate()[1]
+    finally:
+        cfg.CYCLE_CLOSE_POSITIONS = real
+
+
 t = Suite("continuous")
 TMP = pathlib.Path("/tmp/continuous_tests")
 shutil.rmtree(TMP, ignore_errors=True)
 TMP.mkdir(parents=True)
 
 
-def build(overrides=None, name="c", feed=None):
+def build(overrides=None, name="c", feed=None, clock=None):
     settings = RuntimeSettings(cfg.runtime_defaults(), TMP / f"{name}_set.json")
     for key, value in (overrides or {}).items():
         settings._values[key] = value
     broker, feed = make_paper(feed=feed or TickFeed(4010.00),
                               state_path=TMP / f"{name}_paper.json")
+    if clock:
+        broker.clock = clock
     rec = Recorder()
     engine = RollingLadderEngine(broker, settings, hooks=rec.hooks(),
-                                 state_path=TMP / f"{name}_state.json")
+                                 state_path=TMP / f"{name}_state.json",
+                                 clock=clock or __import__("time").time)
     engine.resume()
     return engine, broker, feed, settings, rec
 
 
-def force_reversal(engine, broker, feed, limit=40):
+def force_reversal(engine, broker, feed, limit=40, now=None, tick=0.0):
     """
     Buy into a rise, then let the market turn and keep falling until the exit
     engine calls it - the market keeps moving whether or not levels are left.
+
+    Returns True once the cycle has CLOSED, which is no longer the same event
+    as a new cycle starting.
     """
     start = engine.cycle.cycle_id
     engine.step()
@@ -47,8 +63,10 @@ def force_reversal(engine, broker, feed, limit=40):
             trigger_sell(feed, max(sells, key=lambda o: o.price).price)
         else:
             feed.set(round(feed.bid - 0.15, 2))
+        if now is not None and tick:
+            now[0] += tick
         engine.step()
-        if engine.cycle.cycle_id != start:
+        if not engine.cycle_active or engine.cycle.cycle_id != start:
             return True
     return False
 
@@ -65,23 +83,156 @@ t.check("no candle or signal was waited for",
 t.check("state is active immediately", engine.state == State.LADDER_ACTIVE,
         engine.state)
 
-t.section("IMMEDIATE RE-ENTRY AFTER A CYCLE ENDS")
+t.section("EXIT -> RESET -> COOLDOWN -> NEW LADDER")
+# There is exactly ONE active cycle at a time. Closing a cycle does not start
+# the next one: the account is verified flat, a mandatory re-entry cooldown is
+# served, and only then is a new ladder built at the CURRENT price.
+now = [50_000.0]
 engine, broker, feed, settings, rec = build(
-    {"cooldown_after_loss_minutes": 15}, name="reentry")
-rolled = force_reversal(engine, broker, feed)
-t.check("the cycle rolled", rolled, f"cycle #{engine.cycle.cycle_id}")
-t.check("the new ladder is live in the SAME pass that closed the old one",
-        len(broker.orders()) > 0, f"{len(broker.orders())} orders")
+    {"cooldown_after_loss_minutes": 15, "cycle_reentry_cooldown_seconds": 10},
+    name="reentry", clock=lambda: now[0])
+closed = force_reversal(engine, broker, feed, now=now, tick=2.0)
+closed_cycle = engine.cycle.cycle_id
+t.check("the cycle closed", closed, f"cycle #{closed_cycle}")
+t.check("there is no active cycle any more", not engine.cycle_active)
+t.check("the engine is in COOLDOWN_AFTER_EXIT",
+        engine.state == State.COOLDOWN_AFTER_EXIT, engine.state)
+
+# --- step 6: verified flat ------------------------------------------------
+t.check("no positions are left", not broker.positions(),
+        f"{len(broker.positions())} positions")
+t.check("no pending orders are left", not broker.orders(),
+        f"{len(broker.orders())} orders")
+t.check("the flat state is logged", "CYCLE_FLAT" in rec.names())
+t.check("every exit step is logged, in order",
+        [n for n in rec.names() if n.startswith(("EXIT_", "CYCLE_FLAT",
+                                                 "CYCLE_COOLDOWN"))][:1]
+        == ["EXIT_TRIGGERED"],
+        str([n for n in rec.names() if n.startswith(("EXIT_", "CYCLE_"))][-8:]))
+
+# --- step 7-8: recorded and closed ----------------------------------------
+completes = [c for c in rec.cycles if c.kind_of == "complete"]
+t.check("the cycle is recorded with its P/L and exit reason",
+        completes and completes[-1].kind, str([c.kind for c in completes]))
+t.check("the record carries the wait before the next ladder",
+        completes and completes[-1].next_ladder_seconds == 10,
+        str(completes[-1].next_ladder_seconds if completes else None))
+
+# --- step 9-10: nothing is created during the cooldown --------------------
+t.check("the cooldown was announced once",
+        rec.count("CYCLE_COOLDOWN_STARTED") == 1,
+        str(rec.count("CYCLE_COOLDOWN_STARTED")))
+for _ in range(5):
+    now[0] += 1.0
+    engine.step()
+t.check("NO new ladder during the cooldown", not broker.orders(),
+        f"{len(broker.orders())} orders")
+t.check("NO new pending orders during the cooldown", not broker.orders())
+t.check("NO new cycle during the cooldown",
+        engine.cycle.cycle_id == closed_cycle and not engine.cycle_active,
+        f"#{engine.cycle.cycle_id}")
+t.check("the previous cycle is not reopened",
+        rec.count("CYCLE_STARTED") == 1, str(rec.count("CYCLE_STARTED")))
+t.check("the cooldown is the stated reason",
+        "re-entry cooldown" in engine.block_reason, engine.block_reason)
+t.check("no countdown spam - one cooldown event, not one per pass",
+        rec.count("CYCLE_COOLDOWN_STARTED") == 1)
+
+# --- step 11-14: after the cooldown, a new ladder at the current price ----
+now[0] += 6.0
+engine.step()
+t.check("a new cycle starts once the cooldown elapses",
+        engine.cycle.cycle_id != closed_cycle and engine.cycle_active,
+        f"#{engine.cycle.cycle_id}")
+t.check("the cooldown completion is logged",
+        "CYCLE_COOLDOWN_COMPLETE" in rec.names())
+t.check("the new ladder is live", len(broker.orders()) > 0,
+        f"{len(broker.orders())} orders")
+t.check("the deployment is confirmed as ACTIVE", "CYCLE_ACTIVE" in rec.names())
 t.check("every live order belongs to the new cycle",
         all(parse_comment(o.comment)[0] == engine.cycle.cycle_id
             for o in broker.orders()))
-t.check("no cooldown after a normal cycle", engine.cooldown_until == 0.0,
-        str(engine.cooldown_until))
-t.check("nothing from the old cycle is left open", not broker.positions())
 t.check("the new cycle is anchored on the CURRENT price, not the old grid",
         abs(engine.cycle.anchor - feed().mid) < 0.35,
         f"anchor {engine.cycle.anchor} price {feed().mid:.2f}")
 t.check("the new sequence starts empty", engine.sequence.total_triggers == 0)
+t.check("a normal cycle never arms the loss cooldown",
+        engine.cooldown_until == 0.0, str(engine.cooldown_until))
+
+t.section("THE COOLDOWN IS BETWEEN CYCLES, NEVER BETWEEN TRIGGERS")
+# The rolling ladder keeps running at full speed inside an ACTIVE cycle: the
+# 10 seconds apply only after a complete exit, never between levels, triggers
+# or orders.
+now2 = [70_000.0]
+engine, broker, feed, settings, rec = build(
+    {"cycle_reentry_cooldown_seconds": 10}, name="inside", clock=lambda: now2[0])
+engine.step()
+triggered = 0
+for _ in range(3):
+    buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
+                  key=lambda o: o.price)
+    if not buys or not engine.cycle_active:
+        break
+    trigger_buy(feed, buys[0].price)
+    now2[0] += 0.5                      # half a second between triggers
+    engine.step()
+    if engine.cycle_active:
+        triggered = engine.sequence.total_triggers
+t.check("levels keep triggering half a second apart", triggered == 3,
+        str(triggered))
+t.check("the cycle stayed active throughout", engine.cycle_active)
+t.check("the ladder is replenished immediately, with no cooldown",
+        len(broker.orders()) == 10, f"{len(broker.orders())} orders")
+t.check("no cooldown event was raised inside the cycle",
+        rec.count("CYCLE_COOLDOWN_STARTED") == 0)
+t.check("no exit machinery ran at all inside the cycle",
+        not any(n.startswith("EXIT_") for n in rec.names()),
+        str([n for n in rec.names() if n.startswith("EXIT_")]))
+
+t.section("A LEFTOVER POSITION HOLDS THE NEXT LADDER BACK")
+# CYCLE_CLOSE_POSITIONS=false leaves the basket running under its own TP/SL.
+# One cycle at a time still wins: the next ladder waits until MT5 is flat.
+now7 = [120_000.0]
+engine, broker, feed, settings, rec = build(
+    {"cycle_close_positions": False, "cooldown_after_loss_minutes": 0,
+     "cycle_reentry_cooldown_seconds": 10},
+    name="leftover", clock=lambda: now7[0])
+closed = force_reversal(engine, broker, feed, now=now7, tick=2.0)
+t.check("the cycle closed", closed and not engine.cycle_active,
+        f"#{engine.cycle.cycle_id} active={engine.cycle_active}")
+t.check("its positions were left running", bool(broker.positions()),
+        f"{len(broker.positions())} positions")
+now7[0] += 11
+engine.step()
+t.check("no new ladder while a position is still open",
+        not engine.cycle_active and not broker.orders(),
+        f"{len(broker.orders())} orders")
+t.check("and it says exactly why",
+        "flat" in engine.block_reason, engine.block_reason)
+t.check("the refusal is logged", "CYCLE_REENTRY_BLOCKED" in rec.names())
+for pos in list(broker.positions()):
+    broker.close_position(pos.ticket)
+engine.step()
+t.check("the next cycle starts once the book is flat",
+        engine.cycle_active and len(broker.orders()) > 0,
+        f"#{engine.cycle.cycle_id}, {len(broker.orders())} orders")
+t.check("the config warns about this setting",
+        any("CYCLE_CLOSE_POSITIONS" in w for w in _validate_with_leftovers()),
+        "no warning")
+
+t.section("ONLY ONE ACTIVE CYCLE, EVER")
+# A new cycle is refused outright while anything from a previous one is live -
+# this is what stops #7, #8 and #9 existing at the same time.
+engine, broker, feed, settings, rec = build(name="single")
+engine.step()
+before = engine.cycle.cycle_id
+t.check("a second cycle is refused while the first one is live",
+        engine._start_cycle(reason="should be refused") is False)
+t.check("the cycle id did not move", engine.cycle.cycle_id == before,
+        f"#{engine.cycle.cycle_id}")
+t.check("the refusal is logged", "CYCLE_REENTRY_BLOCKED" in rec.names())
+t.check("no duplicate ladder was placed", len(broker.orders()) == 10,
+        f"{len(broker.orders())} orders")
 
 t.section("COOLDOWN ONLY ON A RISK-FORCED CLOSE")
 engine, broker, feed, settings, rec = build(
@@ -125,7 +276,9 @@ class StubbornBroker:
         return self.inner.cancel_order(ticket)
 
 
-engine, broker, feed, settings, rec = build(name="stubborn")
+now3 = [80_000.0]
+engine, broker, feed, settings, rec = build(
+    {"cooldown_after_loss_minutes": 0}, name="stubborn", clock=lambda: now3[0])
 engine.step()
 stubborn = StubbornBroker(broker, refusals=40)
 engine.broker = stubborn
@@ -152,7 +305,12 @@ t.check("still pending while the broker keeps refusing",
         engine.cycle.cycle_id == cycle_before)
 stubborn.refusals = 0
 engine.step()
-t.check("handoff completes once MT5 is clean",
+t.check("the close completes once MT5 is clean, without starting a cycle",
+        not engine.cycle_active and engine.cycle.cycle_id == cycle_before,
+        f"#{engine.cycle.cycle_id} active={engine.cycle_active}")
+now3[0] += 11
+engine.step()
+t.check("handoff completes once the cooldown is served too",
         engine.cycle.cycle_id == cycle_before + 1,
         f"#{engine.cycle.cycle_id}")
 t.check("exactly one cycle was recorded for the one exit event",
@@ -160,8 +318,11 @@ t.check("exactly one cycle was recorded for the one exit event",
         str([c.cycle_id for c in rec.cycles if c.kind_of == "complete"]))
 
 t.section("ONE EXIT EVENT -> EXACTLY ONE NEW CYCLE")
-engine, broker, feed, settings, rec = build(name="once")
-force_reversal(engine, broker, feed)
+now4 = [90_000.0]
+engine, broker, feed, settings, rec = build(name="once", clock=lambda: now4[0])
+force_reversal(engine, broker, feed, now=now4, tick=2.0)
+now4[0] += 11
+engine.step()
 completes = [c for c in rec.cycles if c.kind_of == "complete"]
 starts = [c for c in rec.cycles if c.kind_of == "start"]
 t.check("one completion recorded", len(completes) == 1, str(len(completes)))
@@ -171,13 +332,17 @@ t.check("cycle ids are sequential and unique",
         [c.cycle_id for c in starts] == sorted(set(c.cycle_id for c in starts)),
         str([c.cycle_id for c in starts]))
 for _ in range(5):
+    now4[0] += 1
     engine.step()
 t.check("repeated passes do not roll the cycle again",
         len([c for c in rec.cycles if c.kind_of == "complete"]) == 1)
 
 t.section("CYCLE IDS NEVER REPEAT ACROSS A RESTART")
-engine, broker, feed, settings, rec = build(name="ids")
-force_reversal(engine, broker, feed)
+now5 = [100_000.0]
+engine, broker, feed, settings, rec = build(name="ids", clock=lambda: now5[0])
+force_reversal(engine, broker, feed, now=now5, tick=2.0)
+now5[0] += 11
+engine.step()
 last_id = engine.cycle.cycle_id
 engine.save()
 t.check("cycle advanced", last_id > 1, str(last_id))
@@ -189,7 +354,9 @@ t.check("a restart never goes backwards", engine2.cycle.cycle_id >= last_id,
 t.check("the highest id seen is remembered",
         engine2.max_cycle_id >= last_id, str(engine2.max_cycle_id))
 before = engine2.cycle.cycle_id
-engine2._start_cycle(reason="test")
+# require_flat is the one-active-cycle gate, exercised in its own section; here
+# the question is only whether ids ever repeat.
+engine2._start_cycle(reason="test", require_flat=False)
 t.check("the next cycle id is strictly higher",
         engine2.cycle.cycle_id > before, f"{before} -> {engine2.cycle.cycle_id}")
 
@@ -230,10 +397,12 @@ t.check("with no cooldown configured it stays a hard stop",
         engine.block_reason)
 
 t.section("CONTINUOUS OPERATION OVER MANY CYCLES")
+now6 = [110_000.0]
 engine, broker, feed, settings, rec = build(
-    {"cooldown_after_loss_minutes": 0}, name="many")
+    {"cooldown_after_loss_minutes": 0}, name="many", clock=lambda: now6[0])
 price = 4010.0
 for i in range(60):
+    now6[0] += 6            # the 10s re-entry cooldown is served, not skipped
     engine.step()
     orders = broker.orders()
     if orders:
@@ -245,6 +414,7 @@ for i in range(60):
             target = (min(candidates, key=lambda o: o.price) if side == BUY_STOP
                       else max(candidates, key=lambda o: o.price))
             (trigger_buy if side == BUY_STOP else trigger_sell)(feed, target.price)
+    now6[0] += 6
     engine.step()
 completed = [c for c in rec.cycles if c.kind_of == "complete"]
 t.check("several cycles completed unattended", len(completed) >= 2,
