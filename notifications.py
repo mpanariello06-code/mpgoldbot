@@ -7,7 +7,7 @@ event-based:
     Telegram = important events        CSV / console = everything
 
 Sent:      bot started, bot stopped, cycle closed, a state TRANSITION into
-           reversal or strong continuation, risk events, throttled errors, and
+           risk events, throttled errors, and
            an optional periodic status.
 Not sent:  individual level triggers, individual TPs, order placement,
            replenishment, or a repeat of a state the chat already knows about.
@@ -18,13 +18,6 @@ inside its interval are dropped rather than queued.
 
 import threading
 import time
-
-# state labels used for transition detection
-NORMAL = "NORMAL"
-REVERSAL = "REVERSAL"
-CONTINUATION = "CONTINUATION"
-EXHAUSTION = "EXHAUSTION"
-
 
 def _duration(seconds):
     seconds = max(0, int(seconds))
@@ -49,8 +42,6 @@ class TelegramNotifier:
 
     # at most this many state messages per cycle, and a continuation run this
     # short is just the ladder doing its job
-    MAX_STATE_ALERTS = 2
-    CONTINUATION_MIN_TRIGGERS = 3
 
     def __init__(self, send, settings=None, clock=time.time):
         self._send = send
@@ -58,7 +49,6 @@ class TelegramNotifier:
         self.clock = clock
         self._lock = threading.RLock()
         self._last_sent = {}        # key -> timestamp
-        self._cycle_state = {}      # cycle_id -> labels already announced
         # the first heartbeat is due one interval after startup, so it never
         # lands right behind the start message
         self._last_status = clock()
@@ -152,53 +142,6 @@ class TelegramNotifier:
             f"Ladder deployed." + (f" {levels} levels live." if levels else "")
         )
 
-    # ------------------------------------------------- state transitions only
-    def state_change(self, symbol, cycle_id, market_state, buys, sells,
-                     imbalance, dominant):
-        """
-        One message per meaningful transition, at most twice per cycle.
-
-        A cycle whose reading oscillates between continuation and exhaustion is
-        not news every time it flips: each label is announced once per cycle,
-        and only reversal and strong continuation are announced at all. Fading
-        momentum shows up in the cycle-closed message instead.
-        """
-        if not self._setting("telegram_state_alerts", True):
-            return False
-        label = {
-            "REVERSAL_DETECTED": REVERSAL,
-            "MOMENTUM_CONTINUATION": CONTINUATION,
-        }.get(market_state)
-        if label is None:
-            return False
-        if label == CONTINUATION and (buys + sells) < self.CONTINUATION_MIN_TRIGGERS:
-            return False        # an ordinary opening run is not news
-
-        with self._lock:
-            announced = self._cycle_state.setdefault(cycle_id, set())
-            if label in announced or len(announced) >= self.MAX_STATE_ALERTS:
-                self.suppressed += 1
-                return False
-            announced.add(label)
-            if len(self._cycle_state) > 64:
-                for key in sorted(self._cycle_state)[:32]:
-                    self._cycle_state.pop(key, None)
-
-        if label == REVERSAL:
-            return self._emit(
-                f"🔄 <b>REVERSAL DETECTED</b>\n\n"
-                f"Cycle #{cycle_id}\n{symbol}\n\n"
-                f"BUY: {buys}\nSELL: {sells}\n\n"
-                f"Dominance: {imbalance:.2f}x {dominant}\n\n"
-                f"Managing basket...",
-                key=f"rev:{cycle_id}", min_interval=30)
-        return self._emit(
-            f"📈 <b>CYCLE #{cycle_id}</b>\n"
-            f"Strong {dominant} momentum\n\n"
-            f"BUY: {buys}\nSELL: {sells}\n\n"
-            f"Ladder continuing...",
-            key=f"cont:{cycle_id}", min_interval=60)
-
     # ----------------------------------------------------------------- risk
     def risk_event(self, title, detail, key="risk"):
         return self._emit(f"⛔ <b>{title}</b>\n\n{detail}",
@@ -227,24 +170,23 @@ class TelegramNotifier:
                 return False
             self._last_status = now
 
-        momentum = status.get("momentum_score", 0.0)
-        word = ("STRONG" if momentum >= 0.66 else
-                "WEAK" if momentum <= 0.33 else "NEUTRAL")
+        target = status.get("basket_profit_target", 0.0)
         return self._emit(
             f"📊 <b>LADDER STATUS</b>\n\n"
             f"{status.get('symbol', '')}\n"
             f"Cycle: #{status.get('cycle_id', 0)}\n"
-            f"State: {(status.get('state') or 'ACTIVE').replace('_', ' ')}\n\n"
+            f"State: {'ACTIVE' if status.get('cycle_active', True) else 'CLOSED'}"
+            f"\n\n"
             f"Pending: {status.get('current_pending_buys', 0)}B / "
             f"{status.get('current_pending_sells', 0)}S\n"
             f"Open: {status.get('current_open_buys', 0)}B / "
             f"{status.get('current_open_sells', 0)}S\n\n"
             f"Triggers so far: {status.get('historical_buy_triggers', 0)}B / "
             f"{status.get('historical_sell_triggers', 0)}S\n"
-            f"Direction: {status.get('last_side') or '-'}\n"
-            f"Momentum: {word}\n\n"
-            f"Floating: {status.get('floating_pnl', 0):+.2f}\n"
-            f"Realized: {status.get('realized_pnl', 0):+.2f}"
+            f"Ladder depth: {status.get('ladder_depth_used', 0)}\n\n"
+            f"Floating basket: {status.get('basket_floating_pnl', 0):+.2f}"
+            + (f" / {target:.2f}" if target else "") + "\n"
+            f"Realized: {status.get('basket_realized_pnl', 0):+.2f}"
         )
 
     # --------------------------------------------------------------- metrics

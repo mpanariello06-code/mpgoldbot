@@ -16,31 +16,18 @@ import threading
 from pathlib import Path
 
 # --- allowed values -------------------------------------------------------
-# "none" is the basket mode and the default: ladder positions carry NO
-# individual take profit, and the whole cycle is closed as one basket by the
-# exit engine. The other modes attach a per-trade TP and are kept for anyone
-# who wants the old per-trade behaviour.
-TP_MODES = ("none", "levels", "distance",
-            "1_pip", "2_pips", "3_pips", "4_pips", "5_pips")
 ROLL_MODES = ("extend", "static")
 DIRECTION_MODES = ("off", "both", "buy_bias", "sell_bias", "none")
 TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1")
 
 # Bumped when a change to the DEFAULTS has to reach existing installations.
-# 2 = the basket architecture: ladder positions carry no individual TP.
+# 2 = basket architecture, no individual TP.
+# 3 = the scenario exit engine is gone; the only normal exit is
+#     basket_profit_target. Settings a stored file may still carry from before
+#     it are dropped as unknown on load.
 SCHEMA_KEY = "_schema"
-BASKET_SCHEMA = 2
+BASKET_SCHEMA = 3
 
-TP_MODE_LABELS = {
-    "none": "NONE (BASKET)",
-    "levels": "LEVELS",
-    "distance": "DISTANCE",
-    "1_pip": "1 PIP",
-    "2_pips": "2 PIPS",
-    "3_pips": "3 PIPS",
-    "4_pips": "4 PIPS",
-    "5_pips": "5 PIPS",
-}
 ROLL_MODE_LABELS = {"extend": "ROLLING", "static": "STATIC GRID"}
 DIRECTION_LABELS = {
     "off": "OFF (both sides)",
@@ -101,17 +88,13 @@ VALIDATORS = {
     "roll_mode":           (lambda v: _choice(v, ROLL_MODES, "Roll mode"), "Roll Mode", True),
     "rearm_levels":        (lambda v: _flag(v, "Re-arm levels"), "Re-arm Levels", False),
     # --- take profit ---
-    "tp_mode":             (lambda v: _choice(v, TP_MODES, "TP mode"), "TP Mode", True),
-    "tp_levels":           (lambda v: _num(v, int, "TP levels", 1, 20), "TP Levels", True),
-    "tp_distance":         (lambda v: _num(v, float, "TP distance", 0.01, 1000.0), "TP Distance", True),
     "stop_loss_distance":  (lambda v: _num(v, float, "Stop loss distance", 0.0, 10000.0), "Stop Loss", True),
     "pip_points":          (lambda v: _num(v, int, "Pip size", 0, 10000), "Pip Size", False),
     # --- cycle ---
+    # The ONE normal strategy exit. Everything else that ends a cycle is a hard
+    # risk limit.
+    "basket_profit_target": (lambda v: _num(v, float, "Basket profit target", 0.0, 100000.0), "Basket Target", True),
     "cycle_close_positions": (lambda v: _flag(v, "Close positions on cycle end"), "Close On Cycle End", True),
-    "profit_fallback_enabled": (lambda v: _flag(v, "Profit fallback"), "Profit Fallback", True),
-    "profit_fallback_buffer_levels": (lambda v: _num(v, float, "Profit buffer", 0.01, 50.0), "Profit Buffer", True),
-    "profit_confirmation_seconds": (lambda v: _num(v, float, "Profit confirmation", 0.0, 3600.0), "Profit Confirmation", False),
-    "profit_fallback_continuation_guard": (lambda v: _num(v, float, "Continuation guard", 0.0, 1.0), "Continuation Guard", False),
     # --- risk ---
     "lot_size":            (lambda v: _num(v, float, "Lot size", 0.001, 100.0), "Lot Size", True),
     "max_lot_size":        (lambda v: _num(v, float, "Max lot size", 0.001, 100.0), "Max Lot", True),
@@ -134,38 +117,17 @@ VALIDATORS = {
     "direction_filter":    (lambda v: _choice(v, DIRECTION_MODES, "Direction filter"), "Direction", True),
 
     # --- telegram notification policy ---
-    "telegram_entry_alerts":  (lambda v: _flag(v, "Entry alerts"), "Entry Alerts", False),
-    "telegram_state_alerts":  (lambda v: _flag(v, "State alerts"), "State Alerts", False),
     "telegram_status_updates": (lambda v: _flag(v, "Status updates"), "Status Updates", False),
     "telegram_status_interval_minutes": (lambda v: _num(v, float, "Status interval", 1.0, 1440.0), "Status Interval", False),
     "telegram_error_throttle_seconds": (lambda v: _num(v, float, "Error throttle", 0.0, 86400.0), "Error Throttle", False),
 
     # --- adaptive exit engine (all fittable against historical data) ---
-    "exit_threshold_exit":    (lambda v: _num(v, float, "Exit threshold", 1.0, 100.0), "Exit Score", True),
-    "exit_threshold_monitor": (lambda v: _num(v, float, "Monitor threshold", 0.0, 99.0), "Monitor Score", False),
-    "exit_w_reversal":     (lambda v: _num(v, float, "Reversal weight", 0.0, 3.0), "Reversal Weight", False),
-    "exit_w_exhaustion":   (lambda v: _num(v, float, "Exhaustion weight", 0.0, 3.0), "Exhaustion Weight", False),
-    "exit_w_directional":  (lambda v: _num(v, float, "Directional weight", 0.0, 3.0), "Directional Weight", False),
-    "exit_w_extended":     (lambda v: _num(v, float, "Extended weight", 0.0, 3.0), "Extended Weight", False),
-    "exit_min_triggers_for_directional": (lambda v: _num(v, int, "Min triggers (directional)", 1, 50), "Min Directional Triggers", False),
-    "exit_min_triggers_for_extended": (lambda v: _num(v, int, "Min triggers (extended)", 1, 50), "Min Extended Triggers", False),
-    "exit_w_continuation": (lambda v: _num(v, float, "Continuation weight", 0.0, 3.0), "Continuation Weight", False),
-    "exit_w_depth":        (lambda v: _num(v, float, "Depth weight", 0.0, 3.0), "Depth Weight", False),
-    "exit_w_drawdown":     (lambda v: _num(v, float, "Drawdown weight", 0.0, 3.0), "Drawdown Weight", False),
-    "exit_w_harvest":      (lambda v: _num(v, float, "Harvest weight", 0.0, 3.0), "Harvest Weight", False),
-    "exit_w_loss_hold":    (lambda v: _num(v, float, "Loss hold weight", 0.0, 3.0), "Loss Hold Weight", False),
-    "exit_recent_window":  (lambda v: _num(v, int, "Recent window", 1, 50), "Recent Window", False),
-    "exit_progress_intervals": (lambda v: _num(v, int, "Progress intervals", 1, 20), "Progress Intervals", False),
-    "exit_consecutive_norm": (lambda v: _num(v, float, "Consecutive norm", 1.0, 50.0), "Consecutive Norm", False),
-    "exit_depth_norm":     (lambda v: _num(v, float, "Depth norm", 1.0, 50.0), "Depth Norm", False),
-    "exit_gap_reference":  (lambda v: _num(v, float, "Gap reference", 1.0, 3600.0), "Gap Reference", False),
-    "exit_min_triggers_for_exhaustion": (lambda v: _num(v, int, "Min triggers (exhaustion)", 1, 50), "Min Exhaustion Triggers", False),
-    "exit_min_triggers_for_reversal": (lambda v: _num(v, int, "Min triggers (reversal)", 1, 50), "Min Reversal Triggers", False),
 }
 
-PRICE_KEYS = ("ladder_spacing", "tp_distance", "first_level_offset",
+PRICE_KEYS = ("ladder_spacing", "first_level_offset",
               "stop_loss_distance", "max_spread")
-MONEY_KEYS = ("max_daily_drawdown", "max_cycle_drawdown")
+MONEY_KEYS = ("max_daily_drawdown", "max_cycle_drawdown",
+              "basket_profit_target")
 
 
 class RuntimeSettings:
@@ -196,16 +158,6 @@ class RuntimeSettings:
             return [f"{self._path.name} is not a JSON object - using defaults"]
 
         with self._lock:
-            # A settings file written before the basket architecture carries a
-            # per-trade tp_mode as a leftover DEFAULT, not as a choice anyone
-            # made. Migrating it is the difference between shipping the basket
-            # strategy and silently shipping the old one.
-            migrated = None
-            if int(stored.get(SCHEMA_KEY, 0)) < BASKET_SCHEMA and \
-                    stored.get("tp_mode") not in (None, "none"):
-                migrated = stored.get("tp_mode")
-                stored = dict(stored)
-                stored["tp_mode"] = self._defaults.get("tp_mode", "none")
             for key, value in stored.items():
                 if key == SCHEMA_KEY:
                     continue
@@ -217,13 +169,6 @@ class RuntimeSettings:
                 except SettingError as exc:
                     problems.append(f"{exc} - kept default {self._defaults[key]}")
             problems.extend(self._repair())
-        if migrated:
-            problems.append(
-                f"tp_mode '{migrated}' was an old default and attaches an "
-                f"individual TP to every ladder position - migrated to "
-                f"'{self._values['tp_mode']}' (the cycle is closed as one "
-                f"basket). Set it back under SETTINGS if that was deliberate")
-            self.save()
         return problems
 
     def save(self):
@@ -287,8 +232,6 @@ class RuntimeSettings:
     @staticmethod
     def display(key, value):
         """Format a value the way the Telegram panel shows it."""
-        if key == "tp_mode":
-            return TP_MODE_LABELS.get(value, str(value))
         if key == "roll_mode":
             return ROLL_MODE_LABELS.get(value, str(value))
         if key == "direction_filter":
@@ -303,10 +246,8 @@ class RuntimeSettings:
             return "AUTO" if not value else f"{value} pts"
         if key in ("cooldown_after_loss_minutes", "max_cycle_duration_minutes"):
             return "OFF" if not value else f"{float(value):g} min"
-        if key in ("profit_confirmation_seconds", "cycle_reentry_cooldown_seconds"):
+        if key == "cycle_reentry_cooldown_seconds":
             return "OFF" if not value else f"{float(value):g}s"
-        if key == "profit_fallback_buffer_levels":
-            return f"{float(value):g} levels"
         if key == "telegram_status_interval_minutes":
             return f"{float(value):g} min"
         if key == "telegram_error_throttle_seconds":
@@ -334,18 +275,6 @@ class RuntimeSettings:
                 raise SettingError(
                     f"Max lot ({new}) must not be below the lot size "
                     f"({self._values['lot_size']})"
-                )
-            if key == "exit_threshold_exit" and \
-                    new <= self._values["exit_threshold_monitor"]:
-                raise SettingError(
-                    f"Exit score ({new:g}) must be above the monitor score "
-                    f"({self._values['exit_threshold_monitor']:g})"
-                )
-            if key == "exit_threshold_monitor" and \
-                    new >= self._values["exit_threshold_exit"]:
-                raise SettingError(
-                    f"Monitor score ({new:g}) must be below the exit score "
-                    f"({self._values['exit_threshold_exit']:g})"
                 )
         return new
 

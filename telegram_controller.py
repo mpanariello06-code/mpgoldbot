@@ -261,17 +261,10 @@ class TelegramController:
         spread = f"{s['spread']:.{d}f}" if s.get("spread") is not None else "n/a"
         updated = s.get("last_update")
 
-        momentum = s.get("momentum_score", 0.0)
-        momentum_word = ("STRONG" if momentum >= 0.66 else
-                         "WEAK" if momentum <= 0.33 else "NEUTRAL")
-        # which way the basket is leaning, not just how hard
-        dominant = s.get("dominant_side") or "-"
-        reversal = s.get("reversal_score", 0.0)
-        reversal_word = "YES" if s.get("market_state") == "REVERSAL_DETECTED" or \
-            reversal >= 0.5 else "NO"
-        market_state = (s.get("state") or "").replace("_", " ")
         cycle_word = ("ACTIVE" if s.get("cycle_active", True) else
                       "COOLDOWN" if s.get("in_reentry_cooldown") else "CLOSED")
+        target = s.get("basket_profit_target", 0.0)
+        floating = s.get("basket_floating_pnl", 0.0)
 
         lines = [
             "📊 <b>ROLLING LADDER</b>", "",
@@ -281,7 +274,7 @@ class TelegramController:
             f"Price: {price}   Spread: {spread}",
             "",
             f"Cycle: #{s.get('cycle_id', 0)}",
-            f"State: {cycle_word}   ({market_state or '-'})",
+            f"State: {cycle_word}",
             f"Age: {int(s.get('cycle_age_seconds', 0) // 60)} min",
             "",
             *(["⏳ <b>COOLDOWN AFTER EXIT</b>",
@@ -297,37 +290,24 @@ class TelegramController:
             "<b>THIS CYCLE SO FAR</b>   (history, NOT current exposure)",
             f"Historical BUY triggers: {s.get('historical_buy_triggers', 0)}",
             f"Historical SELL triggers: {s.get('historical_sell_triggers', 0)}",
-            f"Directional imbalance: {s.get('imbalance', 0):.2f}x",
             f"Direction changes: {s.get('direction_changes', 0)}",
             f"Ladder depth used: {s.get('ladder_depth_used', 0)}",
             "",
             "<b>BASKET</b>",
-            f"Floating basket P/L: {_money(s.get('basket_floating_pnl', 0))}",
+            f"Floating basket P/L: {_money(floating)}"
+            + (f"   (target {_money(target)})" if target else ""),
             f"Realized this cycle: {_money(s.get('basket_realized_pnl', 0))}",
             f"Cycle total: {_money(s.get('basket_net_pnl', 0))}",
             f"Drawdown: {_money(-abs(s.get('basket_drawdown', 0)))}",
             f"Daily P/L: {_money(s.get('daily_profit', 0))}",
             "",
-            f"Spacing: {s.get('spacing')}   TP: {_num(s.get('tp_distance'))}   "
-            f"Lot: {s.get('lot')}",
-            f"Momentum: {dominant} {momentum_word} ({momentum:.2f})",
-            f"Reversal: {reversal_word} ({reversal:.2f})",
-            f"Exhaustion: {s.get('exhaustion_score', 0):.2f}",
-            f"Directional: {s.get('directional_score', 0):.2f}   "
-            f"Extended: {s.get('extended_score', 0):.2f}",
-            f"Exit score: {s.get('exit_score', 0):.0f}"
-            f" / {s.get('settings', {}).get('exit_threshold_exit', 70):.0f}"
-            f"   ({s.get('decision', '-')})",
-            f"Last ladder update: "
-            f"{updated.strftime('%H:%M:%S') if updated else 'n/a'}",
+            f"Spacing: {s.get('spacing')}   Lot: {s.get('lot')}",
         ]
         if s.get("orders", 0) == 0 and s.get("positions", 0) == 0 and \
                 s.get("historical_buy_triggers", 0) + \
                 s.get("historical_sell_triggers", 0) > 0:
             lines.append("\n⚠️ No live orders or positions - "
                          + (s.get("block_reason") or "waiting to redeploy"))
-        if s.get("reason"):
-            lines.append(f"Why: {s['reason']}")
         lines += ["",
                   f"Last ladder update: "
                   f"{updated.strftime('%H:%M:%S') if updated else 'n/a'}"]
@@ -360,21 +340,20 @@ class TelegramController:
                  f"State: {s.get('engine_state', '')}", ""]
         if buys:
             lines.append("<b>BUY STOPS</b>")
-            lines += [f"  {o.price:.{d}f}  →  TP {o.tp:.{d}f}  ({o.volume})"
-                      for o in buys]
+            lines += [f"  {o.price:.{d}f}   ({o.volume})" for o in buys]
         if s.get("bid"):
             lines.append(f"— price {s['bid']:.{d}f} / {s['ask']:.{d}f} —")
         if sells:
             lines.append("<b>SELL STOPS</b>")
-            lines += [f"  {o.price:.{d}f}  →  TP {o.tp:.{d}f}  ({o.volume})"
-                      for o in sells]
+            lines += [f"  {o.price:.{d}f}   ({o.volume})" for o in sells]
         if not orders:
             lines.append("No pending levels right now.")
         if positions:
             lines.append("")
             lines.append("<b>OPEN</b>")
-            lines += [f"  {p.side} {p.volume} @ {p.price_open:.{d}f} "
-                      f"→ TP {p.tp:.{d}f}  {_money(p.profit)}" for p in positions]
+            lines += [f"  {p.side} {p.volume} @ {p.price_open:.{d}f}  "
+                      f"{_money(p.profit)}" for p in positions]
+            lines.append(f"  Basket: {_money(sum(p.profit for p in positions))}")
         lines.append(f"\n<i>Updated {_now()}</i>")
         return "\n".join(lines)
 
@@ -441,7 +420,7 @@ class TelegramController:
             f"Date: {stats['day']}",
             f"Orders placed: {stats.get('orders_placed', 0)}",
             f"Levels triggered: {stats.get('entries', 0)}",
-            f"TP hits: {stats.get('tp_hits', 0)}",
+            f"Basket legs closed: {stats.get('legs_closed', 0)}",
             f"SL hits: {stats.get('sl_hits', 0)}",
             f"Cycles completed: {stats.get('cycles_completed', 0)}",
             f"Realized P/L: {_money(stats.get('realized', 0))}",
@@ -468,12 +447,11 @@ class TelegramController:
             "",
             f"Cycle #{s.get('cycle_id', 0)}  ·  "
             f"{s.get('buy_triggers', 0)}B/{s.get('sell_triggers', 0)}S  ·  "
-            f"P/L {_money(s.get('cycle_profit', 0))}  ·  "
-            f"exit {s.get('exit_score', 0):.0f}",
+            f"basket {_money(s.get('basket_floating_pnl', 0))}"
+            f" / {_money(s.get('basket_profit_target', 0))}",
             f"Positions: {s.get('positions', 0)}   "
             f"Pending: {s.get('orders', 0)}",
-            f"Spacing {s.get('spacing')} · TP {_num(s.get('tp_distance'))} · "
-            f"Lot {s.get('lot')}",
+            f"Spacing {s.get('spacing')} · Lot {s.get('lot')}",
             "",
             "Use the buttons below to control the bot.",
             f"\n<i>Updated {_now()}</i>",

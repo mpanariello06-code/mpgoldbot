@@ -28,7 +28,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from runtime_settings import (
     DIRECTION_LABELS,
     ROLL_MODE_LABELS,
-    TP_MODE_LABELS,
     RuntimeSettings,
     SettingError,
 )
@@ -48,7 +47,7 @@ class SettingsPanel:
     """Renders the settings menus and applies changes to RuntimeSettings."""
 
     KEY_MENU = {
-        "tp_mode": "tp", "tp_levels": "tp", "tp_distance": "tp",
+        "basket_profit_target": "target",
         "stop_loss_distance": "sl",
         "pip_points": "pip",
         "lot_size": "lot", "max_lot_size": "maxlot",
@@ -65,20 +64,14 @@ class SettingsPanel:
         "cycle_reentry_cooldown_seconds": "reentry",
         "order_max_age_seconds": "age",
         "direction_filter": "direction", "timeframe": "settings",
-        "telegram_status_updates": "notify", "telegram_state_alerts": "notify",
-        "telegram_entry_alerts": "notify",
+        "telegram_status_updates": "notify",
         "telegram_status_interval_minutes": "notify",
         "telegram_error_throttle_seconds": "notify",
-        "exit_threshold_exit": "exit", "exit_threshold_monitor": "exit",
-        "exit_w_reversal": "exitweights", "exit_w_exhaustion": "exitweights",
-        "exit_w_continuation": "exitweights", "exit_w_depth": "exitweights",
-        "exit_w_drawdown": "exitweights", "exit_w_harvest": "exitweights",
-        "exit_w_loss_hold": "exitweights",
     }
 
     PROMPTS = {
-        "tp_levels": "Send the TP size in ladder levels (1 = the next rung).",
-        "tp_distance": "Send the TP distance in price units (e.g. 0.30).",
+        "basket_profit_target": "Send the basket profit target in account "
+                                "currency (e.g. 2.00).",
         "stop_loss_distance": "Send the SL distance in price units (0 = no stop loss).",
         "pip_points": "Send how many points make 1 pip (0 = auto-detect).",
         "lot_size": "Send the fixed lot size (e.g. 0.01).",
@@ -92,16 +85,6 @@ class SettingsPanel:
                                             "should be posted, in minutes.",
         "telegram_error_throttle_seconds": "Send how long an identical error is "
                                            "suppressed for, in seconds.",
-        "exit_threshold_exit": "Send the exit score that closes a cycle (1-100).",
-        "exit_threshold_monitor": "Send the score where the cycle moves to "
-                                  "MONITOR (below the exit score).",
-        "exit_w_reversal": "Weight for the reversal reading (0 removes it).",
-        "exit_w_exhaustion": "Weight for the exhaustion reading (0 removes it).",
-        "exit_w_continuation": "How strongly momentum holds a cycle open.",
-        "exit_w_depth": "Weight for how far the ladder has extended.",
-        "exit_w_drawdown": "Weight for give-back from the cycle peak.",
-        "exit_w_harvest": "How much banked profit sharpens an exit signal.",
-        "exit_w_loss_hold": "How strongly an open loss holds a cycle open.",
         "max_open_positions": "Send the maximum open positions (1 - 200).",
         "max_pending_orders": "Send the maximum pending orders (1 - 200).",
         "max_spread": "Send the maximum spread in price units (e.g. 0.50, 0 = off).",
@@ -214,10 +197,9 @@ class SettingsPanel:
                 "⚠️ <b>CONFIRM RESET</b>", "",
                 "Restore the original configuration?", "",
                 f"Spacing {d['ladder_spacing']} × depth {d['ladder_depth']}",
-                f"TP {d['tp_mode']} {d['tp_distance']} | Lot {d['lot_size']}",
+                f"Target {d['basket_profit_target']:.2f} | Lot {d['lot_size']}",
                 f"Max {d['max_open_positions']} pos / "
                 f"{d['max_pending_orders']} pend / depth {d['max_ladder_depth']}",
-                f"Exit score {d['exit_threshold_exit']:g} | "
                 f"Spread {d['max_spread']} | Daily {d['max_daily_drawdown']}",
                 "", "Open positions and orders are not touched.",
             ]), _rows([_btn("✅ CONFIRM", "apply:reset:1")],
@@ -239,8 +221,6 @@ class SettingsPanel:
 
     def _apply(self, payload):
         key, _, value = payload.partition(":")
-        if key == "tp_levels":
-            self.settings.set("tp_mode", "levels")
         if key == "reset":
             changed = self.settings.reset()
             return self.menu("main", banner=f"♻️ Settings reset to the original "
@@ -278,18 +258,6 @@ class SettingsPanel:
         return ("1 pip = auto-detected from the symbol" if not snap["pip_points"]
                 else f"1 pip = {snap['pip_points']} points (pinned)")
 
-    def _tp_line(self):
-        snap = self.settings.snapshot()
-        if snap["tp_mode"] == "none":
-            return "NONE - the cycle is closed as one basket"
-        if snap["tp_mode"] == "levels":
-            n = snap["tp_levels"]
-            return (f"{n} level{'s' if n > 1 else ''} "
-                    f"({n * snap['ladder_spacing']:g})")
-        if snap["tp_mode"] == "distance":
-            return f"{snap['tp_distance']:g} price units"
-        return f"{TP_MODE_LABELS[snap['tp_mode']]} ({self._pip_line().split('=')[1].strip()})"
-
     # ---- root -------------------------------------------------------------
     def _menu_main(self):
         s = self.settings.snapshot()
@@ -297,7 +265,7 @@ class SettingsPanel:
             "⚙️ <b>CURRENT SETTINGS</b>", "",
             f"Symbol: {getattr(self.engine, 'symbol', '')}  ({s['timeframe']})",
             "",
-            f"🎯 TP: {self._tp_line()}",
+            f"🎯 Basket target: {self._d('basket_profit_target')}",
             f"🛑 SL: {self._d('stop_loss_distance')}",
             f"📐 {self._pip_line()}",
             "",
@@ -307,8 +275,6 @@ class SettingsPanel:
             f"🪜 Roll mode: {ROLL_MODE_LABELS[s['roll_mode']]}",
             "",
             f"💰 Lot: {s['lot_size']} (max {s['max_lot_size']})",
-            f"⚖️ Exit at score: {s['exit_threshold_exit']:g} "
-            f"(monitor {s['exit_threshold_monitor']:g})",
             f"🔁 Close on cycle end: {'ON' if s['cycle_close_positions'] else 'OFF'}",
             "",
             f"🛡 Max open: {s['max_open_positions']} | "
@@ -325,10 +291,11 @@ class SettingsPanel:
             "<i>Changes apply to NEW levels only.</i>",
         ])
         markup = _rows(
-            [_btn("🎯 TP SETTINGS", "settings_tp"), _btn("💰 LOT SIZE", "settings_lot")],
+            [_btn("🎯 BASKET TARGET", "settings_target"),
+             _btn("💰 LOT SIZE", "settings_lot")],
             [_btn("🪜 LADDER SETTINGS", "settings_ladder"),
              _btn("🛡 RISK SETTINGS", "settings_risk")],
-            [_btn("⚖️ EXIT ENGINE", "settings_exit"),
+            [_btn("🛑 STOP LOSS", "settings_sl"),
              _btn("🧭 DIRECTION", "settings_direction")],
             [_btn("🔔 NOTIFICATIONS", "settings_notify"),
              _btn("♻️ RESET SETTINGS", "confirm:reset:1")],
@@ -336,37 +303,29 @@ class SettingsPanel:
         )
         return text, markup
 
-    # ---- TP ---------------------------------------------------------------
-    def _menu_tp(self):
+    # ---- the one normal exit ----------------------------------------------
+    def _menu_target(self):
         s = self.settings.snapshot()
-        mode = s["tp_mode"]
-        levels = s["tp_levels"]
         text = "\n".join([
-            "🎯 <b>TP SETTINGS</b>", "",
-            f"Current: {self._tp_line()}",
-            f"Ladder spacing: {self._d('ladder_spacing')}",
-            f"{self._pip_line()}", "",
-            "NONE is the strategy's own mode: ladder positions carry no",
-            "individual target and the exit engine closes the whole cycle",
-            "as one basket. The other modes turn every level back into an",
-            "independent trade with its own TP.",
+            "🎯 <b>BASKET PROFIT TARGET</b>", "",
+            f"Current: {self._d('basket_profit_target')}",
+            f"Lot: {s['lot_size']}   Spacing: {self._d('ladder_spacing')}", "",
+            "The ONE normal exit. When the current cycle's TOTAL floating P/L",
+            "reaches this, every position and every pending order of the cycle",
+            "is closed, and a new ladder follows after the re-entry cooldown.",
+            "",
+            "Ladder positions carry no individual take profit - a triggered",
+            "level is one leg of the basket, never a trade of its own.",
+            "",
+            "OFF leaves only the hard risk limits to end a cycle.",
         ])
-        level_buttons = [
-            _btn(f"{self._mark(mode == 'levels' and levels == n)}{n} LEVEL"
-                 f"{'S' if n > 1 else ''}", f"confirm:tp_levels:{n}")
-            for n in (1, 2, 3, 4, 5)
-        ]
+        row = [_btn(f"{self._mark(s['basket_profit_target'] == v)}"
+                    f"{'OFF' if v == 0 else f'${v:g}'}",
+                    f"confirm:basket_profit_target:{v:g}")
+               for v in (1, 2, 3, 5)]
         return text, _rows(
-            [_btn(f"{self._mark(mode == 'none')}NONE (BASKET)",
-                  "confirm:tp_mode:none")],
-            level_buttons[:3], level_buttons[3:],
-            [_btn(f"{self._mark(mode == 'levels')}MODE: LEVELS",
-                  "confirm:tp_mode:levels"),
-             _btn(f"{self._mark(mode == 'distance')}MODE: DISTANCE",
-                  "confirm:tp_mode:distance")],
-            [_btn("✏️ SET DISTANCE", "custom:tp_distance"),
-             _btn("📐 PIP SIZE", "settings_pip")],
-            [_btn("🛑 STOP LOSS", "settings_sl")],
+            row[:2], row[2:],
+            [_btn("✏️ CUSTOM", "custom:basket_profit_target")],
             [_btn(BACK, "settings")],
         )
 
@@ -383,7 +342,7 @@ class SettingsPanel:
                for v in (0, 0.5, 1.0, 2.0)]
         return text, _rows(row[:2], row[2:],
                            [_btn("✏️ CUSTOM", "custom:stop_loss_distance")],
-                           [_btn(BACK, "settings_tp")])
+                           [_btn(BACK, "settings")])
 
     def _menu_pip(self):
         current = self.settings.get("pip_points")
@@ -399,7 +358,7 @@ class SettingsPanel:
                for v in (0, 1, 10, 100)]
         return text, _rows(row[:2], row[2:],
                            [_btn("✏️ CUSTOM", "custom:pip_points")],
-                           [_btn(BACK, "settings_tp")])
+                           [_btn(BACK, "settings")])
 
     # ---- lot --------------------------------------------------------------
     def _menu_lot(self):
@@ -442,7 +401,7 @@ class SettingsPanel:
             f"Depth: {s['ladder_depth']} levels per side",
             f"First level: {self._d('first_level_offset')} from price",
             f"Roll mode: {ROLL_MODE_LABELS[s['roll_mode']]}",
-            f"Exit at score: {s['exit_threshold_exit']:g}", "",
+            "",
             "BUY STOPs sit above the market, SELL STOPs below, on a grid",
             "anchored when the cycle started.",
         ])
@@ -526,69 +485,20 @@ class SettingsPanel:
             "🔁 <b>CYCLE</b>", "",
             f"Close positions on cycle end: "
             f"{'ON' if s['cycle_close_positions'] else 'OFF'}",
-            f"Exit score to close: {s['exit_threshold_exit']:g}",
+
             f"Max ladder depth: {s['max_ladder_depth']}", "",
-            "A cycle ends when the exit engine reads a reversal or exhaustion,",
-            "or when a risk limit forces it - never on a trade count and never",
-            "on a dollar target. Then pending orders are cancelled and a fresh",
-            "ladder is anchored at the new price.",
+            "A cycle ends when the basket's total floating P/L reaches the",
+            "profit target, or when a hard risk limit forces it. Then every",
+            "position and pending order is closed, and after the re-entry",
+            "cooldown a fresh ladder is anchored at the current price.",
         ])
         return text, _rows(
             [_btn(f"CLOSE ON END: {'ON' if s['cycle_close_positions'] else 'OFF'}",
                   f"confirm:cycle_close_positions:"
                   f"{'false' if s['cycle_close_positions'] else 'true'}")],
-            [_btn("⚖️ EXIT ENGINE", "settings_exit"),
+            [_btn("🎯 BASKET TARGET", "settings_target"),
              _btn("📐 MAX DEPTH", "settings_maxdepth")],
             [_btn(BACK, "settings_ladder")],
-        )
-
-    def _menu_exit(self):
-        s = self.settings.snapshot()
-        text = "\n".join([
-            "⚖️ <b>EXIT ENGINE</b>", "",
-            f"Exit at score: {s['exit_threshold_exit']:g}",
-            f"Monitor from: {s['exit_threshold_monitor']:g}", "",
-            "The score blends reversal, exhaustion, ladder depth and basket",
-            "drawdown, minus the momentum still carrying the move. Banked",
-            "profit sharpens a signal that is already there; an open loss",
-            "holds the cycle open unless a reversal is real.", "",
-            "Lower it to leave sooner, raise it to ride longer. These are",
-            "starting values - fit them on historical data.",
-        ])
-        row = [_btn(f"{self._mark(s['exit_threshold_exit'] == v)}{v:g}",
-                    f"confirm:exit_threshold_exit:{v:g}")
-               for v in (50, 60, 70, 80)]
-        return text, _rows(
-            row[:2], row[2:],
-            [_btn("✏️ EXIT SCORE", "custom:exit_threshold_exit"),
-             _btn("✏️ MONITOR SCORE", "custom:exit_threshold_monitor")],
-            [_btn("🎚 WEIGHTS", "settings_exitweights")],
-            [_btn(BACK, "settings_cycle")],
-        )
-
-    def _menu_exitweights(self):
-        s = self.settings.snapshot()
-        text = "\n".join([
-            "🎚 <b>EXIT WEIGHTS</b>", "",
-            f"Reversal: {s['exit_w_reversal']:g}",
-            f"Exhaustion: {s['exit_w_exhaustion']:g}",
-            f"Continuation (holds the cycle): {s['exit_w_continuation']:g}",
-            f"Depth: {s['exit_w_depth']:g}",
-            f"Drawdown: {s['exit_w_drawdown']:g}",
-            f"Harvest: {s['exit_w_harvest']:g}",
-            f"Loss hold: {s['exit_w_loss_hold']:g}", "",
-            "Each weight scales one input of the exit score. Set any of them",
-            "to 0 to take that input out of the decision entirely.",
-        ])
-        return text, _rows(
-            [_btn("REVERSAL", "custom:exit_w_reversal"),
-             _btn("EXHAUSTION", "custom:exit_w_exhaustion")],
-            [_btn("CONTINUATION", "custom:exit_w_continuation"),
-             _btn("DEPTH", "custom:exit_w_depth")],
-            [_btn("DRAWDOWN", "custom:exit_w_drawdown"),
-             _btn("HARVEST", "custom:exit_w_harvest")],
-            [_btn("LOSS HOLD", "custom:exit_w_loss_hold")],
-            [_btn(BACK, "settings_exit")],
         )
 
     def _menu_maxdepth(self):
@@ -711,15 +621,11 @@ class SettingsPanel:
             "🔔 <b>NOTIFICATIONS</b>", "",
             f"Status updates: {'ON' if s['telegram_status_updates'] else 'OFF'}"
             f"  (every {s['telegram_status_interval_minutes']:g} min)",
-            f"State alerts: {'ON' if s['telegram_state_alerts'] else 'OFF'}",
-            f"Per-entry alerts: "
-            f"{'ON' if s['telegram_entry_alerts'] else 'OFF'}",
             f"Error throttle: {s['telegram_error_throttle_seconds']:g}s", "",
-            "Telegram carries important events only: cycle results, reversals,",
-            "risk and errors. Every level, order, trigger and TP still goes to",
-            "the CSV logs in full.", "",
-            "Per-entry alerts are off by design - this strategy would flood",
-            "the chat.",
+            "Telegram carries important events only: a cycle closing, the next",
+            "ladder going live, risk events and errors. There is no message",
+            "per level, per order, per trigger or per P/L update - all of that",
+            "goes to the CSV logs in full.",
         ])
         return text, _rows(
             [_btn(f"STATUS UPDATES: "
@@ -727,14 +633,6 @@ class SettingsPanel:
                   f"apply:telegram_status_updates:"
                   f"{'false' if s['telegram_status_updates'] else 'true'}"),
              _btn("⏱ INTERVAL", "custom:telegram_status_interval_minutes")],
-            [_btn(f"STATE ALERTS: "
-                  f"{'ON' if s['telegram_state_alerts'] else 'OFF'}",
-                  f"apply:telegram_state_alerts:"
-                  f"{'false' if s['telegram_state_alerts'] else 'true'}")],
-            [_btn(f"ENTRY ALERTS: "
-                  f"{'ON' if s['telegram_entry_alerts'] else 'OFF'}",
-                  f"apply:telegram_entry_alerts:"
-                  f"{'false' if s['telegram_entry_alerts'] else 'true'}")],
             [_btn("⏳ ERROR THROTTLE", "custom:telegram_error_throttle_seconds")],
             [_btn(BACK, "settings")],
         )

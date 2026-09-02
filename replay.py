@@ -14,7 +14,7 @@ one) and is stated in the output.
 
     python replay.py --bars 3000                  # pull M5 bars from MT5
     python replay.py --csv gold_m5.csv            # time,open,high,low,close[,spread]
-    python replay.py --csv g.csv --spacing 0.20 --tp-levels 2 --exit-threshold 60
+    python replay.py --csv g.csv --spacing 0.20 --target 3.00
 """
 
 import argparse
@@ -261,25 +261,23 @@ def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
         "pending stop orders fill at the level unless price gapped past it",
     ]
 
-    def on_cycle(cycle, sequence, assessment, total, reason, kind, lost,
+    def on_cycle(cycle, sequence, total, reason, kind, lost,
                  duration=0.0, next_cycle_id=None, context=None,
                  next_ladder_seconds=0.0):
         seq = sequence.snapshot() if sequence else {}
+        ctx = context or {}
         result.cycles.append({
             "cycle_id": cycle.cycle_id, "realized": total,
             "triggers": seq.get("total_triggers", cycle.trades),
             "buy": seq.get("buy_triggers", 0), "sell": seq.get("sell_triggers", 0),
-            "imbalance": seq.get("imbalance", 0),
-            "exit_score": round(assessment.exit_score, 1) if assessment else 0,
-            "state": assessment.state if assessment else "",
+            "depth": seq.get("ladder_depth_used", 0),
             "kind": kind, "reason": reason,
             "duration_seconds": round(duration, 1),
-            "exit_price": (context or {}).get("exit_price", ""),
-            "open_positions_at_exit": (context or {}).get(
-                "open_positions_at_exit", ""),
+            "exit_price": ctx.get("exit_price", ""),
+            "floating_at_exit": ctx.get("floating_pnl_at_exit", ""),
+            "open_positions_at_exit": ctx.get("open_positions_at_exit", ""),
         })
-        label = f"{kind}: {assessment.state if assessment else 'n/a'}"
-        result.exit_reasons[label] = result.exit_reasons.get(label, 0) + 1
+        result.exit_reasons[kind] = result.exit_reasons.get(kind, 0) + 1
 
     def on_closed(trade, index, cycle, is_win):
         result.closed_trades += 1
@@ -334,8 +332,8 @@ def main(argv=None):
     ap.add_argument("--timeframe", default=cfg.TIMEFRAME)
     ap.add_argument("--spacing", type=float)
     ap.add_argument("--depth", type=int)
-    ap.add_argument("--tp-levels", type=int)
-    ap.add_argument("--exit-threshold", type=float)
+    ap.add_argument("--target", type=float,
+                    help="basket profit target in account currency")
     ap.add_argument("--lot", type=float)
     ap.add_argument("--spread", type=float, default=0.08)
     ap.add_argument("--commission", type=float, default=cfg.COMMISSION_PER_LOT)
@@ -360,11 +358,8 @@ def main(argv=None):
         overrides["ladder_spacing"] = args.spacing
     if args.depth:
         overrides["ladder_depth"] = args.depth
-    if args.tp_levels:
-        overrides["tp_levels"] = args.tp_levels
-        overrides["tp_mode"] = "levels"
-    if args.exit_threshold:
-        overrides["exit_threshold_exit"] = args.exit_threshold
+    if args.target is not None:
+        overrides["basket_profit_target"] = args.target
     if args.lot:
         overrides["lot_size"] = args.lot
 

@@ -74,9 +74,9 @@ class FakeEngine:
             "engine_state": "LADDER_ACTIVE", "timeframe": snap["timeframe"],
             "bid": 4010.06, "ask": 4010.14, "spread": 0.08,
             "spacing": snap["ladder_spacing"], "depth": snap["ladder_depth"],
-            "tp_distance": snap["tp_levels"] * snap["ladder_spacing"],
-            "tp_mode": snap["tp_mode"], "lot": snap["lot_size"],
-            "positions": 5, "orders": 11, "cycle_id": 183, "tp_count": 3,
+            "lot": snap["lot_size"],
+            "basket_profit_target": snap["basket_profit_target"],
+            "positions": 5, "orders": 11, "cycle_id": 183,
             "current_pending_buys": 5, "current_pending_sells": 6,
             "current_open_buys": 0, "current_open_sells": 5,
             "historical_buy_triggers": 2, "historical_sell_triggers": 5,
@@ -84,23 +84,17 @@ class FakeEngine:
             # the basket, reported as its own unit
             "basket_floating_pnl": 0.0, "basket_realized_pnl": 2.31,
             "basket_net_pnl": 2.31, "cycle_active": True,
-            "cycle_age_seconds": 640, "directional_score": 0.12,
-            "extended_score": 0.30, "ladder_live": True,
-            "cycle_profit": 1.36, "daily_profit": 2.10, "total_tp": 12,
+            "cycle_age_seconds": 640, "ladder_live": True,
+            "cycle_profit": 1.36, "daily_profit": 2.10,
             "total_trades": 15, "anchor": 4010.04, "block_reason": "",
             "spread_blocked": False, "losing_streak": 0,
             "last_update": datetime.now(), "uptime": "1h 2m", "error": "",
             "last_loop_at": None, "settings": snap,
-            # sequence + exit engine
+            # the cycle's own bookkeeping
             "buy_triggers": 2, "sell_triggers": 5, "last_side": "SELL",
-            "previous_side": "BUY", "imbalance": 2.5, "direction_changes": 1,
+            "previous_side": "BUY", "direction_changes": 1,
             "ladder_depth_used": 5, "basket_drawdown": 0.42,
-            "efficiency": 0.62, "state": "REVERSAL_DETECTED",
-            "market_state": "REVERSAL_DETECTED",
-            "decision": "EXIT", "exit_score": 81.0, "momentum_score": 0.72,
-            "continuation_score": 0.0, "reversal_score": 0.78,
-            "exhaustion_score": 0.31,
-            "reason": "reversal: 2B/5S imbalance 2.50x eff 0.62",
+            "state": "LADDER_ACTIVE",
             **self.state_overrides,
         }
 
@@ -216,14 +210,13 @@ async def run():
     t.section("STATUS SCREEN: CURRENT STATE vs HISTORY")
     text, _, _ = await press("status")
     for label in ["ROLLING LADDER", "XAUUSD   M5", "Cycle: #183",
-                  "State: ACTIVE   (REVERSAL DETECTED)", "LIVE IN MT5",
+                  "State: ACTIVE", "LIVE IN MT5",
                   "Pending BUY: 5", "Pending SELL: 6", "Open BUY: 0",
                   "Open SELL: 5", "THIS CYCLE SO FAR",
                   "Historical BUY triggers: 2", "Historical SELL triggers: 5",
-                  "Directional imbalance: 2.50x", "Ladder depth used: 5",
+                  "Direction changes: 1", "Ladder depth used: 5",
                   "BASKET", "Floating basket P/L", "Realized this cycle",
-                  "Cycle total",
-                  "Exit score: 81"]:
+                  "Cycle total", "(target $2.00)"]:
         t.check(f"status shows {label!r}", label in text,
                 "" if label in text else text.replace("\n", " | ")[:220])
     t.check("floating and realized are reported separately",
@@ -233,7 +226,11 @@ async def run():
     t.check("current orders are not confused with historical triggers",
             text.index("Pending BUY: 5") < text.index("Historical BUY triggers: 2"))
     t.check("cycle age is shown", "Age: 10 min" in text)
-    t.check("status explains the decision", "Why: reversal" in text)
+    t.check("no scoring or scenario language is left on the screen",
+            not any(w in text.lower() for w in
+                    ("exit score", "reversal", "exhaustion", "momentum",
+                     "scenario", "imbalance")),
+            text.replace("\n", " | ")[:240])
     t.check("status never leaks the token", "TESTTOKEN" not in text)
 
     t.section("STATUS FLAGS A LADDER THAT IS NOT LIVE")
@@ -266,11 +263,11 @@ async def run():
     t.check("stats reports honestly when empty",
             "No ladder activity recorded yet today." in text)
     CSV.log_ladder("ORDER_TRIGGERED", cycle_id=127, symbol="XAUUSD", direction="BUY")
-    CSV.log_ladder("TP_HIT", cycle_id=127, symbol="XAUUSD", profit=0.30)
+    CSV.log_ladder("POSITION_CLOSED", cycle_id=127, symbol="XAUUSD", profit=0.30)
     CSV.log_ladder("CYCLE_COMPLETED", cycle_id=127, profit=1.36)
     text, _, _ = await press("stats")
     t.check("stats counts ladder events",
-            "TP hits: 1" in text and "Levels triggered: 1" in text and
+            "Basket legs closed: 1" in text and "Levels triggered: 1" in text and
             "Cycles completed: 1" in text, text.replace("\n", " | "))
 
     t.section("SETTINGS: EVERY MENU RENDERS")
@@ -308,7 +305,7 @@ async def run():
 
     t.section("SETTINGS SCREEN CONTENT")
     text, _ = panel.render("settings", 111)
-    for label in ["TP:", "Spacing:", "Depth:", "Lot:", "Exit at score:",
+    for label in ["Basket target:", "Spacing:", "Depth:", "Lot:",
                   "Max open:", "Max spread:", "Daily drawdown:", "Direction:"]:
         t.check(f"settings screen shows {label!r}", label in text)
     t.check("pip size resolved from the live symbol", "1 pip = 0.01" in text,
@@ -327,12 +324,11 @@ async def run():
     text, _ = panel.render("apply:ladder_spacing:0.5", 111)
     t.check("confirm applies", S.get("ladder_spacing") == 0.5 and "✅" in text)
 
-    for cb, key, want in [("confirm:tp_mode:2_pips", "tp_mode", "2_pips"),
+    for cb, key, want in [("confirm:basket_profit_target:3",
+                           "basket_profit_target", 3.0),
                           ("confirm:lot_size:0.02", "lot_size", 0.02),
                           ("confirm:ladder_depth:8", "ladder_depth", 8),
                           ("confirm:max_open_positions:2", "max_open_positions", 2),
-                          ("confirm:tp_levels:2", "tp_levels", 2),
-                          ("confirm:exit_threshold_exit:60", "exit_threshold_exit", 60.0),
                           ("confirm:direction_filter:buy_bias", "direction_filter",
                            "buy_bias")]:
         before = S.get(key)
@@ -353,8 +349,10 @@ async def run():
     t.check("order age applied", S.get("order_max_age_seconds") == 300)
     text, markup = panel.render("settings_notify", 111)
     t.check("notifications menu shows the policy",
-            "Status updates:" in text and "Per-entry alerts: OFF" in text,
+            "Status updates:" in text and "Error throttle:" in text,
             text.replace("\n", " | ")[:140])
+    t.check("there is no per-entry alert to turn on any more",
+            "entry" not in text.lower(), text.replace("\n", " | ")[:200])
     t.check("notifications menu explains where the detail lives",
             "CSV logs in full" in text)
     t.check("status updates can be toggled from the menu",
@@ -370,21 +368,21 @@ async def run():
 
     t.section("CUSTOM TYPED VALUES")
     t.check("nothing pending initially", panel.awaiting_input(111) is None)
-    text, markup = panel.render("custom:tp_distance", 111)
-    t.check("prompt shown", "CUSTOM TP DISTANCE" in text and
-            panel.awaiting_input(111) == "tp_distance")
+    text, markup = panel.render("custom:basket_profit_target", 111)
+    t.check("prompt shown", "CUSTOM BASKET TARGET" in text and
+            panel.awaiting_input(111) == "basket_profit_target")
     t.check("other chats unaffected", panel.handle_text(222, "0.5") is None)
     text, _ = panel.handle_text(111, "abc")
     t.check("invalid text explained", "INVALID VALUE" in text and "not a number" in text)
     t.check("still awaiting after an invalid value",
-            panel.awaiting_input(111) == "tp_distance")
-    text, _ = panel.handle_text(111, "9999")
+            panel.awaiting_input(111) == "basket_profit_target")
+    text, _ = panel.handle_text(111, "999999")
     t.check("out of range refused", "INVALID VALUE" in text and "between" in text)
     text, _ = panel.handle_text(111, " 0.45 ")
     t.check("valid custom value asks to confirm", "CONFIRM CHANGE" in text and
             "0.45" in text)
-    panel.render("apply:tp_distance:0.45", 111)
-    t.check("custom value applied", S.get("tp_distance") == 0.45)
+    panel.render("apply:basket_profit_target:0.45", 111)
+    t.check("custom value applied", S.get("basket_profit_target") == 0.45)
     panel.render("custom:lot_size", 111)
     text, _ = panel.handle_text(111, "5")
     t.check("cross-field check runs on typed values",

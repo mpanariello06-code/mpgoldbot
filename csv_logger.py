@@ -38,8 +38,6 @@ TRADE_HEADER = [
     # ladder context for later analysis
     "cycle_id",
     "level",
-    "tp_mode",
-    "tp_distance",
     "spread",
 ]
 
@@ -52,22 +50,18 @@ EVENT_HEADER = [
     "status",
 ]
 
-# One row per ladder event. Deliberately wide: this is the data the exit rules
-# are meant to be re-fitted against later, so the market state at the moment of
-# every decision is captured, not just the decision.
+# One row per ladder event, with the state of the basket at that moment. This
+# is the data a future exit rule would be fitted against - it records what
+# happened, not a score.
 LADDER_HEADER = [
     "timestamp", "symbol", "cycle_id", "candle_time", "event_type", "side",
-    "entry_price", "exit_price", "ladder_price", "ladder_index", "tp",
+    "entry_price", "exit_price", "ladder_price", "ladder_index",
     "sl_if_used", "lot_size", "spread", "order_ticket", "position_ticket",
-    "buy_trigger_count", "sell_trigger_count", "consecutive_buy",
-    "consecutive_sell", "last_side", "previous_side", "direction_changes",
-    "buy_sell_ratio", "sell_buy_ratio", "imbalance", "ladder_depth_used",
-    "price_distance_traveled", "net_levels", "efficiency",
-    "time_since_previous_trigger", "volatility", "basket_pnl",
-    "basket_drawdown", "profit", "cycle_profit", "daily_profit",
-    "momentum_score", "continuation_score", "reversal_score",
-    "exhaustion_score", "exit_score", "decision", "market_state", "action",
-    "reason",
+    "buy_trigger_count", "sell_trigger_count", "last_side", "previous_side",
+    "direction_changes", "ladder_depth_used", "price_distance_traveled",
+    "net_levels", "basket_floating_pnl", "basket_realized_pnl", "basket_pnl",
+    "basket_drawdown", "basket_profit_target", "profit", "cycle_profit",
+    "daily_profit", "action", "reason",
 ]
 
 # One row per completed cycle: how it ran and why it ended.
@@ -75,15 +69,12 @@ CYCLE_HEADER = [
     "timestamp", "symbol", "cycle_id", "started_at", "duration_seconds",
     "anchor", "initial_price", "exit_price", "exit_spread", "spacing",
     "triggers", "buy_triggers", "sell_triggers",
-    "direction_changes", "imbalance", "ladder_depth_used", "net_levels",
-    "path_levels", "efficiency", "tp_count",
+    "direction_changes", "ladder_depth_used", "net_levels",
+    "path_levels", "basket_profit_target",
     "positions_at_exit", "open_buys_at_exit", "open_sells_at_exit",
     "pending_orders_at_exit", "floating_pnl_at_exit",
     "realized_pnl", "peak_pnl", "drawdown",
-    "momentum_score", "continuation_score", "reversal_score",
-    "exhaustion_score", "directional_score", "extended_score",
-    "exit_score", "market_state", "exit_scenario", "end_kind", "end_reason",
-    "daily_profit",
+    "end_kind", "end_reason", "daily_profit",
 ]
 
 ACCOUNT_HEADER = [
@@ -234,7 +225,7 @@ class CsvLogger:
                   entry_price=None, stop_loss=None, take_profit=None,
                   close_price=None, profit=None, commission=None, swap=None,
                   magic=None, deal_id=None, digits=2, cycle_id=None, level=None,
-                  tp_mode=None, tp_distance=None, spread=None):
+                  spread=None):
         """
         Append a trade row, skipping anything already recorded.
 
@@ -264,8 +255,6 @@ class CsvLogger:
                     _fmt(deal_id),
                     _fmt(cycle_id),
                     _fmt(level),
-                    _fmt(tp_mode),
-                    _fmt(tp_distance, digits),
                     _fmt(spread, digits),
                 ]
                 with open(self.trade_path, "a", newline="", encoding="utf-8") as fh:
@@ -292,10 +281,11 @@ class CsvLogger:
         """
         fields["event_type"] = event
         fields.setdefault("timestamp", _now())
-        price_keys = {"entry_price", "exit_price", "ladder_price", "tp",
+        price_keys = {"entry_price", "exit_price", "ladder_price",
                       "sl_if_used", "spread"}
         money_keys = {"profit", "cycle_profit", "daily_profit", "basket_pnl",
-                      "basket_drawdown"}
+                      "basket_floating_pnl", "basket_realized_pnl",
+                      "basket_drawdown", "basket_profit_target"}
         row = []
         for column in LADDER_HEADER:
             value = fields.get(column, "")
@@ -319,7 +309,8 @@ class CsvLogger:
             if column in ("anchor", "spacing", "initial_price", "exit_price"):
                 row.append(_fmt(value, digits))
             elif column in ("realized_pnl", "peak_pnl", "drawdown",
-                            "floating_pnl_at_exit", "daily_profit"):
+                            "floating_pnl_at_exit", "daily_profit",
+                            "basket_profit_target"):
                 row.append(_fmt(value, 2))
             else:
                 row.append(_fmt(value))
@@ -349,7 +340,7 @@ class CsvLogger:
             counts[event] = counts.get(event, 0) + 1
             if row.get("cycle_id"):
                 cycles.add(row["cycle_id"])
-            if event in ("TP_HIT", "SL_HIT", "POSITION_CLOSED"):
+            if event in ("SL_HIT", "POSITION_CLOSED"):
                 try:
                     realized += float(row.get("profit") or 0.0)
                 except ValueError:
@@ -358,8 +349,8 @@ class CsvLogger:
             "available": True,
             "day": day,
             "events": counts,
-            "tp_hits": counts.get("TP_HIT", 0),
             "sl_hits": counts.get("SL_HIT", 0),
+            "legs_closed": counts.get("POSITION_CLOSED", 0),
             "entries": counts.get("ORDER_TRIGGERED", 0),
             "orders_placed": counts.get("ORDER_PLACED", 0),
             "cycles_completed": counts.get("CYCLE_COMPLETED", 0),

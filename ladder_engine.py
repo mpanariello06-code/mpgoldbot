@@ -26,9 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from broker import BUY, BUY_STOP, SELL, SELL_STOP
-from exit_engine import (CONTINUE, EXIT, PROFIT_FALLBACK, RISK_DRAWDOWN,
-                         RISK_TIMEOUT, ExitConfig, LadderSequence,
-                         RollingLadderExitEngine)
+from basket import (BASKET_PROFIT_TARGET, RISK_DRAWDOWN, RISK_TIMEOUT,
+                    CycleBasket)
 
 COMMENT_RE = re.compile(r"^RL(\d+)([BS])(-?\d+)")
 
@@ -42,9 +41,8 @@ class State:
              -> CLOSING_CYCLE -> VERIFYING_FLAT -> COOLDOWN_AFTER_EXIT
              -> NEW_CYCLE -> BUILDING_LADDER ...
 
-    The market reading (continuation / reversal / uncertain / exit evaluation)
-    is the exit engine's own `state`, reported alongside this one: this is what
-    the bot is DOING, that is what it is SEEING.
+    This is what the bot is DOING. There is no separate "market reading" any
+    more - the normal exit is the basket's floating P/L against its target.
     """
     IDLE = "IDLE"
     INITIALIZING = "INITIALIZING"
@@ -133,7 +131,6 @@ class Cycle:
     cycle_id: int = 1
     anchor: float = 0.0
     started_at: float = field(default_factory=time.time)
-    tp_count: int = 0
     trades: int = 0
     realized: float = 0.0
     base_buy_index: int = None      # static roll mode pins the ladder here
@@ -141,7 +138,7 @@ class Cycle:
 
     def to_dict(self):
         return {k: getattr(self, k) for k in
-                ("cycle_id", "anchor", "started_at", "tp_count", "trades",
+                ("cycle_id", "anchor", "started_at", "trades",
                  "realized", "base_buy_index", "base_sell_index")}
 
 
@@ -162,11 +159,9 @@ class RollingLadderEngine:
         self.state = State.IDLE
         self.paused = False
         self.cycle = Cycle()
-        # Adaptive exit: the cycle ends on market structure, never on a trade
-        # count or a dollar amount.
-        self.exit_engine = RollingLadderExitEngine()
+        # One normal exit: the basket's floating P/L reaching the target.
+        # `sequence` is bookkeeping for the log and the status screen.
         self.sequence = None
-        self.assessment = None
         # Cycle transitions are guarded so one exit event can only ever produce
         # one new cycle, however many passes the close takes to verify.
         self._transition_lock = threading.RLock()
@@ -184,7 +179,6 @@ class RollingLadderEngine:
         self.consecutive_losing_cycles = 0
         self.cooldown_until = 0.0
         self._streak_paused = False
-        self.total_tp = 0
         self.total_trades = 0
 
         self._known_positions = {}        # ticket -> OpenPosition
@@ -193,7 +187,6 @@ class RollingLadderEngine:
         self._levels_done = set()         # (side, index) consumed this cycle
         self._triggered_keys = set()      # (side, index) already in the sequence
         self._depth_capped_logged = False
-        self._profit_since = None         # when the basket first cleared the buffer
         self._last_place_error = 0.0
         # There is exactly one active cycle at a time. Between a cycle closing
         # and the next ladder going out the engine is deliberately cycle-less:
@@ -238,7 +231,6 @@ class RollingLadderEngine:
                 "cycle_active": self.cycle_active,
                 "reentry_until": self.reentry_until,
                 "streak_paused": self._streak_paused,
-                "total_tp": self.total_tp,
                 "total_trades": self.total_trades,
                 "levels_done": sorted(f"{s}:{i}" for s, i in self._levels_done),
             }
@@ -268,7 +260,6 @@ class RollingLadderEngine:
         self.cycle_active = bool(data.get("cycle_active", True))
         self.reentry_until = float(data.get("reentry_until", 0.0))
         self._streak_paused = bool(data.get("streak_paused", False))
-        self.total_tp = int(data.get("total_tp", 0))
         self.total_trades = int(data.get("total_trades", 0))
         for item in data.get("levels_done", []):
             side, _, idx = item.partition(":")
@@ -328,7 +319,7 @@ class RollingLadderEngine:
             # after a restart the sequence restarts empty: only what MT5 can
             # still show us is trustworthy, and trigger history is not stored
             # on the broker.
-            self.sequence = LadderSequence(
+            self.sequence = CycleBasket(
                 self.cycle.cycle_id, self.cycle.anchor,
                 float(self.settings.get("ladder_spacing")),
                 started_at=self.clock())
@@ -386,15 +377,13 @@ class RollingLadderEngine:
         # cycle age (and therefore the timeout) is meaningless under replay.
         self.cycle = Cycle(cycle_id=cid, anchor=anchor,
                            started_at=self.clock())
-        self.sequence = LadderSequence(cid, anchor,
-                                       float(self.settings.get("ladder_spacing")),
-                                       started_at=self.clock())
-        self.assessment = None
+        self.sequence = CycleBasket(cid, anchor,
+                                    float(self.settings.get("ladder_spacing")),
+                                    started_at=self.clock())
         self._levels_open.clear()
         self._levels_done.clear()
         self._triggered_keys.clear()
         self._depth_capped_logged = False
-        self._profit_since = None
         self.cycle_active = True
         self.reentry_until = 0.0
         self._cycle_announced = False
@@ -458,7 +447,6 @@ class RollingLadderEngine:
         out_of_range = depth * spacing + offset
 
         allow_buy, allow_sell = DirectionFilter(snap["direction_filter"]).decide()
-        tp_distance = self.tp_distance(snap)
         sl_distance = float(snap["stop_loss_distance"])
 
         live = {BUY_STOP: set(), SELL_STOP: set()}
@@ -525,7 +513,7 @@ class RollingLadderEngine:
                 price = spec.normalize_price(anchor + idx * spacing)
                 levels.append(DesiredLevel(
                     side=BUY_STOP, index=idx, price=price,
-                    tp=spec.normalize_price(price + tp_distance) if tp_distance else 0.0,
+                    tp=0.0,                 # no individual TP: the basket exits
                     sl=spec.normalize_price(price - sl_distance) if sl_distance else 0.0,
                     comment=level_comment(self.cycle.cycle_id, BUY, idx),
                     placeable=price >= tick.ask + offset,
@@ -535,48 +523,12 @@ class RollingLadderEngine:
                 price = spec.normalize_price(anchor + idx * spacing)
                 levels.append(DesiredLevel(
                     side=SELL_STOP, index=idx, price=price,
-                    tp=spec.normalize_price(price - tp_distance) if tp_distance else 0.0,
+                    tp=0.0,                 # no individual TP: the basket exits
                     sl=spec.normalize_price(price + sl_distance) if sl_distance else 0.0,
                     comment=level_comment(self.cycle.cycle_id, SELL, idx),
                     placeable=price <= tick.bid - offset,
                 ))
         return levels
-
-    def tp_distance(self, snap):
-        """
-        Individual TP in price units, or 0 for the basket architecture.
-
-        0 is the default and the point of the strategy: a triggered level is
-        NOT an independent trade with its own target, it is one leg of a basket
-        the exit engine closes as a whole. The other modes exist for anyone who
-        deliberately wants per-trade exits back.
-        """
-        mode = snap["tp_mode"]
-        if mode == "none":
-            return 0.0
-        if mode == "levels":
-            return int(snap["tp_levels"]) * float(snap["ladder_spacing"])
-        if mode == "distance":
-            return float(snap["tp_distance"])
-        pips = {"1_pip": 1, "2_pips": 2, "3_pips": 3, "4_pips": 4, "5_pips": 5}
-        return self.spec.pips_to_price(pips.get(mode, 1))
-
-    # ============================================================ exit engine
-    def exit_config(self, snap):
-        """Build the exit engine's configuration from the live settings."""
-        cfg = ExitConfig()
-        for key in cfg.as_dict():
-            value = snap.get(f"exit_{key}")
-            if value is not None:
-                setattr(cfg, key, type(getattr(cfg, key))(value))
-        return cfg
-
-    def money_per_level(self, snap):
-        """Account currency one ladder level is worth at the configured lot."""
-        if not self.spec:
-            return 0.0
-        return self.spec.money_per_price_unit(snap["lot_size"]) * \
-            float(snap["ladder_spacing"])
 
     # ============================================================ the basket
     # The cycle - not the individual trade - is the unit of management. Every
@@ -657,28 +609,22 @@ class RollingLadderEngine:
             "drawdown": self.get_cycle_drawdown(cid),
         }
 
-    def evaluate_exit(self, snap, tick, positions):
+    def mark_to_market(self, tick, positions=None):
         """
-        Score the CYCLE, not any single trade.
+        Refresh the basket's floating P/L from what MT5 reports, every pass.
 
-        The exit engine only ever sees the basket's combined P/L: a BUY leg
-        sitting at -1.20 while three SELL legs sit at +2.40 is a basket at
-        +1.20, and that is the number the decision is made on. No position is
-        ever closed for being individually profitable or individually losing.
+        This is the only number the normal exit reads: a BUY leg at -1.20 while
+        three SELL legs sit at +2.40 is a basket at +1.20. No position is ever
+        closed for being individually profitable or individually losing.
         """
         if self.sequence is None:
-            return None
-        basket = self.cycle_positions(self.cycle.cycle_id, positions)
-        self.sequence.update_price(tick.mid, ts=tick.time or self.clock())
-        self.sequence.update_pnl(self.get_cycle_floating_pnl(
-            self.cycle.cycle_id, basket))
-        self.exit_engine.config = self.exit_config(snap)
-        self.assessment = self.exit_engine.assess(
-            self.sequence,
-            money_per_level=self.money_per_level(snap),
-            has_exposure=bool(basket),
-        )
-        return self.assessment
+            return 0.0
+        legs = self.cycle_positions(self.cycle.cycle_id, positions)
+        if tick is not None:
+            self.sequence.update_price(tick.mid)
+        floating = self.get_cycle_floating_pnl(self.cycle.cycle_id, legs)
+        self.sequence.update_pnl(floating)
+        return floating
 
     # ================================================================= risk
     def risk_check(self, snap, tick, positions, orders):
@@ -886,12 +832,7 @@ class RollingLadderEngine:
         if cycle_id == self.cycle.cycle_id:
             self.cycle.realized += trade.profit
 
-        # Only money decides: a TP close that still lost (a gapped fill, say)
-        # must not count toward the profit cycle.
         is_win = trade.profit > 0
-        if is_win and cycle_id == self.cycle.cycle_id:
-            self.cycle.tp_count += 1
-            self.total_tp += 1
 
         if self.sequence is not None and cycle_id == self.cycle.cycle_id:
             # A level can fill and hit its TP inside a single poll, so it never
@@ -902,8 +843,9 @@ class RollingLadderEngine:
                                        trade.price_close, trade.profit,
                                        reason=trade.reason, ts=trade.time_close)
 
-        event = "TP_HIT" if trade.reason == "TP" else (
-            "SL_HIT" if trade.reason == "SL" else "POSITION_CLOSED")
+        # There are no individual take profits: a leg only closes on its stop
+        # loss (if one is configured) or with the basket.
+        event = "SL_HIT" if trade.reason == "SL" else "POSITION_CLOSED"
         self._event(event,
                     f"{trade.side} level {index:+d} {trade.price_open} -> "
                     f"{trade.price_close} = {trade.profit:+.2f}",
@@ -926,14 +868,8 @@ class RollingLadderEngine:
         """
         Decide whether this cycle is over, and drive the transition.
 
-        Two independent authorities:
-
-          1. the risk manager, which force-closes a cycle that has drawn down
-             past its limit - a loss guard, never a profit target;
-          2. the exit engine, which reads continuation / reversal / exhaustion
-             from the trigger sequence and the price path.
-
-        There is deliberately no "N trades" and no "X dollars" branch here.
+        Hard risk first, then the one normal exit: the basket's floating P/L
+        reaching BASKET_PROFIT_TARGET.
 
         Returns "pending" while a close is still being verified, "restarted"
         once the next cycle is live (the caller then re-reads state and deploys
@@ -948,10 +884,10 @@ class RollingLadderEngine:
             if not self.cycle_active:
                 return self._advance_reentry(snap, tick, positions, orders)
 
-            assessment = self.evaluate_exit(snap, tick, positions)
-            basket = self.sequence.basket_pnl if self.sequence else 0.0
-            reason_code, detail = self._exit_reason(snap, assessment, basket,
-                                                    positions)
+            # Live basket P/L, refreshed every pass: the exit reacts to the
+            # tick, not to a candle close or any other signal.
+            floating = self.mark_to_market(tick, positions)
+            reason_code, detail = self._exit_reason(snap, floating, positions)
             if reason_code is None:
                 return False
 
@@ -968,7 +904,6 @@ class RollingLadderEngine:
                 "forced": reason_code.startswith("RISK"),
                 "kind": reason_code,
                 "reason": detail,
-                "assessment": assessment,
                 "attempts": 0,
                 "context": {
                     "exit_price": tick.mid if tick else "",
@@ -981,27 +916,27 @@ class RollingLadderEngine:
                     "open_sells_at_exit": len([p for p in positions
                                                if p.side == SELL]),
                     "pending_orders_at_exit": len(orders),
-                    "floating_pnl_at_exit": sum(p.profit for p in positions),
+                    "floating_pnl_at_exit": floating,
                 },
             }
             return self._advance_close(snap, positions, orders)
 
-    def _exit_reason(self, snap, assessment, basket, positions):
+    def _exit_reason(self, snap, floating, positions):
         """
         Decide whether the cycle ends, and name the reason.
 
         Priority, highest first:
-          1. hard risk - drawdown, then cycle timeout;
-          2. the adaptive exit engine (directional / reversal / extended);
-          3. the profit-recovery fallback, so a basket that quietly came good
-             is not held forever waiting for a scenario that never arrives.
+          1. hard risk - cycle drawdown, then cycle duration. These are
+             emergency protection and override everything below;
+          2. the one normal strategy exit: the basket's total floating P/L
+             reaching BASKET_PROFIT_TARGET.
 
         Returns (reason_code, detail) or (None, "") to keep the cycle running.
         """
         # --- 1. hard risk ----------------------------------------------------
         max_dd = float(snap["max_cycle_drawdown"])
-        if max_dd > 0 and basket <= -abs(max_dd):
-            return RISK_DRAWDOWN, f"cycle drawdown limit hit ({basket:+.2f})"
+        if max_dd > 0 and floating <= -abs(max_dd):
+            return RISK_DRAWDOWN, f"cycle drawdown limit hit ({floating:+.2f})"
 
         max_minutes = float(snap["max_cycle_duration_minutes"])
         age = self.clock() - self.cycle.started_at
@@ -1010,55 +945,14 @@ class RollingLadderEngine:
             return RISK_TIMEOUT, (f"cycle open for {age / 60:.0f} min "
                                   f"(limit {max_minutes:.0f}) - closing out")
 
-        # --- 2. the strategy's own reading ------------------------------------
-        if assessment is not None and assessment.decision == EXIT:
-            return (assessment.scenario or "EXIT_ENGINE"), assessment.reason
-
-        # --- 3. profit recovery fallback --------------------------------------
-        code, detail = self._profit_fallback(snap, assessment, basket)
-        if code:
-            return code, detail
+        # --- 2. the normal exit ----------------------------------------------
+        # One source of truth for the target, read live every pass. There is no
+        # candle wait, no confirmation window and no second condition.
+        target = float(snap["basket_profit_target"])
+        if target > 0 and positions and floating >= target:
+            return BASKET_PROFIT_TARGET, (f"basket floating P/L {floating:+.2f} "
+                                          f"reached the {target:+.2f} target")
         return None, ""
-
-    def _profit_fallback(self, snap, assessment, basket):
-        """
-        A basket that has recovered into confirmed profit is taken, rather than
-        held indefinitely waiting for a scenario that may never come.
-
-        This is NOT a dollar target: the buffer is a fraction of what one ladder
-        level is worth, so it scales with lot size and spacing, and the profit
-        has to hold for a confirmation period before it counts. Strong
-        continuation still wins - a run that is working is not cut short for a
-        few cents.
-        """
-        if not snap["profit_fallback_enabled"]:
-            self._profit_since = None
-            return None, ""
-        if self.sequence is None or self.sequence.total_triggers == 0:
-            return None, ""
-
-        buffer_money = float(snap["profit_fallback_buffer_levels"]) * \
-            self.money_per_level(snap)
-        if basket < buffer_money or buffer_money <= 0:
-            self._profit_since = None
-            return None, ""
-
-        now = self.clock()
-        if self._profit_since is None:
-            self._profit_since = now
-            return None, ""
-
-        held = now - self._profit_since
-        if held < float(snap["profit_confirmation_seconds"]):
-            return None, ""
-
-        guard = float(snap["profit_fallback_continuation_guard"])
-        if assessment is not None and assessment.continuation_score >= guard:
-            return None, ""          # the move is still working; let it run
-
-        return PROFIT_FALLBACK, (f"basket recovered to {basket:+.2f} "
-                                 f"(buffer {buffer_money:.2f}) and held for "
-                                 f"{held:.0f}s with no primary exit")
 
     def _advance_close(self, snap, positions, orders):
         """
@@ -1147,7 +1041,6 @@ class RollingLadderEngine:
         total = self.cycle.realized
         lost = total < 0
         sequence = self.sequence
-        assessment = info["assessment"]
 
         if lost:
             self.consecutive_losing_cycles += 1
@@ -1163,7 +1056,7 @@ class RollingLadderEngine:
 
         self._event("CYCLE_LOSS" if lost else "CYCLE_COMPLETED",
                     f"Cycle #{cid}: {self.cycle.trades} triggers, "
-                    f"{self.cycle.tp_count} TPs, P/L {total:+.2f} "
+                    f"P/L {total:+.2f} "
                     f"[{info['kind']}] {info['reason']}",
                     cycle_id=cid, profit=total,
                     cycle_profit=total, daily_profit=self.daily_profit,
@@ -1184,7 +1077,7 @@ class RollingLadderEngine:
                     f"{_seconds(wait)}.",
                     cycle_id=cid, status="COOLDOWN")
         self.save()
-        self._emit("cycle_complete", closed_cycle, sequence, assessment, total,
+        self._emit("cycle_complete", closed_cycle, sequence, total,
                    info["reason"], info["kind"], lost, duration,
                    self.max_cycle_id + 1, info.get("context") or {}, wait)
         return "pending"
@@ -1436,8 +1329,7 @@ class RollingLadderEngine:
             "spread": tick.spread if tick else None,
             "spacing": snap["ladder_spacing"],
             "depth": snap["ladder_depth"],
-            "tp_distance": self.tp_distance(snap) if self.spec else snap["tp_distance"],
-            "tp_mode": snap["tp_mode"],
+            "basket_profit_target": snap["basket_profit_target"],
             "lot": snap["lot_size"],
             # --- CURRENT MT5 STATE ---
             "positions": len(positions),
@@ -1462,13 +1354,11 @@ class RollingLadderEngine:
             # --- P/L, kept distinct ---
             "floating_pnl": floating,
             "cycle_id": self.cycle.cycle_id,
-            "tp_count": self.cycle.tp_count,
             "cycle_triggers": self.cycle.trades,
             "cycle_profit": round(self.cycle.realized + floating, 2),
             "cycle_realized": self.cycle.realized,
             "floating": floating,
             "daily_profit": self.daily_profit,
-            "total_tp": self.total_tp,
             "total_trades": self.total_trades,
             "block_reason": self.block_reason,
             "spread_blocked": self.spread_blocked,
@@ -1488,17 +1378,5 @@ class RollingLadderEngine:
             data["cycle_total_pnl"] = self.sequence.realized_pnl + floating
             data["cycle_profit"] = data["cycle_total_pnl"]
             data["cycle_age_seconds"] = self.clock() - self.cycle.started_at
-        # `engine_state` is what the bot is DOING (the cycle state machine);
-        # `market_state` is what the exit engine is SEEING. They are different
-        # questions and are reported under different names.
         data["engine_state"] = self.state
-        if self.assessment is not None:
-            data.update(self.assessment.as_dict())
-            data["market_state"] = self.assessment.state
-        else:
-            data.update({"exit_score": 0.0, "decision": CONTINUE,
-                         "momentum_score": 0.0, "reversal_score": 0.0,
-                         "exhaustion_score": 0.0, "continuation_score": 0.0,
-                         "reason": "", "phase": self.state})
-            data["market_state"] = self.state
         return data

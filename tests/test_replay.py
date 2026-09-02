@@ -103,11 +103,11 @@ t.check("a reversal series completes cycles", len(res.cycles) > 0,
 t.check("cycle endings are attributed", bool(res.exit_reasons),
         str(res.exit_reasons))
 t.check("endings name an explicit reason, never a trade count",
-        all(any(tag in k for tag in ("SCENARIO_", "PROFIT_FALLBACK", "RISK_",
-                                     "EXIT_ENGINE"))
+        all(k in ("BASKET_PROFIT_TARGET", "RISK_DRAWDOWN", "RISK_TIMEOUT",
+                  "RISK_SPREAD", "MANUAL_STOP", "OTHER_RISK_EXIT")
             for k in res.exit_reasons), str(res.exit_reasons))
-t.check("cycle rows carry the sequence",
-        all({"buy", "sell", "triggers", "exit_score"} <= set(c)
+t.check("cycle rows carry the sequence and the basket at the exit",
+        all({"buy", "sell", "triggers", "depth", "floating_at_exit"} <= set(c)
             for c in res.cycles))
 
 t.section("CHOP IS SURVIVABLE")

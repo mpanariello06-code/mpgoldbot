@@ -15,8 +15,6 @@ SUITES = [
     "test_price_utils.py",
     "test_broker.py",
     "test_settings.py",
-    "test_exit_engine.py",
-    "test_scenarios.py",
     "test_basket.py",
     "test_ladder_engine.py",
     "test_continuous.py",

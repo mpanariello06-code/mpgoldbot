@@ -8,7 +8,7 @@ from harness import Suite, use_stub_mt5
 use_stub_mt5()
 
 import config as cfg
-from runtime_settings import TP_MODES, RuntimeSettings, SettingError
+from runtime_settings import RuntimeSettings, SettingError
 
 t = Suite("settings")
 TMP = pathlib.Path("/tmp/settings_tests")
@@ -20,25 +20,21 @@ t.section("DEFAULTS (the values from .env / the spec)")
 rs = RuntimeSettings(cfg.runtime_defaults(), PATH)
 s = rs.snapshot()
 t.check("ladder defaults",
-        (s["ladder_spacing"], s["ladder_depth"], s["tp_mode"], s["tp_levels"],
-         s["lot_size"]) == (0.30, 5, "none", 1, 0.01),
-        str({k: s[k] for k in ("ladder_spacing", "ladder_depth", "tp_mode",
-                               "tp_levels", "lot_size")}))
-t.check("a 1-level TP equals the ladder spacing, if per-trade TPs are used",
-        s["tp_levels"] * s["ladder_spacing"] == 0.30)
+        (s["ladder_spacing"], s["ladder_depth"], s["basket_profit_target"],
+         s["lot_size"]) == (0.30, 5, 2.00, 0.01),
+        str({k: s[k] for k in ("ladder_spacing", "ladder_depth",
+                               "basket_profit_target", "lot_size")}))
+t.check("the basket target is the ONE normal exit setting",
+        s["basket_profit_target"] == 2.00 and
+        not any(k.startswith(("tp_", "exit_", "profit_fallback")) for k in s),
+        str([k for k in s if k.startswith(("tp_", "exit_", "profit_"))]))
 t.check("risk defaults",
         (s["max_open_positions"], s["max_pending_orders"], s["max_spread"],
          s["direction_filter"]) == (12, 10, 0.50, "off"),
         str({k: s[k] for k in ("max_open_positions", "max_pending_orders",
                                "max_spread", "direction_filter")}))
-t.check("TP mode defaults to NONE - the basket has no individual TPs",
-        s["tp_mode"] == "none", s["tp_mode"])
-t.check("per-trade TP modes are still available for anyone who wants them",
-        set(("levels", "distance", "1_pip")) <= set(TP_MODES), str(TP_MODES))
-t.check("adaptive exit defaults",
-        (s["exit_threshold_exit"], s["exit_threshold_monitor"],
-         s["exit_w_reversal"]) == (70.0, 40.0, 0.75),
-        str({k: v for k, v in s.items() if k.startswith("exit_")}))
+t.check("there is no take-profit setting at all",
+        not any("tp" == k[:2] for k in s), str([k for k in s if k[:2] == "tp"]))
 t.check("no trade-count or dollar exit setting exists",
         not any(k in s for k in ("profit_cycle_target", "cycle_take_profit_money",
                                  "target_profit_usd")))
@@ -53,10 +49,10 @@ t.check("no secrets in the json",
 t.section("VALIDATION")
 for key, bad in [("ladder_spacing", "abc"), ("ladder_spacing", 0),
                  ("ladder_depth", 0), ("ladder_depth", 500),
-                 ("tp_distance", -1), ("lot_size", 0),
-                 ("max_open_positions", 0), ("tp_mode", "6_pips"),
+                 ("basket_profit_target", -1), ("lot_size", 0),
+                 ("max_open_positions", 0), ("basket_profit_target", "abc"),
                  ("roll_mode", "sideways"), ("direction_filter", "maybe"),
-                 ("exit_threshold_exit", 0), ("max_spread", "wide"),
+                 ("max_spread", "wide"),
                  ("cycle_close_positions", "perhaps"),
                  ("cooldown_after_loss_minutes", 99999)]:
     t.raises(f"reject {key}={bad!r}", SettingError, rs.set, key, bad)
@@ -65,18 +61,15 @@ t.check("nothing was applied by the rejected values",
 
 t.raises("lot above max lot is refused", SettingError, rs.set, "lot_size", 5.0)
 t.raises("max lot below lot is refused", SettingError, rs.set, "max_lot_size", 0.001)
-t.raises("exit score below the monitor score is refused", SettingError,
-         rs.set, "exit_threshold_exit", 10.0)
-t.raises("monitor score above the exit score is refused", SettingError,
-         rs.set, "exit_threshold_monitor", 90.0)
 t.check("lot/max lot unchanged after the rejects",
         (rs.get("lot_size"), rs.get("max_lot_size")) == (0.01, 0.10))
 
 t.section("APPLY + PERSIST")
-changed, msg, old, new = rs.set("tp_mode", "2_pips")
-t.check("value applied", changed and rs.get("tp_mode") == "2_pips", msg)
-t.check("persisted", json.load(open(PATH))["tp_mode"] == "2_pips")
-t.check("re-setting the same value is a no-op", not rs.set("tp_mode", "2_pips")[0])
+changed, msg, old, new = rs.set("basket_profit_target", 3.50)
+t.check("value applied", changed and rs.get("basket_profit_target") == 3.50, msg)
+t.check("persisted", json.load(open(PATH))["basket_profit_target"] == 3.50)
+t.check("re-setting the same value is a no-op",
+        not rs.set("basket_profit_target", 3.50)[0])
 rs.set("ladder_spacing", 0.5)
 rs.set("max_open_positions", 8)
 t.check("floats and ints keep their type",
@@ -87,7 +80,8 @@ t.check("booleans parse from text", rs.set("m5_candle_reset", "true")[0] and
 
 rs2 = RuntimeSettings(cfg.runtime_defaults(), PATH)
 t.check("settings survive a restart",
-        rs2.get("tp_mode") == "2_pips" and rs2.get("ladder_spacing") == 0.5)
+        rs2.get("basket_profit_target") == 3.50 and
+        rs2.get("ladder_spacing") == 0.5)
 
 t.section("DISPLAY")
 t.check("prices shown plainly", RuntimeSettings.display("ladder_spacing", 0.30) == "0.3")
@@ -96,20 +90,20 @@ t.check("money shown with a currency",
 t.check("zero money reads as OFF",
         RuntimeSettings.display("max_cycle_drawdown", 0) == "OFF")
 t.check("booleans read as ON/OFF", RuntimeSettings.display("m5_candle_reset", True) == "ON")
-t.check("tp mode labelled", RuntimeSettings.display("tp_mode", "3_pips") == "3 PIPS")
+t.check("the basket target reads as money",
+        RuntimeSettings.display("basket_profit_target", 2.0) == "$2.00")
 t.check("roll mode labelled", RuntimeSettings.display("roll_mode", "extend") == "ROLLING")
 t.check("direction labelled",
         "BUY" in RuntimeSettings.display("direction_filter", "buy_bias"))
 t.check("pip size auto", RuntimeSettings.display("pip_points", 0) == "AUTO")
 
 t.section("CONFIRMATION FLAGS")
-for key in ("tp_mode", "tp_levels", "tp_distance", "lot_size", "ladder_spacing",
+for key in ("basket_profit_target", "lot_size", "ladder_spacing",
             "ladder_depth", "max_open_positions", "stop_loss_distance",
-            "max_daily_drawdown", "exit_threshold_exit", "direction_filter"):
+            "max_daily_drawdown", "direction_filter"):
     t.check(f"{key} needs confirmation", RuntimeSettings.needs_confirmation(key))
 for key in ("max_spread", "pip_points", "order_max_age_seconds",
-            "cooldown_after_loss_minutes", "exit_w_reversal",
-            "exit_threshold_monitor"):
+            "cooldown_after_loss_minutes", "cycle_reentry_cooldown_seconds"):
     t.check(f"{key} applies directly", not RuntimeSettings.needs_confirmation(key))
 
 t.section("RESET")

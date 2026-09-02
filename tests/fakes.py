@@ -72,7 +72,6 @@ class CycleRecord:
     reason: str
     kind: str
     lost: bool
-    assessment: object = None
     sequence: object = None
     duration: float = 0.0
     next_id: int = None
@@ -101,11 +100,11 @@ class Recorder:
             "closed": lambda t, i, c, w: self.closed.append((t, i, c.cycle_id, w)),
             "cycle_started": lambda c, a: self.cycles.append(
                 CycleRecord("start", c.cycle_id, 0.0, "", "", False)),
-            "cycle_complete": lambda c, seq, assessment, tot, reason, kind, lost,
+            "cycle_complete": lambda c, seq, tot, reason, kind, lost,
                                      duration=0.0, next_id=None, context=None,
                                      next_ladder_seconds=0.0:
                 self.cycles.append(CycleRecord("complete", c.cycle_id, tot,
-                                               reason, kind, lost, assessment,
+                                               reason, kind, lost,
                                                seq, duration, next_id,
                                                context or {},
                                                next_ladder_seconds)),

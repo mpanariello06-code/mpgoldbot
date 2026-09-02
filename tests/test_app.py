@@ -17,8 +17,11 @@ os.environ.update({
     "TRADING_MODE": "PAPER", "AUTO_START_TRADING": "false",
     "TELEGRAM_BOT_TOKEN": "", "POLL_SECONDS": "0.05",
     "ACCOUNT_SNAPSHOT_INTERVAL": "1", "LADDER_SPACING": "0.30",
-    "TP_MODE": "distance", "TP_DISTANCE": "0.20", "LADDER_DEPTH": "5",
+    "LADDER_DEPTH": "5",
     "PAPER_START_BALANCE": "1000",
+    # the cooldown is exercised properly in test_basket; here it only needs to
+    # be short enough that the suite does not spend ten seconds waiting
+    "CYCLE_REENTRY_COOLDOWN": "1",
 })
 
 import MetaTrader5 as mt5
@@ -69,24 +72,21 @@ for name in ("trades.csv", "events.csv", "account_snapshots.csv",
 header = open(TMP / "rolling_ladder_events.csv").readline().strip().split(",")
 for column in ("timestamp", "symbol", "cycle_id", "candle_time", "event_type",
                "side", "entry_price", "ladder_price", "ladder_index",
-               "buy_trigger_count", "sell_trigger_count", "consecutive_buy",
-               "consecutive_sell", "last_side", "previous_side",
-               "direction_changes", "buy_sell_ratio", "sell_buy_ratio",
-               "price_distance_traveled", "time_since_previous_trigger",
-               "basket_pnl", "basket_drawdown", "momentum_score",
-               "reversal_score", "exhaustion_score", "exit_score", "action",
-               "reason"):
+               "buy_trigger_count", "sell_trigger_count", "last_side",
+               "previous_side", "direction_changes", "ladder_depth_used",
+               "price_distance_traveled", "net_levels",
+               "basket_floating_pnl", "basket_realized_pnl", "basket_pnl",
+               "basket_drawdown", "basket_profit_target", "action", "reason"):
     t.check(f"event log has {column!r}", column in header)
 cycle_header = open(TMP / "rolling_ladder_cycles.csv").readline().strip().split(",")
 for column in ("cycle_id", "triggers", "buy_triggers", "sell_triggers",
-               "imbalance", "realized_pnl", "exit_score", "end_kind",
-               "end_reason",
+               "realized_pnl", "end_kind", "end_reason",
                # the state that caused the exit, not the empty state after it
                "initial_price", "exit_price", "positions_at_exit",
                "open_buys_at_exit", "open_sells_at_exit",
                "pending_orders_at_exit", "floating_pnl_at_exit",
-               "peak_pnl", "drawdown", "exit_scenario", "duration_seconds",
-               "continuation_score", "directional_score", "extended_score"):
+               "peak_pnl", "drawdown", "duration_seconds",
+               "basket_profit_target", "ladder_depth_used", "net_levels"):
     t.check(f"cycle log has {column!r}", column in cycle_header)
 events = [e["event_type"] for e in rows("events.csv")]
 t.check("startup recorded", "BOT_STARTED" in events and "MT5_CONNECTED" in events,
@@ -149,36 +149,44 @@ t.check("trade recorded with ladder context",
         str([r for r in rows("trades.csv") if r["reason"] == "OPEN"][-1:]))
 
 pos = app.bot.positions()[0]
-mt5.set_price(round(pos.tp, 2))
-t.check("TP executed", wait_for(lambda: not app.bot.positions()))
+t.check("the triggered position has NO take profit", pos.tp == 0, str(pos.tp))
+# a level does not close on its own any more; the whole basket exits together
+mt5.set_price(round(pos.price_open + 2.10, 2))     # basket well past the target
+t.check("the basket exited on its target",
+        wait_for(lambda: not app.bot.positions()),
+        f"{len(app.bot.positions())} positions")
 t.check("NO per-TP Telegram message", not any("TP HIT" in n for n in notes),
         str(notes))
+t.check("the close names the basket target",
+        any("BASKET PROFIT" in n for n in notes), str(notes[-1:]))
 t.check("entries are still recorded in full",
         any(r["event_type"] == "ORDER_TRIGGERED"
             for r in rows("rolling_ladder_events.csv")))
 events = rows("rolling_ladder_events.csv")
-t.check("TP recorded in the ladder log",
-        any(r["event_type"] == "TP_HIT" for r in events))
+t.check("no TP event can be logged any more",
+        not any(r["event_type"] == "TP_HIT" for r in events))
 triggered = [r for r in events if r["event_type"] == "ORDER_TRIGGERED"]
 t.check("trigger rows carry the sequence state",
         triggered and triggered[-1]["buy_trigger_count"] != "",
         str(triggered[-1] if triggered else None))
-t.check("trigger rows carry the exit score",
-        triggered and triggered[-1]["exit_score"] != "")
+t.check("trigger rows carry the basket P/L and its target",
+        triggered and triggered[-1]["basket_floating_pnl"] != ""
+        and triggered[-1]["basket_profit_target"] != "")
 t.check("close recorded in trades.csv",
         any(r["reason"] == "CLOSE" for r in rows("trades.csv")))
 t.check("paper balance grew", app.bot.account().balance > 1000.0,
         str(app.bot.account().balance))
-t.check("ladder rolled forward",
+t.check("the next ladder follows the cooldown",
         wait_for(lambda: len([o for o in app.bot.orders()
-                              if o.side == BUY_STOP]) == 5))
+                              if o.side == BUY_STOP]) == 5, timeout=8.0),
+        f"{len(app.bot.orders())} orders")
 
 t.section("STATUS SNAPSHOT")
 status = app.bot.status()
 for key in ("state", "lifecycle", "mode", "symbol", "timeframe", "bid", "spread",
-            "spacing", "tp_distance", "lot", "positions", "orders", "cycle_id",
-            "buy_triggers", "sell_triggers", "imbalance", "exit_score",
-            "momentum_score", "reversal_score", "exhaustion_score", "decision",
+            "spacing", "lot", "positions", "orders", "cycle_id",
+            "basket_profit_target",
+            "basket_floating_pnl", "basket_realized_pnl", "basket_net_pnl",
             "cycle_profit", "daily_profit", "last_update"):
     t.check(f"status carries {key}", key in status and status[key] is not None,
             str(status.get(key)))

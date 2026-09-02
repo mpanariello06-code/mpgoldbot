@@ -64,7 +64,7 @@ t.check("announces the wait, not a cycle that is not deployed yet",
 t.check("names the exit", "Exit: Reversal" in msg, msg)
 t.check("does not list individual trades", msg.count("Entry") == 0)
 t.check("stays compact", len(msg) < 260, str(len(msg)))
-n.cycle_closed("XAUUSDs", 13, -0.80, 4, 1, "Exhaustion", "BUY", 60, 14)
+n.cycle_closed("XAUUSDs", 13, -0.80, 4, 1, "RISK DRAWDOWN", "BUY", 60, 14)
 t.check("a losing cycle is marked", sent[1].startswith("🔴"), sent[1][:12])
 
 t.section("EXIT -> COOLDOWN -> NEW LADDER: EXACTLY TWO MESSAGES")
@@ -93,38 +93,14 @@ t.check("a long wait is written for a person, not in raw seconds",
          notifications._seconds(930)) == ("10s", "15m", "15m 30s"),
         str([notifications._seconds(v) for v in (10, 900, 930)]))
 
-t.section("STATE CHANGES ONLY ON TRANSITION")
+t.section("THE SCENARIO MESSAGES ARE GONE")
 n, sent, clock = notifier()
-for _ in range(5):
-    n.state_change("XAUUSDs", 14, "REVERSAL_DETECTED", 2, 5, 2.5, "SELL")
-t.check("five identical readings -> one message", len(sent) == 1, str(len(sent)))
-t.check("reversal message has the dominance", "2.50x SELL" in sent[0], sent[0])
-t.check("suppressed count tracked", n.stats()["suppressed"] == 4,
-        str(n.stats()))
-for _ in range(3):
-    n.state_change("XAUUSDs", 14, "MOMENTUM_CONTINUATION", 6, 0, 6.0, "BUY")
-t.check("a genuine transition does send", len(sent) == 2, str(len(sent)))
-t.check("continuation message names the direction",
-        "Strong BUY momentum" in sent[1], sent[1])
-clock.advance(61)
-for _ in range(10):
-    n.state_change("XAUUSDs", 14, "REVERSAL_DETECTED", 2, 7, 3.5, "SELL")
-    n.state_change("XAUUSDs", 14, "MOMENTUM_CONTINUATION", 8, 2, 4.0, "BUY")
-t.check("a cycle that flip-flops is capped at two state messages",
-        len(sent) == 2, str(len(sent)))
-n.state_change("XAUUSDs", 16, "REVERSAL_DETECTED", 1, 4, 4.0, "SELL")
-t.check("a new cycle gets its own allowance", len(sent) == 3, str(len(sent)))
-n.state_change("XAUUSDs", 16, "MOMENTUM_EXHAUSTION", 4, 4, 1.0, "BUY")
-t.check("fading momentum is not announced (it shows in the cycle close)",
-        len(sent) == 3, str(sent[-1:]))
-before = len(sent)
-n.state_change("XAUUSDs", 15, "MOMENTUM_CONTINUATION", 1, 0, 1.0, "BUY")
-t.check("an ordinary opening run in a new cycle is not news",
-        len(sent) == before, str(sent[-1:]))
-
-n, sent, clock = notifier(telegram_state_alerts=False)
-n.state_change("XAUUSDs", 1, "REVERSAL_DETECTED", 2, 5, 2.5, "SELL")
-t.check("state alerts can be switched off", not sent)
+for name in ("state_change", "reversal_alert", "momentum_alert"):
+    t.check(f"{name}() no longer exists", not hasattr(n, name))
+t.check("nothing announces a reversal or continuation any more",
+        not any(w in open(notifications.__file__).read().upper()
+                for w in ("REVERSAL DETECTED", "STRONG {DOMINANT} MOMENTUM")),
+        "scenario text still present")
 
 t.section("ERRORS ARE DEDUPLICATED")
 n, sent, clock = notifier()
@@ -153,8 +129,9 @@ status = {"symbol": "XAUUSDs", "cycle_id": 18, "state": "LADDER_ACTIVE",
           "historical_buy_triggers": 3, "historical_sell_triggers": 1,
           "current_pending_buys": 4, "current_pending_sells": 4,
           "current_open_buys": 2, "current_open_sells": 0,
-          "last_side": "BUY", "momentum_score": 0.8, "positions": 2,
-          "orders": 8, "floating_pnl": 1.18, "realized_pnl": 0.42}
+          "last_side": "BUY", "positions": 2, "ladder_depth_used": 6,
+          "orders": 8, "cycle_active": True, "basket_profit_target": 2.00,
+          "basket_floating_pnl": 1.18, "basket_realized_pnl": 0.42}
 n, sent, clock = notifier()
 n.periodic_status(status)
 t.check("no heartbeat right after startup", not sent, str(sent))
@@ -164,9 +141,12 @@ t.check("the first heartbeat arrives one interval in", len(sent) == 1)
 t.check("status separates live state from history",
         all(x in sent[0] for x in ("Cycle: #18", "Pending: 4B / 4S",
                                    "Open: 2B / 0S", "Triggers so far: 3B / 1S",
-                                   "Momentum: STRONG")), sent[0])
+                                   "Ladder depth: 6")), sent[0])
 t.check("floating and realized are reported apart",
-        "Floating: +1.18" in sent[0] and "Realized: +0.42" in sent[0], sent[0])
+        "Floating basket: +1.18" in sent[0] and "Realized: +0.42" in sent[0],
+        sent[0])
+t.check("the basket is shown against its target",
+        "+1.18 / 2.00" in sent[0], sent[0])
 for _ in range(50):
     n.periodic_status(status)
 t.check("no repeats inside the interval", len(sent) == 1, str(len(sent)))

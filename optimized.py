@@ -567,16 +567,14 @@ class LadderBot:
         else:
             data.update({"lifecycle": state, "engine_state": State.IDLE,
                          "positions": 0, "orders": 0,
-                         "cycle_id": 0, "tp_count": 0, "cycle_profit": 0.0,
+                         "cycle_id": 0, "cycle_profit": 0.0,
                          "daily_profit": 0.0, "spread": None, "bid": None,
                          "ask": None})
             snap = self.settings.snapshot()
             data.update({"spacing": snap["ladder_spacing"],
                          "depth": snap["ladder_depth"],
-                         "tp_mode": snap["tp_mode"],
-                         "tp_distance": snap["tp_distance"],
                          "lot": snap["lot_size"],
-                         "exit_score": 0.0, "decision": "CONTINUE",
+                         "basket_profit_target": snap["basket_profit_target"],
                          "timeframe": snap["timeframe"]})
         return data
 
@@ -618,8 +616,8 @@ class LadderBot:
             log("=" * 70)
             log(f"ROLLING LADDER SCALPER: {SYMBOL} {TIMEFRAME} [{self.broker.name}]")
             log(f"Spacing {snap['ladder_spacing']} | Depth {snap['ladder_depth']} "
-                f"| TP {snap['tp_mode']} | Lot {snap['lot_size']}")
-            log(f"Adaptive exit at score {snap['exit_threshold_exit']:g} | "
+                f"| Lot {snap['lot_size']}")
+            log(f"Basket target {snap['basket_profit_target']:.2f} | "
                 f"Max {snap['max_open_positions']} positions / "
                 f"{snap['max_pending_orders']} pendings / "
                 f"depth {snap['max_ladder_depth']}")
@@ -639,7 +637,6 @@ class LadderBot:
 
                     self._check_new_candle()
                     self.engine.step()
-                    self._state_alert()
 
                     self._sleep(POLL_SECONDS)
 
@@ -662,23 +659,6 @@ class LadderBot:
 
         if self.state != BotState.ERROR:
             self._set_state(BotState.STOPPED)
-
-    def _state_alert(self):
-        """
-        Announce a change of market state, once per transition.
-
-        The notifier drops repeats, so calling this every pass costs nothing and
-        the chat only hears about NORMAL -> REVERSAL and similar transitions.
-        """
-        engine = self.engine
-        if not (engine and engine.assessment and engine.sequence):
-            return
-        seq = engine.sequence
-        self.notifier.state_change(
-            symbol=SYMBOL, cycle_id=engine.cycle.cycle_id,
-            market_state=engine.assessment.state,
-            buys=seq.buy_triggers, sells=seq.sell_triggers,
-            imbalance=seq.imbalance, dominant=seq.dominant_side)
 
     def _check_new_candle(self):
         """
@@ -719,10 +699,10 @@ class LadderBot:
         """
         Every ladder event -> console + events.csv + rolling_ladder_events.csv.
 
-        The ladder row carries the full market state at the moment of the
-        event - trigger sequence, imbalance, momentum/reversal/exhaustion and
-        the exit score - so the exit rules can be re-fitted from the log later
-        instead of from memory.
+        The ladder row carries the state of the basket at that moment -
+        trigger counts, ladder depth, distance travelled and the basket's
+        floating/realized P/L - so behaviour can be measured from the log
+        rather than from memory.
         """
         noisy = event in ("ORDER_PLACED", "ORDER_CANCELLED")
         if not noisy or DIAGNOSTICS:
@@ -761,7 +741,7 @@ class LadderBot:
             "action": fields.get("status", ""),
             "reason": message,
         }
-        for key in ("cycle_id", "entry_price", "exit_price", "tp", "lot_size",
+        for key in ("cycle_id", "entry_price", "exit_price", "lot_size",
                     "spread", "order_ticket", "position_ticket", "profit",
                     "cycle_profit", "daily_profit"):
             if key in fields:
@@ -773,62 +753,37 @@ class LadderBot:
             row.update({
                 "buy_trigger_count": seq["buy_triggers"],
                 "sell_trigger_count": seq["sell_triggers"],
-                "consecutive_buy": seq["consecutive_buy"],
-                "consecutive_sell": seq["consecutive_sell"],
                 "last_side": seq["last_side"],
                 "previous_side": seq["previous_side"],
                 "direction_changes": seq["direction_changes"],
-                "buy_sell_ratio": seq["buy_sell_ratio"],
-                "sell_buy_ratio": seq["sell_buy_ratio"],
-                "imbalance": seq["imbalance"],
                 "ladder_depth_used": seq["ladder_depth_used"],
                 "price_distance_traveled": seq["price_distance_traveled"],
                 "net_levels": seq["net_levels"],
-                "efficiency": seq["efficiency"],
-                "time_since_previous_trigger": seq["time_since_last_trigger"],
-                "volatility": seq["volatility"],
+                "basket_floating_pnl": seq["basket_floating_pnl"],
+                "basket_realized_pnl": seq["basket_realized_pnl"],
                 "basket_pnl": seq["basket_pnl"],
                 "basket_drawdown": seq["basket_drawdown"],
+                "basket_profit_target": self.settings.get("basket_profit_target"),
             })
             row.setdefault("cycle_id", seq["cycle_id"])
-        if engine is not None and engine.assessment is not None:
-            a = engine.assessment
-            row.update({
-                "momentum_score": round(a.momentum_score, 3),
-                "continuation_score": round(a.continuation_score, 3),
-                "reversal_score": round(a.reversal_score, 3),
-                "exhaustion_score": round(a.exhaustion_score, 3),
-                "exit_score": round(a.exit_score, 1),
-                "decision": a.decision,
-                "market_state": a.state,
-            })
         CSV.log_ladder(event, digits=spec.digits if spec else 2, **row)
 
     def _on_entry(self, position, index, cycle):
         """
-        A level triggered: recorded in full, announced only if the operator
-        explicitly asked for per-entry pings (off by default - this strategy
-        would flood the chat).
+        A level triggered: recorded in the CSV, never announced.
+
+        This strategy triggers levels constantly and each one is just another
+        leg of the basket - there is nothing to tell anyone until the basket
+        closes.
         """
-        snap = self.settings.snapshot()
         spec = self.engine.spec
         self.csv.log_trade(
             symbol=SYMBOL, ticket=position.ticket, direction=position.side,
             volume=position.volume, reason="OPEN",
             entry_price=position.price_open, stop_loss=position.sl,
             take_profit=position.tp, magic=MAGIC, digits=spec.digits,
-            cycle_id=cycle.cycle_id, level=index, tp_mode=snap["tp_mode"],
-            tp_distance=self.engine.tp_distance(snap),
+            cycle_id=cycle.cycle_id, level=index,
             spread=self.engine.last_tick.spread if self.engine.last_tick else None,
-        )
-        if not snap.get("telegram_entry_alerts"):
-            return                        # the default: no per-entry messages
-        d = spec.digits
-        target = (f" → {position.tp:.{d}f}" if position.tp else " (basket)")
-        self.notify(
-            f"🟢 <b>LADDER ENTRY</b>  {position.side} {position.volume}\n"
-            f"{position.price_open:.{d}f}{target}  "
-            f"(cycle #{cycle.cycle_id}, level {index:+d})"
         )
 
     def _on_closed(self, trade, index, cycle, is_win):
@@ -840,13 +795,13 @@ class LadderBot:
             volume=trade.volume, reason="CLOSE", entry_price=trade.price_open,
             close_price=trade.price_close, profit=trade.profit, magic=MAGIC,
             digits=spec.digits, deal_id=f"{trade.ticket}-{int(trade.time_close)}",
-            cycle_id=cycle.cycle_id, level=index, tp_mode=snap["tp_mode"],
+            cycle_id=cycle.cycle_id, level=index,
         )
 
     def _on_cycle_started(self, cycle, anchor):
         log(f"🪜 Cycle #{cycle.cycle_id} anchored at {anchor}")
 
-    def _on_cycle_complete(self, cycle, sequence, assessment, total, reason,
+    def _on_cycle_complete(self, cycle, sequence, total, reason,
                            kind, lost, duration=0.0, next_cycle_id=None,
                            context=None, next_ladder_seconds=0.0):
         seq = sequence.snapshot() if sequence is not None else {}
@@ -869,12 +824,10 @@ class LadderBot:
             buy_triggers=seq.get("buy_triggers", ""),
             sell_triggers=seq.get("sell_triggers", ""),
             direction_changes=seq.get("direction_changes", ""),
-            imbalance=seq.get("imbalance", ""),
             ladder_depth_used=seq.get("ladder_depth_used", ""),
             net_levels=seq.get("net_levels", ""),
             path_levels=seq.get("path_levels", ""),
-            efficiency=seq.get("efficiency", ""),
-            tp_count=cycle.tp_count,
+            basket_profit_target=self.settings.get("basket_profit_target"),
             positions_at_exit=ctx.get("open_positions_at_exit", ""),
             open_buys_at_exit=ctx.get("open_buys_at_exit", ""),
             open_sells_at_exit=ctx.get("open_sells_at_exit", ""),
@@ -883,31 +836,19 @@ class LadderBot:
             realized_pnl=total,
             peak_pnl=seq.get("peak_pnl", ""),
             drawdown=seq.get("basket_drawdown", ""),
-            momentum_score=round(assessment.momentum_score, 3) if assessment else "",
-            continuation_score=round(assessment.continuation_score, 3) if assessment else "",
-            reversal_score=round(assessment.reversal_score, 3) if assessment else "",
-            exhaustion_score=round(assessment.exhaustion_score, 3) if assessment else "",
-            directional_score=round(assessment.directional_score, 3) if assessment else "",
-            extended_score=round(assessment.extended_score, 3) if assessment else "",
-            exit_score=round(assessment.exit_score, 1) if assessment else "",
-            market_state=assessment.state if assessment else "",
-            exit_scenario=assessment.scenario if assessment else "",
             end_kind=kind,
             end_reason=reason,
             daily_profit=self.engine.daily_profit if self.engine else "",
         )
 
         reason_word = {
-            "SCENARIO_1_DIRECTIONAL": "Directional move",
-            "SCENARIO_2_REVERSAL": "Reversal",
-            "SCENARIO_3_EXTENDED_LADDER": "Extended ladder",
-            "PROFIT_FALLBACK": "Profit fallback",
-            "RISK_DRAWDOWN": "Risk drawdown",
-            "RISK_TIMEOUT": "Risk timeout",
-            "RISK_SPREAD": "Risk spread",
-            "OTHER_RISK_EXIT": "Risk exit",
-            "EXIT_ENGINE": "Exit engine",
-        }.get(kind, kind.replace("_", " ").title())
+            "BASKET_PROFIT_TARGET": "BASKET PROFIT",
+            "RISK_DRAWDOWN": "RISK DRAWDOWN",
+            "RISK_TIMEOUT": "RISK TIMEOUT",
+            "RISK_SPREAD": "RISK SPREAD",
+            "MANUAL_STOP": "MANUAL STOP",
+            "OTHER_RISK_EXIT": "RISK EXIT",
+        }.get(kind, kind.replace("_", " "))
         self._cycles_closed = getattr(self, "_cycles_closed", 0) + 1
         wait = float(next_ladder_seconds or 0.0)
         log(f"🔄 Cycle #{cycle.cycle_id} closed ({reason_word}, {total:+.2f}) "
@@ -1010,17 +951,12 @@ class Application:
             f"{'  (simulated fills, no orders sent)' if cfg.TRADING_MODE == 'PAPER' else '  *** REAL ORDERS ***'}")
         log(f"Ladder: spacing {snap['ladder_spacing']} x depth {snap['ladder_depth']} "
             f"| first level {snap['first_level_offset']} | {snap['roll_mode']}")
-        tp_txt = ("NONE - the cycle is closed as one basket"
-                  if snap["tp_mode"] == "none"
-                  else f"{snap['tp_levels']} level(s) = "
-                       f"{snap['tp_levels'] * snap['ladder_spacing']:g}"
-                  if snap["tp_mode"] == "levels"
-                  else f"{snap['tp_mode']} ({snap['tp_distance']})")
-        log(f"TP: {tp_txt} | SL: {snap['stop_loss_distance'] or 'none'} | "
+        log(f"TP: none - no individual take profit on any ladder position | "
+            f"SL: {snap['stop_loss_distance'] or 'none'} | "
             f"Lot: {snap['lot_size']}")
-        log(f"Exit: adaptive (score >= {snap['exit_threshold_exit']:g}, "
-            f"monitor {snap['exit_threshold_monitor']:g}) - no trade count, "
-            f"no dollar target")
+        log(f"Exit: basket floating P/L >= "
+            f"{snap['basket_profit_target']:.2f} (the only normal exit), "
+            f"then a {snap['cycle_reentry_cooldown_seconds']:g}s cooldown")
         log(f"Risk: {snap['max_open_positions']} pos / "
             f"{snap['max_pending_orders']} pend / depth {snap['max_ladder_depth']} "
             f"/ spread {snap['max_spread']} / daily {snap['max_daily_drawdown']} "

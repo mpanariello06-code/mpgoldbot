@@ -8,8 +8,8 @@ use_stub_mt5()
 
 import config as cfg
 from broker import BUY, BUY_STOP, SELL, SELL_STOP
-from fakes import (Recorder, TickFeed, gold_spec, make_paper, reach_buy_tp,
-                   reach_sell_tp, trigger_buy, trigger_sell)
+from fakes import (Recorder, TickFeed, gold_spec, make_paper, trigger_buy,
+                   trigger_sell)
 from ladder_engine import RollingLadderEngine, State, level_comment, parse_comment
 from runtime_settings import RuntimeSettings
 
@@ -66,9 +66,8 @@ t.check("every level sits on the cycle grid",
 # independent trade with its own target.
 t.check("NO individual take profit on any ladder order by default",
         all(o.tp == 0 for o in orders), str([o.tp for o in orders][:4]))
-t.check("the TP distance the engine computes is zero",
-        engine.tp_distance(settings.snapshot()) == 0.0,
-        str(engine.tp_distance(settings.snapshot())))
+t.check("there is no TP setting to compute one from",
+        not any(k.startswith("tp_") for k in settings.snapshot()))
 t.check("no stop loss by default", all(o.sl == 0 for o in orders))
 t.check("fixed 0.01 lots everywhere", all(o.volume == 0.01 for o in orders))
 t.check("each level has a unique identity",
@@ -78,23 +77,6 @@ t.check("identity encodes cycle, side and level",
 t.check("LADDER_CREATED logged", rec.count("LADDER_CREATED") == 1)
 t.check("ORDER_PLACED logged per level", rec.count("ORDER_PLACED") == 10)
 t.check("state is LADDER_ACTIVE", engine.state == State.LADDER_ACTIVE)
-
-t.section("PER-TRADE TP IS STILL AVAILABLE, BUT OPT-IN")
-tp_engine, tp_broker, tp_feed, tp_settings, _ = build(
-    {"tp_mode": "levels", "tp_levels": 1}, name="pertrade")
-tp_engine.step()
-tp_orders = tp_broker.orders()
-t.check("levels mode attaches a 0.30 TP to every buy stop",
-        all(abs(o.tp - o.price - 0.30) < 1e-9
-            for o in tp_orders if o.side == BUY_STOP))
-t.check("and to every sell stop",
-        all(abs(o.price - o.tp - 0.30) < 1e-9
-            for o in tp_orders if o.side == SELL_STOP))
-t.check("switching back to basket mode strips the TPs",
-        (tp_settings._values.__setitem__("tp_mode", "none"),
-         tp_engine.step(),
-         all(o.tp == 0 for o in tp_broker.orders()))[2],
-        str([o.tp for o in tp_broker.orders()][:4]))
 
 t.section("IDEMPOTENCE / NO DUPLICATES")
 before = [o.ticket for o in broker.orders()]
@@ -110,10 +92,9 @@ t.check("small price moves do not re-place the ladder",
 
 # ===========================================================================
 t.section("TRIGGER -> TP -> ROLL")
-# TP below the spacing keeps this scenario to a single trade; with the default
-# TP == spacing a TP and the next trigger land on the same tick (see below).
-engine, broker, feed, settings, rec = build(
-    {"tp_mode": "distance", "tp_distance": 0.20}, name="roll")
+# The ladder rolls when a level is consumed, not when a TP is hit - there are
+# no take profits. The window extends past the level price has just eaten.
+engine, broker, feed, settings, rec = build(name="roll")
 engine.step()
 first_buy = min(o.price for o in broker.orders() if o.side == BUY_STOP)
 trigger_buy(feed, first_buy)
@@ -121,23 +102,19 @@ engine.step()
 positions = broker.positions()
 t.check("level triggered into a position", len(positions) == 1, str(len(positions)))
 t.check("position is a BUY", positions and positions[0].side == BUY)
+t.check("it carries no take profit", positions[0].tp == 0, str(positions[0].tp))
 t.check("ORDER_TRIGGERED logged", rec.count("ORDER_TRIGGERED") == 1)
 t.check("entry hook fired for Telegram", len(rec.entries) == 1)
 t.check("state is POSITION_ACTIVE", engine.state == State.POSITION_ACTIVE)
+t.check("the leg is in the basket", engine.get_cycle_floating_pnl() != 0.0 or
+        len(engine.cycle_positions()) == 1)
 
 triggered_price = positions[0].price_open
-tp_price = positions[0].tp
-reach_buy_tp(feed, tp_price)
+feed.set(round(first_buy + 0.35, 2))
 engine.step()
-t.check("position closed at TP", not broker.positions())
-t.check("TP_HIT logged", rec.count("TP_HIT") == 1)
-t.check("TP counted for the cycle", engine.cycle.tp_count == 1)
-t.check("cycle P/L credited", abs(engine.cycle.realized - 0.20) < 0.01,
-        f"{engine.cycle.realized:.2f}")
-t.check("daily P/L credited", abs(engine.daily_profit - 0.20) < 0.01)
-t.check("LEVEL_ROLLED logged (level re-armed)", rec.count("LEVEL_ROLLED") == 1)
-
-engine.step()
+t.check("a favourable move does NOT close the leg", len(broker.positions()) >= 1,
+        f"{len(broker.positions())} positions")
+t.check("no TP event can be logged", rec.count("TP_HIT") == 0)
 new_buys = prices(broker.orders(), BUY_STOP)
 t.check("ladder rolled forward above the new price",
         min(new_buys) > triggered_price, f"{min(new_buys)} > {triggered_price}")
@@ -149,8 +126,7 @@ t.check("levels stay on the cycle grid",
                 round((p - engine.cycle.anchor) / 0.30)) < 1e-6 for p in new_buys))
 
 t.section("SELL SIDE")
-engine, broker, feed, settings, rec = build(
-    {"tp_mode": "distance", "tp_distance": 0.20}, name="sell")
+engine, broker, feed, settings, rec = build(name="sell")
 engine.step()
 first_sell = max(o.price for o in broker.orders() if o.side == SELL_STOP)
 trigger_sell(feed, first_sell)
@@ -158,18 +134,19 @@ engine.step()
 t.check("sell stop triggered on a dip",
         broker.positions() and broker.positions()[0].side == SELL)
 sell_pos = broker.positions()[0]
-t.check("sell TP is below entry", sell_pos.tp < sell_pos.price_open)
-reach_sell_tp(feed, sell_pos.tp)
+t.check("the sell leg carries no take profit either", sell_pos.tp == 0,
+        str(sell_pos.tp))
+feed.set(round(first_sell - 0.35, 2))
 engine.step()
-t.check("sell closed at TP", engine.cycle.tp_count == 1,
-        f"tp_count={engine.cycle.tp_count}")
-t.check("sell profit is positive", engine.cycle.realized > 0,
-        f"{engine.cycle.realized:.2f}")
+t.check("a favourable move does not close it",
+        any(p.ticket == sell_pos.ticket for p in broker.positions()))
+t.check("the basket is in profit", engine.get_cycle_floating_pnl() > 0,
+        f"{engine.get_cycle_floating_pnl():+.2f}")
 
 # ===========================================================================
-t.section("ADAPTIVE EXIT: A CLEAN RUN IS NOT CLOSED BY A TRADE COUNT")
+t.section("A CLEAN RUN IS NOT CLOSED BY A TRADE COUNT")
 engine, broker, feed, settings, rec = build(
-    {"tp_mode": "distance", "tp_distance": 0.20}, name="cycle")
+    {"basket_profit_target": 0}, name="cycle")     # normal exit disabled
 start_cycle = engine.cycle.cycle_id
 for i in range(5):
     engine.step()
@@ -179,29 +156,25 @@ for i in range(5):
     target = min(buys, key=lambda o: o.price)
     trigger_buy(feed, target.price)
     engine.step()
-    if broker.positions():
-        reach_buy_tp(feed, broker.positions()[0].tp)
-        engine.step()
 
 t.check("five clean BUY levels did not end the cycle",
         engine.cycle.cycle_id == start_cycle,
-        f"cycle #{engine.cycle.cycle_id} after {engine.sequence.total_triggers} triggers")
+        f"cycle #{engine.cycle.cycle_id} after "
+        f"{engine.sequence.total_triggers} triggers")
 t.check("no CYCLE_COMPLETED logged for a trade count",
         rec.count("CYCLE_COMPLETED") == 0)
 t.check("the sequence was tracked", engine.sequence.buy_triggers >= 4,
         str(engine.sequence.buy_triggers))
-t.check("engine reads it as continuation",
-        engine.assessment.state == "MOMENTUM_CONTINUATION", engine.assessment.state)
-t.check("exit score stayed below the threshold",
-        engine.assessment.exit_score < settings.get("exit_threshold_exit"),
-        f"{engine.assessment.exit_score:.1f}")
+t.check("with the target off, only risk can end it",
+        engine.cycle_active and engine.get_cycle_floating_pnl() > 2.0,
+        f"{engine.get_cycle_floating_pnl():+.2f}")
 
-t.section("ADAPTIVE EXIT: A REVERSAL ENDS THE CYCLE")
+t.section("THE BASKET TARGET ENDS THE CYCLE")
 # the re-entry cooldown has its own section in test_continuous; here the
-# question is only whether the reversal ends the cycle cleanly
+# question is only whether the target ends the cycle cleanly
 engine, broker, feed, settings, rec = build(
-    {"tp_mode": "distance", "tp_distance": 0.20,
-     "cycle_reentry_cooldown_seconds": 0}, name="reverse")
+    {"basket_profit_target": 0.50,
+     "cycle_reentry_cooldown_seconds": 0}, name="target")
 engine.step()
 buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
               key=lambda o: o.price)
@@ -210,38 +183,34 @@ engine.step()
 start_cycle = engine.cycle.cycle_id
 t.check("two BUY triggers recorded", engine.sequence.buy_triggers == 2,
         str(engine.sequence.buy_triggers))
+t.check("the basket is still short of the target",
+        engine.cycle_active and
+        engine.get_cycle_floating_pnl() < settings.get("basket_profit_target"),
+        f"{engine.get_cycle_floating_pnl():+.2f}")
 
-# the market turns and takes out the sell side
-for _ in range(6):
-    engine.step()
-    sells = [o for o in broker.orders() if o.side == SELL_STOP]
-    if not sells:
+# the market moves the basket into profit
+for _ in range(10):
+    if not engine.cycle_active:
         break
-    target = max(sells, key=lambda o: o.price)
-    trigger_sell(feed, target.price)
+    feed.set(round(feed.bid + 0.15, 2))
     engine.step()
-    if not engine.cycle_active or engine.cycle.cycle_id != start_cycle:
-        break
 
 # Closing a cycle no longer starts the next one: the re-entry cooldown sits in
 # between, so "closed" is `cycle_active`, not a bumped id.
-t.check("the cycle closed on the reversal",
+t.check("the cycle closed on the target",
         not engine.cycle_active or engine.cycle.cycle_id != start_cycle,
         f"cycle #{engine.cycle.cycle_id} active={engine.cycle_active}")
 t.check("CYCLE_COMPLETED or CYCLE_LOSS logged",
         rec.count("CYCLE_COMPLETED") + rec.count("CYCLE_LOSS") == 1)
 closes = [c for c in rec.cycles if c.kind_of == "complete"]
-t.check("the close names an explicit exit reason",
-        any(c.kind in ("SCENARIO_1_DIRECTIONAL", "SCENARIO_2_REVERSAL",
-                       "SCENARIO_3_EXTENDED_LADDER", "PROFIT_FALLBACK",
-                       "EXIT_ENGINE") for c in closes),
+t.check("the close names the one normal exit reason",
+        [c.kind for c in closes] == ["BASKET_PROFIT_TARGET"],
         str([c.kind for c in closes]))
-t.check("the reason names the structure",
-        any("reversal" in c.reason or "exhaustion" in c.reason for c in closes),
-        str([c.reason for c in closes]))
-t.check("the assessment is handed to the logger",
-        any(c.assessment is not None and c.assessment.exit_score > 0
-            for c in closes))
+t.check("the reason names the number that caused it",
+        closes and "target" in closes[0].reason, str([c.reason for c in closes]))
+t.check("the basket state at the exit is handed to the logger",
+        closes and closes[0].context.get("floating_pnl_at_exit", 0) >= 0.50,
+        str(closes[0].context if closes else None))
 t.check("positions were closed out", not broker.positions())
 engine.step()          # the (zero-length) re-entry cooldown is served
 t.check("pending orders were cancelled or rebuilt for the new cycle",
@@ -356,7 +325,7 @@ for _ in range(5):
 t.check("no further levels are added beyond the cap",
         len(broker.orders()) <= before, f"{before} -> {len(broker.orders())}")
 t.check("the cycle can still reach an exit decision",
-        engine.assessment is not None)
+        engine.sequence is not None and engine.cycle_active)
 
 t.section("RISK: LOSING CYCLE STREAK")
 engine, broker, feed, settings, rec = build(
@@ -379,8 +348,7 @@ t.check("lot size is used verbatim, never scaled",
 
 # ===========================================================================
 t.section("PAUSE (positions still managed)")
-engine, broker, feed, settings, rec = build(
-    {"tp_mode": "levels"}, name="pause")     # a per-trade TP, to fire while paused
+engine, broker, feed, settings, rec = build(name="pause")
 engine.step()
 buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
               key=lambda o: o.price)
@@ -391,11 +359,12 @@ engine.paused = True
 engine.step()
 t.check("pause cancels pending levels", not broker.orders())
 t.check("pause does not close positions", len(broker.positions()) == 1)
-pos = broker.positions()[0]
-reach_buy_tp(feed, pos.tp)
+t.check("the paused position has no TP to close it",
+        broker.positions()[0].tp == 0)
+feed.set(round(feed.bid + 1.00, 2))
 engine.step()
-t.check("TP still executes while paused", not broker.positions())
-t.check("TP still counted while paused", engine.cycle.tp_count == 1)
+t.check("a paused basket is still held, not closed",
+        len(broker.positions()) == 1, f"{len(broker.positions())} positions")
 engine.paused = False
 engine.step()
 t.check("resume rebuilds the ladder", len(broker.orders()) == 10)
@@ -456,34 +425,17 @@ buy_min = min(o.price for o in broker.orders() if o.side == BUY_STOP)
 t.check("first level respects the broker minimum",
         buy_min >= feed().ask + 0.50, f"{buy_min} vs ask {feed().ask}")
 
-t.section("TP MODES")
-engine, broker, feed, settings, rec = build(
-    {"tp_mode": "3_pips", "pip_points": 10}, name="pips")
-engine.step()
-order = next(o for o in broker.orders() if o.side == BUY_STOP)
-t.check("3 pips with 10-point pips = 0.30 TP",
-        abs(order.tp - order.price - 0.30) < 1e-9, f"{order.tp - order.price:.2f}")
-engine, broker, feed, settings, rec = build(
-    {"tp_mode": "1_pip", "pip_points": 100}, name="pips2")
-engine.step()
-order = next(o for o in broker.orders() if o.side == BUY_STOP)
-t.check("pip size setting rescales the TP",
-        abs(order.tp - order.price - 1.00) < 1e-9, f"{order.tp - order.price:.2f}")
-
 t.section("SETTINGS CHANGE AT RUNTIME")
-engine, broker, feed, settings, rec = build(
-    {"tp_mode": "distance", "tp_distance": 0.30}, name="live")
+engine, broker, feed, settings, rec = build(name="live")
 engine.step()
-old_tp = next(o for o in broker.orders() if o.side == BUY_STOP).tp
-settings._values["tp_distance"] = 0.60
 settings._values["ladder_spacing"] = 0.50
 engine.step()
 levels = prices(broker.orders(), BUY_STOP)
 t.check("new spacing applied without a restart",
         all(abs(round(levels[i + 1] - levels[i], 2) - 0.50) < 1e-9
             for i in range(len(levels) - 1)), str(levels))
-new_tp = next(o for o in broker.orders() if o.side == BUY_STOP).tp
-t.check("new TP applied to new levels", new_tp != old_tp)
+t.check("levels still carry no TP after a settings change",
+        all(o.tp == 0 for o in broker.orders()))
 
 t.section("RESTART RECOVERY")
 engine, broker, feed, settings, rec = build(name="recover")

@@ -405,21 +405,16 @@ t.check("with no cooldown configured it stays a hard stop",
 t.section("CONTINUOUS OPERATION OVER MANY CYCLES")
 now6 = [110_000.0]
 engine, broker, feed, settings, rec = build(
-    {"cooldown_after_loss_minutes": 0}, name="many", clock=lambda: now6[0])
-price = 4010.0
+    {"cooldown_after_loss_minutes": 0, "basket_profit_target": 0.50},
+    name="many", clock=lambda: now6[0])
 for i in range(60):
     now6[0] += 6            # the 10s re-entry cooldown is served, not skipped
     engine.step()
-    orders = broker.orders()
-    if orders:
-        # walk price onto the nearest level, alternating sides to force
-        # reversals and keep cycles turning over
-        side = BUY_STOP if i % 7 < 4 else SELL_STOP
-        candidates = [o for o in orders if o.side == side]
-        if candidates:
-            target = (min(candidates, key=lambda o: o.price) if side == BUY_STOP
-                      else max(candidates, key=lambda o: o.price))
-            (trigger_buy if side == BUY_STOP else trigger_sell)(feed, target.price)
+    # a rising market: each new BUY level lifts the legs already open, so the
+    # basket reaches its target and the cycle turns over
+    candidates = [o for o in broker.orders() if o.side == BUY_STOP]
+    if candidates:
+        trigger_buy(feed, min(candidates, key=lambda o: o.price).price)
     now6[0] += 6
     engine.step()
 completed = [c for c in rec.cycles if c.kind_of == "complete"]

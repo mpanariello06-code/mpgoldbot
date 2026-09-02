@@ -136,78 +136,25 @@ ROLL_MODE = _get_str("ROLL_MODE", "extend").lower()
 REARM_LEVELS = _get_bool("REARM_LEVELS", True)
 
 # ---------------------------------------------------------------------------
-# TAKE PROFIT
+# STOP LOSS
 # ---------------------------------------------------------------------------
-# none (default) = NO individual take profit. Ladder positions stay open and
-# the whole cycle is closed as one basket by the exit engine - this is the
-# basket architecture the strategy is built on.
-# levels = TP_LEVELS x LADDER_SPACING | distance = TP_DISTANCE price units |
-# 1_pip..5_pips = symbol-aware pips. Those attach a per-trade TP and turn each
-# ladder level back into an independent trade.
-TP_MODE = _get_str("TP_MODE", "none").lower()
-TP_LEVELS = _get_int("TP_LEVELS", 1)
-TP_DISTANCE = _get_float("TP_DISTANCE", LADDER_SPACING)
+# There are NO individual take profits. A triggered level is one leg of the
+# cycle's basket, and the basket is closed as one unit when its total floating
+# P/L reaches BASKET_PROFIT_TARGET below.
 STOP_LOSS_DISTANCE = _get_float("STOP_LOSS_DISTANCE", 0.0)   # 0 = no SL
 # 1 pip = N points; 0 = derive from the symbol's digits/point
 PIP_POINTS = _get_int("PIP_POINTS", 0)
 
 # ---------------------------------------------------------------------------
-# CYCLE / ADAPTIVE EXIT
+# CYCLE EXIT
 # ---------------------------------------------------------------------------
-# The cycle ends when the exit engine reads reversal or exhaustion in the
-# trigger sequence - never on a trade count and never on a dollar target.
-# Every weight and threshold below is a starting value to be fitted against
-# historical XAUUSD data, not a discovered truth.
+# The ONE normal strategy exit. When the current cycle's total floating basket
+# P/L reaches this, every position and every pending order of the cycle is
+# closed. One source of truth - nothing else in the code carries a profit
+# figure. 0 disables the normal exit entirely, leaving only the hard risk
+# limits, which is almost certainly not what you want.
+BASKET_PROFIT_TARGET = _get_float("BASKET_PROFIT_TARGET", 2.00)
 CYCLE_CLOSE_POSITIONS = _get_bool("CYCLE_CLOSE_POSITIONS", True)
-
-# --- profit recovery fallback ---
-# A basket that quietly came good is taken rather than held forever waiting for
-# a scenario that may never arrive. NOT a dollar target: the buffer is a
-# fraction of what one ladder level is worth, so it scales with lot and
-# spacing, and the profit must hold for the confirmation period.
-PROFIT_FALLBACK_ENABLED = _get_bool("PROFIT_FALLBACK_ENABLED", True)
-PROFIT_FALLBACK_BUFFER_LEVELS = _get_float("PROFIT_FALLBACK_BUFFER_LEVELS", 0.5)
-PROFIT_CONFIRMATION_SECONDS = _get_float("PROFIT_CONFIRMATION_SECONDS", 60.0)
-# strong continuation above this is left to run rather than harvested
-PROFIT_FALLBACK_CONTINUATION_GUARD = _get_float(
-    "PROFIT_FALLBACK_CONTINUATION_GUARD", 0.60)
-
-_EXIT_DEFAULTS = {
-    "recent_window": 5,
-    "progress_intervals": 2,
-    "consecutive_norm": 4.0,
-    "depth_norm": 6.0,
-    "gap_reference": 60.0,
-    "min_triggers_for_exhaustion": 3,
-    "min_triggers_for_reversal": 2,
-    "min_triggers_for_directional": 3,
-    "min_triggers_for_extended": 5,
-    "w_reversal": 0.75,
-    "w_exhaustion": 0.45,
-    "w_directional": 0.65,
-    "w_extended": 0.50,
-    "w_depth": 0.20,
-    "w_drawdown": 0.25,
-    "w_continuation": 0.45,
-    "w_harvest": 0.30,
-    "w_loss_hold": 0.20,
-    "threshold_exit": 70.0,
-    "threshold_monitor": 40.0,
-}
-
-
-def _exit_settings():
-    """EXIT_<FIELD> in .env overrides any exit-engine parameter."""
-    out = {}
-    for key, default in _EXIT_DEFAULTS.items():
-        env = f"EXIT_{key.upper()}"
-        if isinstance(default, bool):
-            out[f"exit_{key}"] = _get_bool(env, default)
-        elif isinstance(default, int):
-            out[f"exit_{key}"] = _get_int(env, default)
-        else:
-            out[f"exit_{key}"] = _get_float(env, default)
-    return out
 
 # ---------------------------------------------------------------------------
 # RISK
@@ -280,8 +227,6 @@ TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN)
 TELEGRAM_NOTIFICATIONS = _get_bool("TELEGRAM_NOTIFICATIONS", True)
 # Telegram is event-based: cycles, state transitions, risk and errors. Per-entry
 # pings are off by default - this strategy would flood the chat.
-TELEGRAM_ENTRY_ALERTS = _get_bool("TELEGRAM_ENTRY_ALERTS", False)
-TELEGRAM_STATE_ALERTS = _get_bool("TELEGRAM_STATE_ALERTS", True)
 TELEGRAM_STATUS_UPDATES = _get_bool("TELEGRAM_STATUS_UPDATES", True)
 TELEGRAM_STATUS_INTERVAL = _get_float("TELEGRAM_STATUS_INTERVAL", 20.0)  # minutes
 TELEGRAM_ERROR_THROTTLE = _get_float("TELEGRAM_ERROR_THROTTLE", 300.0)   # seconds
@@ -330,17 +275,11 @@ def runtime_defaults():
         "roll_mode": ROLL_MODE,
         "rearm_levels": REARM_LEVELS,
         # take profit
-        "tp_mode": TP_MODE,
-        "tp_levels": TP_LEVELS,
-        "tp_distance": TP_DISTANCE,
+        "basket_profit_target": BASKET_PROFIT_TARGET,
         "stop_loss_distance": STOP_LOSS_DISTANCE,
         "pip_points": PIP_POINTS,
         # cycle / adaptive exit
         "cycle_close_positions": CYCLE_CLOSE_POSITIONS,
-        "profit_fallback_enabled": PROFIT_FALLBACK_ENABLED,
-        "profit_fallback_buffer_levels": PROFIT_FALLBACK_BUFFER_LEVELS,
-        "profit_confirmation_seconds": PROFIT_CONFIRMATION_SECONDS,
-        "profit_fallback_continuation_guard": PROFIT_FALLBACK_CONTINUATION_GUARD,
         # risk
         "lot_size": LOT_SIZE,
         "max_lot_size": MAX_LOT_SIZE,
@@ -361,12 +300,9 @@ def runtime_defaults():
         # direction
         "direction_filter": DIRECTION_FILTER,
         # telegram policy
-        "telegram_entry_alerts": TELEGRAM_ENTRY_ALERTS,
-        "telegram_state_alerts": TELEGRAM_STATE_ALERTS,
         "telegram_status_updates": TELEGRAM_STATUS_UPDATES,
         "telegram_status_interval_minutes": TELEGRAM_STATUS_INTERVAL,
         "telegram_error_throttle_seconds": TELEGRAM_ERROR_THROTTLE,
-        **_exit_settings(),
     }
 
 
@@ -401,25 +337,19 @@ def validate():
         errors.append("LADDER_SPACING must be greater than 0")
     if LADDER_DEPTH < 1:
         errors.append("LADDER_DEPTH must be at least 1")
-    if TP_MODE not in ("none", "levels", "distance", "1_pip", "2_pips",
-                       "3_pips", "4_pips", "5_pips"):
-        errors.append("TP_MODE must be none, levels, distance or 1_pip..5_pips")
-    if TP_MODE != "none":
+    if BASKET_PROFIT_TARGET < 0:
+        errors.append("BASKET_PROFIT_TARGET cannot be negative")
+    if BASKET_PROFIT_TARGET == 0:
         warnings.append(
-            f"TP_MODE={TP_MODE} attaches an individual take profit to every "
-            f"ladder position - the strategy is designed to manage the cycle "
-            f"as ONE basket. Use TP_MODE=none unless you want per-trade exits")
-    if TP_MODE == "distance" and TP_DISTANCE <= 0:
-        errors.append("TP_DISTANCE must be greater than 0")
-    if TP_MODE == "levels" and TP_LEVELS < 1:
-        errors.append("TP_LEVELS must be at least 1")
+            "BASKET_PROFIT_TARGET is 0 - the normal exit is disabled and only "
+            "the hard risk limits can end a cycle")
     if LOT_SIZE <= 0:
         errors.append("LOT_SIZE must be greater than 0")
     if LOT_SIZE > MAX_LOT_SIZE:
         errors.append(f"LOT_SIZE ({LOT_SIZE}) is above MAX_LOT_SIZE ({MAX_LOT_SIZE})")
     if MAX_OPEN_POSITIONS < 1:
         errors.append("MAX_OPEN_POSITIONS must be at least 1")
-    if TP_MODE == "none" and MAX_OPEN_POSITIONS < LADDER_DEPTH:
+    if MAX_OPEN_POSITIONS < LADDER_DEPTH:
         warnings.append(
             f"MAX_OPEN_POSITIONS={MAX_OPEN_POSITIONS} is below LADDER_DEPTH="
             f"{LADDER_DEPTH}: with no individual TP the basket will stop "
@@ -447,9 +377,6 @@ def validate():
     if MAX_CYCLE_DURATION <= 0:
         warnings.append(
             "MAX_CYCLE_DURATION is 0 - a cycle can stay open indefinitely")
-    exits = _exit_settings()
-    if exits["exit_threshold_exit"] <= exits["exit_threshold_monitor"]:
-        errors.append("EXIT_THRESHOLD_EXIT must be above EXIT_THRESHOLD_MONITOR")
 
     if not TELEGRAM_BOT_TOKEN:
         warnings.append(
@@ -474,11 +401,9 @@ def strategy_summary():
         "Mode": TRADING_MODE,
         "Spacing": LADDER_SPACING,
         "Depth": LADDER_DEPTH,
-        "TP": ("none (basket)" if TP_MODE == "none" else
-               f"{TP_LEVELS} level(s)" if TP_MODE == "levels" else (
-                   TP_DISTANCE if TP_MODE == "distance" else TP_MODE)),
+        "TP": "none - basket exit only",
         "Lot": LOT_SIZE,
-        "Exit": f"score >= {_EXIT_DEFAULTS['threshold_exit']:.0f}",
+        "Exit": f"basket floating P/L >= {BASKET_PROFIT_TARGET:.2f}",
         "Max Positions": MAX_OPEN_POSITIONS,
         "Max Pendings": MAX_PENDING_ORDERS,
         "Max Spread": MAX_SPREAD,
