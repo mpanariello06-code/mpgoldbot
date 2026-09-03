@@ -28,8 +28,11 @@ import MetaTrader5 as mt5
 import config as cfg
 import optimized as bot
 from broker import BUY_STOP, SELL_STOP
+from ladder_engine import parse_comment
 
 t = Suite("app")
+# one ladder = LADDER_DEPTH per side
+LADDER_ORDERS = cfg.LADDER_DEPTH * 2
 mt5.reset()
 mt5.set_price(4010.00)
 
@@ -111,7 +114,7 @@ app.bot.set_notifier(lambda text: notes.append(text))
 ok, msg = app.bot.start()
 t.check("start() ok", ok, msg)
 t.check("state RUNNING", app.bot.state == "RUNNING")
-t.check("ladder built", wait_for(lambda: len(app.bot.orders()) == 10),
+t.check("ladder built", wait_for(lambda: len(app.bot.orders()) == LADDER_ORDERS),
         f"{len(app.bot.orders())} orders")
 orders = app.bot.orders()
 t.check("buy stops above the market",
@@ -224,7 +227,18 @@ time.sleep(0.3)
 t.check("no new entries while paused", not app.bot.positions())
 ok, msg = app.bot.resume()
 t.check("resume() ok", ok and app.bot.state == "RUNNING", msg)
-t.check("ladder rebuilt on resume", wait_for(lambda: len(app.bot.orders()) == 10))
+# The grid is pinned for the life of the ladder, so after a 2.00 move only the
+# levels still reachable from the pinned grid come back - and, critically, the
+# SAME ladder comes back rather than a new one.
+ladder_before = app.bot.status().get("cycle_id")
+t.check("the same ladder resumes, not a new one",
+        wait_for(lambda: app.bot.orders()) and
+        app.bot.status().get("cycle_id") == ladder_before,
+        f"#{app.bot.status().get('cycle_id')} vs #{ladder_before}")
+t.check("its orders all carry that ladder id",
+        all(parse_comment(o.comment)[0] == ladder_before
+            for o in app.bot.orders()),
+        str(sorted({parse_comment(o.comment)[0] for o in app.bot.orders()})))
 
 t.section("MT5 DISCONNECT / RECONNECT")
 cycle_before = app.bot.engine.cycle.cycle_id

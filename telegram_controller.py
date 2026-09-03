@@ -45,6 +45,12 @@ def _num(value, digits=2):
         return "n/a"
 
 
+def _hms(seconds):
+    """A ladder's age, as hh:mm:ss."""
+    seconds = max(0, int(seconds or 0))
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
 def _money(value):
     try:
         return f"${float(value):,.2f}"
@@ -286,6 +292,17 @@ class TelegramController:
                f"No active cycle. Next ladder in "
                f"{s.get('reentry_wait_seconds', 0):.0f}s.", ""]
               if s.get("in_reentry_cooldown") else []),
+            f"<b>LADDER #{s.get('cycle_id', 0)}</b>",
+            f"Status: {s.get('ladder_status', 'CLOSED')}"
+            + (f"   (cooldown {s.get('cooldown_left', 0):.1f}s)"
+               if s.get("ladder_status") == "COOLDOWN" else ""),
+            f"Buy Stops: {s.get('current_pending_buys', 0)} remaining",
+            f"Sell Stops: {s.get('current_pending_sells', 0)} remaining",
+            f"Triggered: {s.get('historical_buy_triggers', 0) + s.get('historical_sell_triggers', 0)}",
+            f"Open Positions: {s.get('positions', 0)}",
+            f"Closed Positions: {s.get('closed_positions', 0)}",
+            f"Age: {_hms(s.get('cycle_age_seconds', 0))}",
+            "",
             "<b>LIVE IN MT5</b>   (what actually exists right now)",
             f"Pending BUY: {s.get('current_pending_buys', 0)}",
             f"Pending SELL: {s.get('current_pending_sells', 0)}",

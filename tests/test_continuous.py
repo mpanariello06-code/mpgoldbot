@@ -82,7 +82,8 @@ t.section("IMMEDIATE FIRST LADDER")
 engine, broker, feed, settings, rec = build(name="first")
 t.check("nothing is live before the first pass", not broker.orders())
 engine.step()
-t.check("ladder deployed on the very first pass", len(broker.orders()) == 10,
+t.check("ladder deployed on the very first pass",
+        len(broker.orders()) == settings.get("ladder_depth") * 2,
         f"{len(broker.orders())} orders")
 t.check("no candle or signal was waited for",
         rec.count("LADDER_CREATED") == 1 and rec.count("CYCLE_STARTED") == 1)
@@ -112,7 +113,7 @@ t.check("no pending orders are left", not broker.orders(),
 t.check("the flat state is logged", "CYCLE_FLAT" in rec.names())
 t.check("every exit step is logged, in order",
         [n for n in rec.names() if n.startswith(("EXIT_", "CYCLE_FLAT",
-                                                 "CYCLE_COOLDOWN"))][:1]
+                                                 "COOLDOWN"))][:1]
         == ["EXIT_TRIGGERED"],
         str([n for n in rec.names() if n.startswith(("EXIT_", "CYCLE_"))][-8:]))
 
@@ -126,8 +127,8 @@ t.check("the record carries the wait before the next ladder",
 
 # --- step 9-10: nothing is created during the cooldown --------------------
 t.check("the cooldown was announced once",
-        rec.count("CYCLE_COOLDOWN_STARTED") == 1,
-        str(rec.count("CYCLE_COOLDOWN_STARTED")))
+        rec.count("COOLDOWN_STARTED") == 1,
+        str(rec.count("COOLDOWN_STARTED")))
 for _ in range(5):
     now[0] += 1.0
     engine.step()
@@ -142,7 +143,7 @@ t.check("the previous cycle is not reopened",
 t.check("the cooldown is the stated reason",
         "re-entry cooldown" in engine.block_reason, engine.block_reason)
 t.check("no countdown spam - one cooldown event, not one per pass",
-        rec.count("CYCLE_COOLDOWN_STARTED") == 1)
+        rec.count("COOLDOWN_STARTED") == 1)
 
 # --- step 11-14: after the cooldown, a new ladder at the current price ----
 now[0] += 6.0
@@ -151,7 +152,7 @@ t.check("a new cycle starts once the cooldown elapses",
         engine.cycle.cycle_id != closed_cycle and engine.cycle_active,
         f"#{engine.cycle.cycle_id}")
 t.check("the cooldown completion is logged",
-        "CYCLE_COOLDOWN_COMPLETE" in rec.names())
+        "COOLDOWN_FINISHED" in rec.names())
 t.check("the new ladder is live", len(broker.orders()) > 0,
         f"{len(broker.orders())} orders")
 t.check("the deployment is confirmed as ACTIVE", "CYCLE_ACTIVE" in rec.names())
@@ -193,8 +194,8 @@ t.check("with no cooldown between them", all(g <= 0.5 for g in gaps), str(gaps))
 t.check("the ladder was replenished between triggers, with no cooldown",
         rec.count("ORDER_PLACED") > 10, str(rec.count("ORDER_PLACED")))
 t.check("no cooldown ran inside the cycle - the events are all at the end",
-        rec.names().index("CYCLE_COOLDOWN_STARTED") > rec.names().index("EXIT_TRIGGERED")
-        if "CYCLE_COOLDOWN_STARTED" in rec.names() else True)
+        rec.names().index("COOLDOWN_STARTED") > rec.names().index("EXIT_TRIGGERED")
+        if "COOLDOWN_STARTED" in rec.names() else True)
 t.check("no exit machinery ran before the last trigger",
         all(rec.names().index(n) > rec.names().index("ORDER_TRIGGERED")
             for n in set(rec.names()) if n.startswith("EXIT_")),
@@ -220,7 +221,8 @@ t.check("no new ladder while a position is still open",
         f"{len(broker.orders())} orders")
 t.check("and it says exactly why",
         "flat" in engine.block_reason, engine.block_reason)
-t.check("the refusal is logged", "CYCLE_REENTRY_BLOCKED" in rec.names())
+t.check("the refusal is logged",
+        "LADDER_REJECTED_ALREADY_ACTIVE" in rec.names(), str(rec.names()[-3:]))
 for pos in list(broker.positions()):
     broker.close_position(pos.ticket)
 engine.step()
@@ -238,11 +240,13 @@ engine, broker, feed, settings, rec = build(name="single")
 engine.step()
 before = engine.cycle.cycle_id
 t.check("a second cycle is refused while the first one is live",
-        engine._start_cycle(reason="should be refused") is False)
+        engine.create_new_ladder(reason="should be refused") is False)
 t.check("the cycle id did not move", engine.cycle.cycle_id == before,
         f"#{engine.cycle.cycle_id}")
-t.check("the refusal is logged", "CYCLE_REENTRY_BLOCKED" in rec.names())
-t.check("no duplicate ladder was placed", len(broker.orders()) == 10,
+t.check("the refusal is logged",
+        "LADDER_REJECTED_ALREADY_ACTIVE" in rec.names(), str(rec.names()[-3:]))
+t.check("no duplicate ladder was placed",
+        len(broker.orders()) == settings.get("ladder_depth") * 2,
         f"{len(broker.orders())} orders")
 
 t.section("COOLDOWN ONLY ON A RISK-FORCED CLOSE")
@@ -366,9 +370,10 @@ t.check("a restart never goes backwards", engine2.cycle.cycle_id >= last_id,
 t.check("the highest id seen is remembered",
         engine2.max_cycle_id >= last_id, str(engine2.max_cycle_id))
 before = engine2.cycle.cycle_id
-# require_flat is the one-active-cycle gate, exercised in its own section; here
-# the question is only whether ids ever repeat.
-engine2._start_cycle(reason="test", require_flat=False)
+# The one-active-ladder gate is exercised in its own section; here the question
+# is only whether ids ever repeat, so the ladder is marked closed first.
+engine2.cycle_active = False
+engine2.create_new_ladder(reason="test", require_flat=False)
 t.check("the next cycle id is strictly higher",
         engine2.cycle.cycle_id > before, f"{before} -> {engine2.cycle.cycle_id}")
 

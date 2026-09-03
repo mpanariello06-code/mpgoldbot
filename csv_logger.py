@@ -57,6 +57,8 @@ LADDER_HEADER = [
     "timestamp", "symbol", "cycle_id", "candle_time", "event_type", "side",
     "entry_price", "exit_price", "ladder_price", "ladder_index",
     "sl_if_used", "lot_size", "spread", "order_ticket", "position_ticket",
+    "buy_pending_count", "sell_pending_count", "open_positions",
+    "closed_positions",
     "buy_trigger_count", "sell_trigger_count", "last_side", "previous_side",
     "direction_changes", "ladder_depth_used", "price_distance_traveled",
     "net_levels", "basket_floating_pnl", "basket_realized_pnl", "basket_pnl",

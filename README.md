@@ -41,7 +41,7 @@ runtime_settings.py     Telegram-controlled settings, persisted as JSON
 telegram_controller.py  control panel (own thread, own event loop)
 telegram_settings.py    the ⚙️ SETTINGS menu tree
 csv_logger.py           trades, events, account snapshots, ladder events, cycles
-tests/                  895 offline checks — python tests/run_all.py
+tests/                  971 offline checks — python tests/run_all.py
 data/                   CSVs + runtime_settings.json + state files (auto-created)
 ```
 
@@ -74,8 +74,9 @@ is never reopened. A new ladder is built only when **both** are true:
 * the account is verified flat — 0 strategy positions and 0 pending orders.
 
 If either fails the engine waits and reconciles again, so cycle #7 still being
-alive can never coexist with #8 and #9. `_start_cycle()` refuses outright while
-anything from a previous cycle is live, and logs `CYCLE_REENTRY_BLOCKED`.
+alive can never coexist with #8 and #9. `create_new_ladder()` refuses outright while
+anything from a previous cycle is live, and logs
+`LADDER_REJECTED_ALREADY_ACTIVE`.
 
 The new ladder is anchored on the price **at the end of the cooldown**, not on
 the old grid and not at the next M5 open.
@@ -95,8 +96,8 @@ A cycle can open and close in seconds, so every step of the exit is logged to
 ```
 EXIT_TRIGGERED → EXIT_ORDERS_FOUND → EXIT_CANCEL_SENT → ORDER_CANCELLED
   → EXIT_POSITIONS_FOUND → EXIT_CLOSE_SENT → EXIT_CLOSE_CONFIRMED
-  → EXIT_RECONCILED → CYCLE_FLAT → CYCLE_COMPLETED → CYCLE_COOLDOWN_STARTED
-  → CYCLE_COOLDOWN_COMPLETE → LADDER_DEPLOY_START → LADDER_CREATED
+  → EXIT_RECONCILED → CYCLE_FLAT → CYCLE_COMPLETED → LADDER_CLOSED
+  → COOLDOWN_STARTED → COOLDOWN_FINISHED → LADDER_DEPLOY_START → LADDER_CREATED
   → CYCLE_ACTIVE
 ```
 
@@ -170,6 +171,42 @@ and dropping those legs would understate the basket.
 individual TP the basket accumulates until the cycle closes, and a low cap would
 stop the ladder after N triggers — which is a fixed trade count, not a strategy.
 `config.validate()` warns when it is below `LADDER_DEPTH`.
+
+## The ladder lifecycle
+
+**One active ladder = one ladder ID.** A ladder is `LADDER_DEPTH` BUY STOP plus
+`LADDER_DEPTH` SELL STOP — 11 + 11 = **22 orders**, placed once when the cycle
+starts and **never replenished**:
+
+```
+IDLE -> CREATE_LADDER -> PLACE 22 PENDING ORDERS -> ACTIVE_LADDER
+     -> MANAGE_CURRENT_LADDER -> FINAL CLOSE CONDITION -> verify flat
+     -> COOLDOWN (CYCLE_REENTRY_COOLDOWN, 10s) -> IDLE -> CREATE_NEW_LADDER
+```
+
+`create_new_ladder()` is the only function in the engine that creates a ladder,
+and it refuses — logging `LADDER_REJECTED_ALREADY_ACTIVE` — when a ladder is
+already active, when the cooldown has not expired, or when anything from a
+previous ladder is still at the broker. `ladder_active` and `active_ladder_id`
+are the single source of truth.
+
+Nothing that happens *inside* a live ladder ends it or starts another: a
+trigger, a position opening or closing, a direction change, or the pendings
+running low are all events belonging to the current ladder. Only the **final
+close condition** — hard risk (`MAX_CYCLE_DRAWDOWN`, then `MAX_CYCLE_DURATION`)
+or basket profit management — moves it to COOLDOWN.
+
+`ROLL_MODE=static` with `REARM_LEVELS=false` is what makes the grid fixed: it
+is pinned when the cycle starts and price consumes it. The trade-off is real —
+**a pinned grid does not follow price**, so if the market leaves the grid the
+ladder runs with whatever levels it has left rather than re-centring.
+`ROLL_MODE=extend` restores the old rolling behaviour, where consumed levels
+are replaced and a live ladder keeps placing orders all cycle; the config warns
+when it is set.
+
+At creation the accepted orders are counted per side. A short deployment is
+logged as `LADDER_CREATED … PARTIAL` plus an `ERROR` naming the shortfall, and
+the ladder runs as placed — **a second ladder is never created to compensate**.
 
 ## How the ladder works
 
@@ -362,10 +399,12 @@ filter in particular blocks and un-blocks automatically.
   (`LADDER_CREATED`, `ORDER_PLACED`, `ORDER_CANCELLED`, `ORDER_TRIGGERED`,
   `SL_HIT`, `POSITION_CLOSED`, `LEVEL_ROLLED`, `CYCLE_STARTED`, `CYCLE_COMPLETED`,
   `CYCLE_LOSS`, `LADDER_DEPLOY_START`, `LADDER_DEPTH_CAP`, `ORDER_REJECTED`,
+  the ladder lifecycle (`LADDER_CREATED`, `POSITION_OPENED`, `LADDER_CLOSED`,
+  `COOLDOWN_STARTED`, `COOLDOWN_FINISHED`, `LADDER_REJECTED_ALREADY_ACTIVE`),
   the exit trail (`EXIT_TRIGGERED`, `EXIT_ORDERS_FOUND`, `EXIT_CANCEL_SENT`,
   `EXIT_POSITIONS_FOUND`, `EXIT_CLOSE_SENT`, `EXIT_CLOSE_CONFIRMED`,
-  `EXIT_RECONCILED`, `CYCLE_FLAT`, `CYCLE_COOLDOWN_STARTED`,
-  `CYCLE_COOLDOWN_COMPLETE`, `CYCLE_REENTRY_BLOCKED`, `CYCLE_ACTIVE`),
+  `EXIT_RECONCILED`, `CYCLE_FLAT`,
+  `CYCLE_ACTIVE`),
   `RISK_BLOCK`, `SPREAD_BLOCK`, `ERROR`) with the **state of the basket at that
   moment**: trigger counts by side, last/previous side, direction changes, depth
   used, distance travelled, net levels, the basket's floating / realized / total
@@ -429,10 +468,14 @@ you only touch once.
 ## Tests
 
 ```bash
-python tests/run_all.py        # 895 checks, no MT5 or network needed
+python tests/run_all.py        # 971 checks, no MT5 or network needed
 ```
 
-Covers: the basket profit target at 1.99 / 2.00 / 2.01 and fluctuating around
+Covers: the ladder lifecycle (exactly 11+11, no second ladder while one is
+active, triggers and closes that must not re-ladder, no replenishment, the
+10-second cooldown, exactly one new ladder after it with a new id, never two
+ladder ids live at once, restart recovery, a short deployment that is not
+compensated); the basket profit target at 1.99 / 2.00 / 2.01 and fluctuating around
 it (one exit, never repeated); peak tracking that never decreases and resets
 per cycle; drawdown-from-peak; the trail closing a protected basket and the
 floor catching one the trail would let bleed out; the +95 → −9 sequence exiting

@@ -20,8 +20,20 @@ TMP.mkdir(parents=True)
 
 
 def build(overrides=None, feed=None, spec=None, name="e", balance=1000.0):
-    """A fresh engine on a paper broker, with settings overrides applied."""
+    """
+    A fresh engine on a paper broker, with settings overrides applied.
+
+    This suite is about ladder GEOMETRY - grid maths, rolling, reconciliation,
+    risk gates - so it pins a small 5-per-side ladder in `extend` mode rather
+    than inheriting the shipped 11+11 static lifecycle. The lifecycle itself is
+    covered in test_ladder_lifecycle.py.
+    """
     settings = RuntimeSettings(cfg.runtime_defaults(), TMP / f"{name}_settings.json")
+    for key, value in {"ladder_depth": 5, "roll_mode": "extend",
+                       "rearm_levels": True, "max_pending_orders": 10,
+                       "max_open_positions": 12,
+                       "max_ladder_depth": 12}.items():
+        settings._values[key] = value
     for key, value in (overrides or {}).items():
         settings._values[key] = value          # bypass confirmation plumbing
     feed = feed or TickFeed(4010.00)
@@ -502,9 +514,15 @@ engine.step()
 t.check("only what the broker accepted is live", len(broker.orders()) == 3,
         f"{len(broker.orders())} orders")
 created = [e for e in rec.events if e[0] == "LADDER_CREATED"]
-t.check("LADDER_CREATED reports actual of intended",
-        created and created[-1][1].startswith("Cycle #1: 3 of 10 levels live"),
+t.check("LADDER_CREATED reports the live count per side against the wanted one",
+        created and "2 BUY STOP + 1 SELL STOP = 3 live" in created[-1][1]
+        and "wanted 5+5=10" in created[-1][1],
         created[-1][1] if created else "none")
+t.check("a short deployment is called out as an error",
+        any(e[0] == "ERROR" and "deployed SHORT" in e[1] for e in rec.events),
+        str([e[1][:60] for e in rec.events if e[0] == "ERROR"]))
+t.check("and no second ladder is created to compensate",
+        rec.count("CYCLE_STARTED") == 1, str(rec.count("CYCLE_STARTED")))
 t.check("the deployment is flagged PARTIAL",
         created and created[-1][2].get("status") == "PARTIAL",
         str(created[-1][2].get("status") if created else None))

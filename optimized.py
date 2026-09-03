@@ -35,7 +35,7 @@ from datetime import datetime
 import MetaTrader5 as mt5
 
 import config as cfg
-from broker import MT5_LOCK, Mt5Broker, PaperBroker
+from broker import BUY_STOP, SELL_STOP, MT5_LOCK, Mt5Broker, PaperBroker
 from csv_logger import CsvLogger
 from ladder_engine import RollingLadderEngine, State
 from notifications import TelegramNotifier
@@ -736,6 +736,9 @@ class LadderBot:
         spec = engine.spec if engine else None
         row = {
             "symbol": SYMBOL,
+            # what the ladder holds at the moment of the event - never a
+            # historical counter dressed up as current exposure
+            **self._ladder_counts(),
             "candle_time": self.last_candle_time or "",
             "side": fields.get("direction", ""),
             "ladder_index": fields.get("level", ""),
@@ -769,6 +772,24 @@ class LadderBot:
             })
             row.setdefault("cycle_id", seq["cycle_id"])
         CSV.log_ladder(event, digits=spec.digits if spec else 2, **row)
+
+    def _ladder_counts(self):
+        """Live BUY/SELL pendings, open and closed positions for the ladder."""
+        engine = self.engine
+        if engine is None:
+            return {}
+        try:
+            orders = engine.cycle_orders()
+            positions = engine.cycle_positions()
+        except Exception:
+            return {}
+        seq = engine.sequence
+        return {
+            "buy_pending_count": len([o for o in orders if o.side == BUY_STOP]),
+            "sell_pending_count": len([o for o in orders if o.side == SELL_STOP]),
+            "open_positions": len(positions),
+            "closed_positions": len(seq.closures) if seq else 0,
+        }
 
     def _on_telemetry(self, row):
         """One intra-cycle basket snapshot -> basket_telemetry.csv only."""

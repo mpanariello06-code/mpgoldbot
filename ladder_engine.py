@@ -306,12 +306,13 @@ class RollingLadderEngine:
         elif not self.cycle_active and self._reentry_wait() > 0:
             # restarted inside a re-entry cooldown: serve out what is left of it
             self.state = State.COOLDOWN_AFTER_EXIT
-            self._event("CYCLE_COOLDOWN_STARTED",
+            self._event("COOLDOWN_STARTED",
                         f"restart during the re-entry cooldown - next ladder in "
                         f"{_seconds(self._reentry_wait())}", status="COOLDOWN")
         elif not self.cycle.anchor or not self.cycle_active:
-            self._start_cycle(new_id=self.cycle.cycle_id if not self.cycle.anchor
-                              else None, reason="startup")
+            self.create_new_ladder(
+                new_id=self.cycle.cycle_id if not self.cycle.anchor else None,
+                reason="startup")
 
         if self.cycle_active and (
                 self.sequence is None or
@@ -348,24 +349,59 @@ class RollingLadderEngine:
         tick = self.broker.tick()
         return tick.mid
 
-    def _start_cycle(self, new_id=None, reason="", require_flat=True):
+    # ======================================================= ladder lifecycle
+    @property
+    def ladder_active(self):
         """
-        Open a new cycle. Returns True when one was started.
+        True while a ladder exists and owns the account.
 
-        MAX_ACTIVE_CYCLES = 1. A new cycle is refused outright while anything
-        from a previous one is still live - that is the only way #7, #8 and #9
-        can never exist at the same time.
+        A cycle that has been anchored and not yet closed is an ACTIVE LADDER,
+        whatever the market has since done to its orders. Consuming levels,
+        opening positions and closing positions all happen INSIDE this - none
+        of them ends it.
         """
+        return bool(self.cycle_active and self.cycle.anchor)
+
+    @property
+    def active_ladder_id(self):
+        """The single source of truth for which ladder owns the account."""
+        return self.cycle.cycle_id if self.ladder_active else None
+
+    def create_new_ladder(self, new_id=None, reason="", require_flat=True):
+        """
+        The ONE place a ladder is ever created. Returns True when one was.
+
+        It refuses, loudly, if a ladder is already active, if the re-entry
+        cooldown has not expired, or if anything from a previous ladder is
+        still live at the broker. Nothing else in the engine may create,
+        replace or reset a ladder.
+        """
+        # 1. one active ladder, ever
+        if self.ladder_active:
+            self._event("LADDER_REJECTED_ALREADY_ACTIVE",
+                        f"refusing to create a ladder: ladder "
+                        f"#{self.active_ladder_id} is still ACTIVE ({reason})",
+                        cycle_id=self.active_ladder_id, status="REJECTED")
+            return False
+        # 2. the cooldown after the previous ladder must have expired
+        wait = self._reentry_wait()
+        if wait > 0:
+            self._event("LADDER_REJECTED_ALREADY_ACTIVE",
+                        f"refusing to create a ladder: {_seconds(wait)} of "
+                        f"cooldown left after ladder #{self.cycle.cycle_id}",
+                        cycle_id=self.cycle.cycle_id, status="REJECTED")
+            return False
+        # 3. nothing from the previous ladder may still be at the broker
         if require_flat:
             leftovers = [item for item in
                          list(self.broker.positions()) + list(self.broker.orders())
                          if parse_comment(item.comment)]
             if leftovers:
-                self._event("CYCLE_REENTRY_BLOCKED",
-                            f"refusing to start a new cycle: {len(leftovers)} "
-                            f"positions/orders from cycle(s) "
+                self._event("LADDER_REJECTED_ALREADY_ACTIVE",
+                            f"refusing to create a ladder: {len(leftovers)} "
+                            f"positions/orders from ladder(s) "
                             f"{sorted({parse_comment(i.comment)[0] for i in leftovers})} "
-                            f"are still live", status="RETRY")
+                            f"are still live", status="REJECTED")
                 return False
         tick = self.last_tick or self.broker.tick()
         anchor = self.spec.normalize_price(tick.mid) if self.spec else tick.mid
@@ -389,7 +425,7 @@ class RollingLadderEngine:
         self.reentry_until = 0.0
         self._cycle_announced = False
         self._event("CYCLE_STARTED",
-                    f"Cycle #{cid} anchored at {anchor} ({reason})",
+                    f"Ladder #{cid} anchored at {anchor} ({reason})",
                     cycle_id=cid, entry_price=anchor)
         self._emit("cycle_started", self.cycle, anchor)
         self.save()
@@ -817,6 +853,12 @@ class RollingLadderEngine:
             self.total_trades += 1
             self._record_trigger(side, index, pos.price_open,
                                  pos.time_open or self.clock())
+            self._event("POSITION_OPENED",
+                        f"{side} {pos.volume} @ {pos.price_open} "
+                        f"(ladder #{self.cycle.cycle_id}, level {index:+d})",
+                        cycle_id=self.cycle.cycle_id, direction=side,
+                        level=index, entry_price=pos.price_open,
+                        lot_size=pos.volume, position_ticket=pos.ticket)
             self._event("ORDER_TRIGGERED",
                         f"{pos.side} {pos.volume} @ {pos.price_open} (level {index:+d})",
                         cycle_id=self.cycle.cycle_id, direction=pos.side, level=index,
@@ -1091,13 +1133,19 @@ class RollingLadderEngine:
         self._closing_cycle = None
 
         # --- the cycle is CLOSED; there is now no active cycle ---------------
+        # The FINAL CLOSE CONDITION has been satisfied and verified flat. This
+        # is the ONLY transition out of an active ladder.
         self.cycle_active = False
         self.sequence = None
         self.reentry_until = self.clock() + self._reentry_cooldown(snap)
         self.state = State.COOLDOWN_AFTER_EXIT
         wait = self._reentry_wait()
-        self._event("CYCLE_COOLDOWN_STARTED",
-                    f"Cycle #{cid} closed - no active cycle. Next ladder in "
+        self._event("LADDER_CLOSED",
+                    f"Ladder #{cid} CLOSED [{info['kind']}] {info['reason']} - "
+                    f"P/L {total:+.2f}",
+                    cycle_id=cid, profit=total, status="CLOSED")
+        self._event("COOLDOWN_STARTED",
+                    f"Ladder #{cid} closed - no active ladder. Next ladder in "
                     f"{_seconds(wait)}.",
                     cycle_id=cid, status="COOLDOWN")
         self.save()
@@ -1157,17 +1205,18 @@ class RollingLadderEngine:
             self.block_reason = (
                 f"waiting to go flat before the next cycle: "
                 f"{len(live_positions)} positions / {len(live_orders)} orders")
-            self._event("CYCLE_REENTRY_BLOCKED", self.block_reason, status="RETRY")
+            self._event("LADDER_REJECTED_ALREADY_ACTIVE", self.block_reason,
+                        status="REJECTED")
             return "pending"
 
-        self._event("CYCLE_COOLDOWN_COMPLETE",
+        self._event("COOLDOWN_FINISHED",
                     "cooldown elapsed and the account is flat - building the "
                     "next ladder at the current price", status="OK")
         if self.block_reason.startswith(("cycle re-entry cooldown",
                                          "waiting to go flat")):
             self.block_reason = ""
         # anchored on the CURRENT price, never the old grid
-        if not self._start_cycle(reason="continuous re-entry"):
+        if not self.create_new_ladder(reason="continuous re-entry"):
             return "pending"
         return "restarted"
 
@@ -1286,15 +1335,36 @@ class RollingLadderEngine:
                 break                        # stop hammering a rejecting broker
 
         if first_deploy:
-            # what was actually accepted, never what was intended
+            # ORDER COUNT SAFETY: what the broker actually accepted, per side,
+            # against what one ladder is supposed to be. A short deployment is
+            # reported loudly and left alone - a second ladder is NEVER created
+            # to make up the difference.
+            live = self.cycle_orders(self.cycle.cycle_id)
+            live_buys = len([o for o in live if o.side == BUY_STOP])
+            live_sells = len([o for o in live if o.side == SELL_STOP])
+            want = int(snap["ladder_depth"])
             intended = len([d for d in desired_by_key.values() if d.placeable])
+            short = live_buys != want or live_sells != want
             self._event("LADDER_CREATED",
-                        f"Cycle #{self.cycle.cycle_id}: {placed} of "
-                        f"{intended} levels live around {tick.mid:.2f} "
-                        f"(spacing {snap['ladder_spacing']}"
+                        f"Ladder #{self.cycle.cycle_id}: "
+                        f"{live_buys} BUY STOP + {live_sells} SELL STOP = "
+                        f"{live_buys + live_sells} live around {tick.mid:.2f} "
+                        f"(wanted {want}+{want}={want * 2}, spacing "
+                        f"{snap['ladder_spacing']}"
                         + (f", {failures} rejected" if failures else "") + ")",
                         cycle_id=self.cycle.cycle_id,
-                        status="PARTIAL" if placed < intended else "OK")
+                        buy_pending_count=live_buys,
+                        sell_pending_count=live_sells,
+                        status="PARTIAL" if short else "OK")
+            if short:
+                self._event(
+                    "ERROR",
+                    f"Ladder #{self.cycle.cycle_id} deployed SHORT: "
+                    f"{live_buys}/{want} BUY STOP, {live_sells}/{want} SELL "
+                    f"STOP ({intended} placeable, {failures} refused). The "
+                    f"ladder runs as placed - no second ladder is created to "
+                    f"compensate. Check the broker rejection above.",
+                    cycle_id=self.cycle.cycle_id, status="ERROR")
             # the deployment is verified against what the broker accepted, and
             # only then is the cycle announced as running - once
             if placed > 0 and not self._cycle_announced:
@@ -1431,6 +1501,17 @@ class RollingLadderEngine:
                                      if self.sequence else 0.0),
             "cycle_state": (self.sequence.state if self.sequence
                             else "BASKET_BUILDING"),
+            # --- ladder lifecycle ---
+            "ladder_active": self.ladder_active,
+            "active_ladder_id": self.active_ladder_id,
+            "ladder_status": ("ACTIVE" if self.ladder_active else
+                              "COOLDOWN" if self._reentry_wait() > 0
+                              else "CLOSED"),
+            "ladder_depth_per_side": snap["ladder_depth"],
+            "ladder_size": int(snap["ladder_depth"]) * 2,
+            "closed_positions": (len(self.sequence.closures)
+                                 if self.sequence else 0),
+            "cooldown_left": round(self._reentry_wait(), 1),
             # --- one active cycle at a time ---
             "cycle_active": self.cycle_active,
             "reentry_wait_seconds": round(self._reentry_wait(), 1),

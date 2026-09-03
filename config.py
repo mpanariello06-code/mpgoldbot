@@ -126,14 +126,22 @@ PAPER_START_BALANCE = _get_float("PAPER_START_BALANCE", 10000.0)
 # ROLLING LADDER
 # ---------------------------------------------------------------------------
 LADDER_SPACING = _get_float("LADDER_SPACING", 0.30)     # price units
-LADDER_DEPTH = _get_int("LADDER_DEPTH", 5)              # levels per side
+# Levels per side. One ladder is LADDER_DEPTH BUY STOP + LADDER_DEPTH SELL
+# STOP, placed once at cycle start and never replenished.
+LADDER_DEPTH = _get_int("LADDER_DEPTH", 11)            # levels per side
 # Nearest level distance from price; the broker's minimum stop distance always
 # wins when it is larger.
 FIRST_LEVEL_OFFSET = _get_float("FIRST_LEVEL_OFFSET", LADDER_SPACING)
 # extend = the ladder rolls with price (levels re-created ahead of the market)
 # static = the grid is fixed for the cycle and consumed as price crosses it
-ROLL_MODE = _get_str("ROLL_MODE", "extend").lower()
-REARM_LEVELS = _get_bool("REARM_LEVELS", True)
+# static: the ladder is pinned when the cycle starts and price consumes it.
+# One ladder = LADDER_DEPTH BUY STOP + LADDER_DEPTH SELL STOP, placed once.
+# extend: the window rolls forward and consumed levels are replaced, so a live
+# ladder keeps placing new orders. That is not one fixed ladder per cycle.
+ROLL_MODE = _get_str("ROLL_MODE", "static").lower()
+# Re-arm a level whose position closed. Off: a consumed level stays consumed
+# for the life of the ladder.
+REARM_LEVELS = _get_bool("REARM_LEVELS", False)
 
 # ---------------------------------------------------------------------------
 # STOP LOSS
@@ -177,9 +185,10 @@ MAX_LOT_SIZE = _get_float("MAX_LOT_SIZE", 0.10)
 # whole cycle is closed, so this has to allow a full ladder. Too low and the
 # ladder stops after N triggers, which is the "N trades = exit" rule the
 # strategy explicitly does not have.
-MAX_OPEN_POSITIONS = _get_int("MAX_OPEN_POSITIONS", 12)
-MAX_PENDING_ORDERS = _get_int("MAX_PENDING_ORDERS", 10)
-MAX_LADDER_DEPTH = _get_int("MAX_LADDER_DEPTH", 12)     # levels used per cycle
+MAX_OPEN_POSITIONS = _get_int("MAX_OPEN_POSITIONS", 22)
+# Must allow a whole ladder (2 x LADDER_DEPTH) or it deploys short.
+MAX_PENDING_ORDERS = _get_int("MAX_PENDING_ORDERS", 22)
+MAX_LADDER_DEPTH = _get_int("MAX_LADDER_DEPTH", 22)    # levels used per cycle
 MAX_SPREAD = _get_float("MAX_SPREAD", 0.50)             # price units, 0 = off
 MAX_SLIPPAGE = _get_int("MAX_SLIPPAGE", 20)             # deviation points
 # Round-turn commission per lot in account currency (paper/replay costing)
@@ -394,6 +403,17 @@ def validate():
             f"accumulating before the ladder is fully consumed")
     if MAX_PENDING_ORDERS < 1:
         errors.append("MAX_PENDING_ORDERS must be at least 1")
+    if MAX_PENDING_ORDERS < LADDER_DEPTH * 2:
+        warnings.append(
+            f"MAX_PENDING_ORDERS={MAX_PENDING_ORDERS} is below a whole ladder "
+            f"({LADDER_DEPTH} x 2 = {LADDER_DEPTH * 2}) - every ladder will "
+            f"deploy short")
+    if ROLL_MODE != "static" or REARM_LEVELS:
+        warnings.append(
+            f"ROLL_MODE={ROLL_MODE} / REARM_LEVELS={REARM_LEVELS}: consumed "
+            f"levels will be replaced inside a live ladder. Use "
+            f"ROLL_MODE=static with REARM_LEVELS=false for one fixed "
+            f"{LADDER_DEPTH}+{LADDER_DEPTH} ladder per cycle")
     if POLL_SECONDS <= 0:
         errors.append("POLL_SECONDS must be greater than 0")
     if ROLL_MODE not in ("extend", "static"):

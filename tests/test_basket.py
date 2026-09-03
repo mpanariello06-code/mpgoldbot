@@ -265,8 +265,8 @@ t.check("13. exactly one exit, not one per pass above the target",
 t.check("the close ran once", rec.count("EXIT_TRIGGERED") == 1,
         str(rec.count("EXIT_TRIGGERED")))
 t.check("and one cooldown followed it",
-        rec.count("CYCLE_COOLDOWN_STARTED") == 1,
-        str(rec.count("CYCLE_COOLDOWN_STARTED")))
+        rec.count("COOLDOWN_STARTED") == 1,
+        str(rec.count("COOLDOWN_STARTED")))
 
 t.section("TEST 6 - NO NEW LADDER DURING THE COOLDOWN")
 t.check("the engine is in COOLDOWN_AFTER_EXIT",
@@ -284,7 +284,7 @@ t.check("the previous cycle was not reopened", not broker.positions())
 t.check("the cooldown is the stated reason",
         "re-entry cooldown" in eng.block_reason, eng.block_reason)
 t.check("no countdown spam - one event, not one per pass",
-        rec.count("CYCLE_COOLDOWN_STARTED") == 1)
+        rec.count("COOLDOWN_STARTED") == 1)
 
 t.section("TEST 7 - A NEW LADDER AT THE CURRENT PRICE AFTER 10s")
 eng.settings._values["direction_filter"] = "off"     # unfreeze
@@ -515,11 +515,13 @@ t.check("it starts once MT5 says flat", eng.cycle_active and broker.orders(),
 t.section("TEST 9 - BLOCKED WHILE PENDING ORDERS REMAIN")
 eng, broker, feed, settings, rec = build(name="t9")
 t.check("a second cycle is refused while the ladder is live",
-        eng._start_cycle(reason="should be refused") is False)
+        eng.create_new_ladder(reason="should be refused") is False)
 t.check("the cycle id did not move", eng.cycle.cycle_id == 1,
         f"#{eng.cycle.cycle_id}")
-t.check("the refusal is logged", "CYCLE_REENTRY_BLOCKED" in rec.names())
-t.check("no duplicate ladder was placed", len(broker.orders()) == 10,
+t.check("the refusal is logged",
+        "LADDER_REJECTED_ALREADY_ACTIVE" in rec.names(), str(rec.names()[-3:]))
+t.check("no duplicate ladder was placed",
+        len(broker.orders()) == settings.get("ladder_depth") * 2,
         f"{len(broker.orders())} orders")
 
 t.section("TEST 10 - HARD RISK OVERRIDES THE PROFIT TARGET")
@@ -596,8 +598,8 @@ t.check("and only the reasons that still exist",
                        RISK_TIMEOUT) for c in closes),
         str(sorted({c.kind for c in closes})))
 t.check("one cooldown per close",
-        rec.count("CYCLE_COOLDOWN_STARTED") == len(closes),
-        f"{rec.count('CYCLE_COOLDOWN_STARTED')} vs {len(closes)}")
+        rec.count("COOLDOWN_STARTED") == len(closes),
+        f"{rec.count('COOLDOWN_STARTED')} vs {len(closes)}")
 
 t.section("16. TELEMETRY IS RECORDED, 17. NEVER SENT TO TELEGRAM")
 now = [16_000.0]

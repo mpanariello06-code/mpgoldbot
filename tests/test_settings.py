@@ -21,7 +21,7 @@ rs = RuntimeSettings(cfg.runtime_defaults(), PATH)
 s = rs.snapshot()
 t.check("ladder defaults",
         (s["ladder_spacing"], s["ladder_depth"], s["basket_profit_target"],
-         s["lot_size"]) == (0.30, 5, 2.00, 0.01),
+         s["lot_size"]) == (0.30, 11, 2.00, 0.01),
         str({k: s[k] for k in ("ladder_spacing", "ladder_depth",
                                "basket_profit_target", "lot_size")}))
 t.check("the basket target is the ONE normal exit setting",
@@ -30,7 +30,7 @@ t.check("the basket target is the ONE normal exit setting",
         str([k for k in s if k.startswith(("tp_", "exit_", "profit_"))]))
 t.check("risk defaults",
         (s["max_open_positions"], s["max_pending_orders"], s["max_spread"],
-         s["direction_filter"]) == (12, 10, 0.50, "off"),
+         s["direction_filter"]) == (22, 22, 0.50, "off"),
         str({k: s[k] for k in ("max_open_positions", "max_pending_orders",
                                "max_spread", "direction_filter")}))
 t.check("there is no take-profit setting at all",
@@ -38,7 +38,12 @@ t.check("there is no take-profit setting at all",
 t.check("no trade-count or dollar exit setting exists",
         not any(k in s for k in ("profit_cycle_target", "cycle_take_profit_money",
                                  "target_profit_usd")))
-t.check("roll mode default is rolling", s["roll_mode"] == "extend")
+t.check("one ladder per cycle: the grid is pinned and never re-armed",
+        (s["roll_mode"], s["rearm_levels"]) == ("static", False),
+        f"{s['roll_mode']} / {s['rearm_levels']}")
+t.check("a whole ladder fits inside the pending-order cap",
+        s["max_pending_orders"] >= s["ladder_depth"] * 2,
+        f"{s['max_pending_orders']} vs {s['ladder_depth'] * 2}")
 t.check("no martingale knobs exist",
         not any("martingale" in k or "multiplier" in k for k in s))
 t.check("json created on first run", PATH.exists())
@@ -122,7 +127,7 @@ rs3 = RuntimeSettings(cfg.runtime_defaults(), PATH)
 problems = rs3.load()
 t.check("good values load", rs3.get("ladder_spacing") == 0.4)
 t.check("unknown keys ignored", "bogus" not in rs3.snapshot())
-t.check("bad values fall back", rs3.get("ladder_depth") == 5)
+t.check("bad values fall back", rs3.get("ladder_depth") == 11)
 t.check("problems reported", any("depth" in p.lower() for p in problems), str(problems))
 json.dump({"lot_size": 5.0, "max_lot_size": 0.10}, open(PATH, "w"))
 rs4 = RuntimeSettings(cfg.runtime_defaults(), PATH)
