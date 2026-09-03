@@ -73,8 +73,26 @@ CYCLE_HEADER = [
     "path_levels", "basket_profit_target",
     "positions_at_exit", "open_buys_at_exit", "open_sells_at_exit",
     "pending_orders_at_exit", "floating_pnl_at_exit",
-    "realized_pnl", "peak_pnl", "drawdown",
+    "realized_pnl", "final_realized_pnl", "peak_pnl", "drawdown",
+    # how the profit-management state machine ran this cycle
+    "max_floating_profit", "max_floating_loss", "max_drawdown",
+    "profit_giveback", "time_to_peak", "time_to_profit_target",
+    "time_in_profit", "time_in_protection", "protection_active",
+    "cycle_state", "exit_reason",
     "end_kind", "end_reason", "daily_profit",
+]
+
+# One row every TELEMETRY_INTERVAL_SECONDS while a cycle is open. This is the
+# intra-cycle record the exit rules are meant to be optimised against: the
+# cycle summary alone cannot show that a basket was +95 before it was -9.
+TELEMETRY_HEADER = [
+    "timestamp", "symbol", "cycle_id", "elapsed_seconds",
+    "bid", "ask", "spread",
+    "current_pnl", "peak_pnl", "drawdown_from_peak", "realized_pnl",
+    "open_positions", "open_buys", "open_sells", "pending_orders",
+    "net_volume", "ladder_depth", "triggers", "buy_triggers", "sell_triggers",
+    "direction_changes", "basket_profit_target", "protection_active",
+    "protection_threshold", "cycle_state",
 ]
 
 ACCOUNT_HEADER = [
@@ -107,13 +125,15 @@ def _fmt(value, digits=None):
 class CsvLogger:
     def __init__(self, data_dir, trade_file, event_file, account_file,
                  ladder_file="rolling_ladder_events.csv",
-                 cycle_file="rolling_ladder_cycles.csv"):
+                 cycle_file="rolling_ladder_cycles.csv",
+                 telemetry_file="basket_telemetry.csv"):
         self.dir = Path(data_dir)
         self.trade_path = self.dir / trade_file
         self.event_path = self.dir / event_file
         self.account_path = self.dir / account_file
         self.ladder_path = self.dir / ladder_file
         self.cycle_path = self.dir / cycle_file
+        self.telemetry_path = self.dir / telemetry_file
 
         self._lock = threading.Lock()
         # Keys of trade rows already written -> prevents duplicates across restarts
@@ -129,6 +149,7 @@ class CsvLogger:
         self._ensure_file(self.account_path, ACCOUNT_HEADER)
         self._ensure_file(self.ladder_path, LADDER_HEADER)
         self._ensure_file(self.cycle_path, CYCLE_HEADER)
+        self._ensure_file(self.telemetry_path, TELEMETRY_HEADER)
         self._load_trade_keys()
 
     @staticmethod
@@ -308,9 +329,11 @@ class CsvLogger:
             value = fields.get(column, "")
             if column in ("anchor", "spacing", "initial_price", "exit_price"):
                 row.append(_fmt(value, digits))
-            elif column in ("realized_pnl", "peak_pnl", "drawdown",
-                            "floating_pnl_at_exit", "daily_profit",
-                            "basket_profit_target"):
+            elif column in ("realized_pnl", "final_realized_pnl", "peak_pnl",
+                            "drawdown", "floating_pnl_at_exit", "daily_profit",
+                            "basket_profit_target", "max_floating_profit",
+                            "max_floating_loss", "max_drawdown",
+                            "profit_giveback"):
                 row.append(_fmt(value, 2))
             else:
                 row.append(_fmt(value))
@@ -359,6 +382,32 @@ class CsvLogger:
         }
 
     # ------------------------------------------------------- account snapshot
+    def log_telemetry(self, digits=2, **fields):
+        """
+        One intra-cycle basket snapshot. CSV only - never Telegram.
+
+        Written straight through with no buffering: the point of this file is
+        to survive whatever ends the cycle.
+        """
+        fields.setdefault("timestamp", _now())
+        price_keys = {"bid", "ask", "spread"}
+        money_keys = {"current_pnl", "peak_pnl", "drawdown_from_peak",
+                      "realized_pnl", "basket_profit_target",
+                      "protection_threshold"}
+        row = []
+        for column in TELEMETRY_HEADER:
+            value = fields.get(column, "")
+            if column in price_keys:
+                row.append(_fmt(value, digits))
+            elif column in money_keys:
+                row.append(_fmt(value, 2))
+            else:
+                row.append(_fmt(value))
+        try:
+            self._append(self.telemetry_path, row)
+        except Exception as exc:
+            print(f"[csv_logger] telemetry write failed: {exc}")
+
     def log_account(self, balance, equity, margin, free_margin, margin_level,
                     open_positions):
         try:

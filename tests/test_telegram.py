@@ -84,6 +84,9 @@ class FakeEngine:
             # the basket, reported as its own unit
             "basket_floating_pnl": 0.0, "basket_realized_pnl": 2.31,
             "basket_net_pnl": 2.31, "cycle_active": True,
+            "cycle_state": "PROFIT_PROTECTION", "protection_active": True,
+            "basket_peak_pnl": 10.21, "basket_giveback": 2.79,
+            "protection_threshold": 8.71,
             "cycle_age_seconds": 640, "ladder_live": True,
             "cycle_profit": 1.36, "daily_profit": 2.10,
             "total_trades": 15, "anchor": 4010.04, "block_reason": "",
@@ -210,17 +213,18 @@ async def run():
     t.section("STATUS SCREEN: CURRENT STATE vs HISTORY")
     text, _, _ = await press("status")
     for label in ["ROLLING LADDER", "XAUUSD   M5", "Cycle: #183",
-                  "State: ACTIVE", "LIVE IN MT5",
+                  "State: PROFIT PROTECTION", "LIVE IN MT5",
                   "Pending BUY: 5", "Pending SELL: 6", "Open BUY: 0",
                   "Open SELL: 5", "THIS CYCLE SO FAR",
                   "Historical BUY triggers: 2", "Historical SELL triggers: 5",
                   "Direction changes: 1", "Ladder depth used: 5",
-                  "BASKET", "Floating basket P/L", "Realized this cycle",
-                  "Cycle total", "(target $2.00)"]:
+                  "BASKET", "Current P/L", "Peak P/L: $10.21",
+                  "Giveback: $2.79", "Protection: ACTIVE",
+                  "Realized this cycle", "Cycle total", "(target $2.00)"]:
         t.check(f"status shows {label!r}", label in text,
                 "" if label in text else text.replace("\n", " | ")[:220])
     t.check("floating and realized are reported separately",
-            "Floating basket P/L: $0.00" in text and
+            "Current P/L: $0.00" in text and
             "Realized this cycle: $2.31" in text,
             text.replace("\n", " | ")[:240])
     t.check("current orders are not confused with historical triggers",

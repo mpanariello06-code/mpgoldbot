@@ -41,7 +41,7 @@ runtime_settings.py     Telegram-controlled settings, persisted as JSON
 telegram_controller.py  control panel (own thread, own event loop)
 telegram_settings.py    the ⚙️ SETTINGS menu tree
 csv_logger.py           trades, events, account snapshots, ladder events, cycles
-tests/                  780 offline checks — python tests/run_all.py
+tests/                  895 offline checks — python tests/run_all.py
 data/                   CSVs + runtime_settings.json + state files (auto-created)
 ```
 
@@ -197,23 +197,42 @@ it — the behaviour visible in the reference recording.
 
 ## The exit
 
-**There is exactly one normal strategy exit:**
+The normal strategy exit is **basket profit management** — one state machine,
+one decision path:
 
 ```
-total floating basket P/L >= BASKET_PROFIT_TARGET   ->  close everything
+BASKET_BUILDING        below the target
+      ↓  floating P/L >= BASKET_PROFIT_TARGET
+PROFIT_TARGET_REACHED  taken now if PROFIT_RUNNER_ENABLED is off;
+                       otherwise allowed to run, with the floor underneath it
+      ↓  peak >= PROFIT_PROTECTION_ACTIVATION
+PROFIT_PROTECTION      the peak is trailed: give back more than
+                       PROFIT_PROTECTION_TRAIL and the basket is taken
 ```
 
-`BASKET_PROFIT_TARGET` defaults to **$2.00** and is the single source of truth —
-one setting in `.env`, editable at runtime under ⚙️ SETTINGS → 🎯 BASKET TARGET,
-and no dollar figure is hard-coded anywhere else. Set it to 0 and the normal
-exit is disabled, leaving only the risk limits.
+Peak P/L is tracked per cycle, only ever rises while the cycle is open, and
+starts at zero for every new cycle. `drawdown_from_peak = peak_pnl -
+current_pnl`. Every threshold is a setting; none of them is written twice.
 
-It is evaluated on **every poll**, against the live basket. There is no candle
-wait, no confirmation window and no second condition:
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `BASKET_PROFIT_TARGET` | 2.00 | the profit at which a basket is takeable |
+| `PROFIT_RUNNER_ENABLED` | true | let a basket run past the target instead of cutting it off |
+| `PROFIT_PROTECTION_ACTIVATION` | 3.00 | peak at which the trail arms — and it stays armed |
+| `PROFIT_PROTECTION_TRAIL` | 1.50 | give-back from the peak that closes the basket |
+| `MIN_PROTECTED_PROFIT` | 1.00 | the floor a protected basket is never knowingly let through (capped at the target) |
 
-```
-+1.72  +1.83  +1.94  +2.01   <- exits here, on the tick
-```
+**Why this exists.** A cycle that reached +$95 floating and closed at −$9.78 is
+the failure this replaces: the $2 target alone captured nothing on the way up
+and the emergency drawdown was the only thing left underneath. Now the same
+path — `+2 +10 +30 +60 +95 +70 …` — arms protection at +3 and closes on the
+first give-back past the trail, at +70 rather than −9. That sequence is a test.
+
+The trail is deliberately a **fixed dollar amount** for this version: it is the
+simplest thing that reliably stops a winner becoming a loser.
+`ProfitRules.trail_for(peak)` is the one place it is computed — a
+percentage-of-peak, volatility-adjusted or ladder-depth-adjusted trail replaces
+that method body and nothing else.
 
 ### Order of precedence
 
@@ -222,11 +241,13 @@ A cycle ends for exactly one reason, checked in this order:
 1. `MAX_CYCLE_DRAWDOWN` — the basket is too deep under water (`RISK_DRAWDOWN`)
 2. `MAX_CYCLE_DURATION` — the cycle has been open too long (`RISK_TIMEOUT`).
    **A basket can never float indefinitely.** Set it to 0 and it can.
-3. the basket profit target (`BASKET_PROFIT_TARGET`)
+3. basket profit management — `BASKET_PROFIT_TARGET` or `PROFIT_PROTECTION`
 
-The first two are emergency protection and override the strategy. The exit
-reasons are the complete set: `BASKET_PROFIT_TARGET`, `RISK_DRAWDOWN`,
-`RISK_TIMEOUT`, `RISK_SPREAD`, `MANUAL_STOP`, `OTHER_RISK_EXIT`.
+The first two are emergency protection and override the strategy. In practice
+a basket that got ahead is taken by the trail long before the emergency
+drawdown is reached — that is the point of it. The exit reasons are the
+complete set: `BASKET_PROFIT_TARGET`, `PROFIT_PROTECTION`, `RISK_DRAWDOWN`,
+`RISK_TIMEOUT`, `RISK_SPREAD`, `EMERGENCY_EXIT`, `MANUAL_EXIT`.
 
 ### An exit closes the entire basket
 
@@ -263,7 +284,7 @@ restored from here.
 | ⏸ PAUSE | cancels pending levels, opens nothing new — open positions keep being managed |
 | ▶️ RESUME | rebuilds the ladder |
 | 🛑 STOP | stops the loop and cancels pending orders; **open positions are left untouched** |
-| 📊 STATUS | mode, price, spread, spacing, lot, cycle and its state, live pendings and positions split by side, historical triggers, ladder depth, and the basket's floating / realized / total P/L against its target |
+| 📊 STATUS | mode, price, spread, spacing, lot, cycle and its profit-management state, live pendings and positions split by side, historical triggers, ladder depth, and the basket's current / peak / give-back P/L with the protection threshold |
 | 💰 ACCOUNT | live balance/equity/margin |
 | 📈 POSITIONS | open positions + pending count |
 | 📋 TODAY'S STATS | from `ladder.csv`: orders placed, levels triggered, TP/SL hits, cycles, realised P/L |
@@ -308,11 +329,11 @@ immediately (no restart), never modifies open positions, and is stored in
 
 | Menu | Controls |
 | --- | --- |
-| 🎯 BASKET TARGET | the one normal exit — $1 / $2 / $3 / $5 or custom, or OFF |
+| 🎯 BASKET PROFIT | the target, the profit runner on/off, the protection activation, the trail and the protected floor |
 | 💰 LOT SIZE | 0.01–0.10 or custom, plus the hard MAX LOT cap |
 | 🪜 LADDER SETTINGS | spacing (0.10–0.50), depth, first-level offset, roll mode, cycle |
 | 🛑 STOP LOSS | emergency per-position SL (off by default), and 📐 PIP SIZE |
-| 🔔 NOTIFICATIONS | status updates ON/OFF and interval, error throttle |
+| 🔔 NOTIFICATIONS | status updates ON/OFF and interval, error throttle, telemetry interval |
 | 🛡 RISK SETTINGS | max open, max pending, max depth, max spread, daily/cycle drawdown, losing-cycle streak, cooldown, order age |
 | 🧭 DIRECTION | OFF / BOTH / BUY ONLY / SELL ONLY / NO ENTRIES |
 
@@ -354,8 +375,18 @@ filter in particular blocks and un-blocks automatically.
   exactly why it ended, including the state **at the moment the exit was
   decided** (`exit_price`, `positions_at_exit`, `open_buys_at_exit`,
   `open_sells_at_exit`, `pending_orders_at_exit`, `floating_pnl_at_exit`) rather
-  than the empty state that follows the close, plus `basket_profit_target`,
-  `ladder_depth_used`, `peak_pnl`, `drawdown`, `end_kind` and `end_reason`
+  than the empty state that follows the close, plus how the profit-management
+  state machine ran: `max_floating_profit`, `max_floating_loss`,
+  `max_drawdown`, `profit_giveback`, `time_to_peak`, `time_to_profit_target`,
+  `time_in_profit`, `time_in_protection`, `protection_active`, `cycle_state`,
+  `exit_reason` and `final_realized_pnl`
+* `data/basket_telemetry.csv` — an intra-cycle snapshot every
+  `TELEMETRY_INTERVAL_SECONDS` while a cycle is open: price, current / peak /
+  give-back P/L, open and pending counts, net volume, ladder depth, triggers,
+  the target in force, whether protection is active and the threshold it would
+  close at. **This is the file the exit thresholds should be fitted on** — a
+  cycle summary alone cannot show that a basket was +95 before it was −9. CSV
+  only; none of it reaches Telegram.
 * `data/trades.csv` — one row per open and close, with cycle and level context
 * `data/events.csv` — bot events (start/stop/pause/settings/errors)
 * `data/account_snapshots.csv` — periodic balance/equity/margin
@@ -398,11 +429,15 @@ you only touch once.
 ## Tests
 
 ```bash
-python tests/run_all.py        # 780 checks, no MT5 or network needed
+python tests/run_all.py        # 895 checks, no MT5 or network needed
 ```
 
 Covers: the basket profit target at 1.99 / 2.00 / 2.01 and fluctuating around
-it (one exit, never repeated); no individual TP on any order or position; the
+it (one exit, never repeated); peak tracking that never decreases and resets
+per cycle; drawdown-from-peak; the trail closing a protected basket and the
+floor catching one the trail would let bleed out; the +95 → −9 sequence exiting
+during the retracement; a never-profitable basket still hitting the emergency
+drawdown; telemetry snapshots at the configured interval and never in Telegram; no individual TP on any order or position; the
 basket's floating / realized / net P/L and its cycle scoping; the whole basket
 closing at once; the 10-second cooldown creating nothing; the next ladder
 anchored on the current price; the one-active-cycle gate blocked by leftover
@@ -416,9 +451,11 @@ replay determinism and costing; and a paper-mode run end to end.
 
 ## What still needs fitting
 
-`BASKET_PROFIT_TARGET`, the ladder spacing, depth and first-level offset, the
-drawdown and duration limits and the cooldown are **starting values**, not
-results. This version is deliberately simple and deterministic so it can be
+`BASKET_PROFIT_TARGET`, `PROFIT_PROTECTION_ACTIVATION`,
+`PROFIT_PROTECTION_TRAIL`, `MIN_PROTECTED_PROFIT`, the ladder spacing, depth
+and first-level offset, the drawdown and duration limits and the cooldown are
+**starting values**, not results. The trail in particular is a guess: fit it on
+`basket_telemetry.csv`, which exists for exactly that. This version is deliberately simple and deterministic so it can be
 measured; fit it with `replay.py` on real XAUUSD M5 history, and set
 `COMMISSION_PER_LOT` to your broker's real figure before drawing any conclusion.
 

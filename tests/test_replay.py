@@ -103,8 +103,9 @@ t.check("a reversal series completes cycles", len(res.cycles) > 0,
 t.check("cycle endings are attributed", bool(res.exit_reasons),
         str(res.exit_reasons))
 t.check("endings name an explicit reason, never a trade count",
-        all(k in ("BASKET_PROFIT_TARGET", "RISK_DRAWDOWN", "RISK_TIMEOUT",
-                  "RISK_SPREAD", "MANUAL_STOP", "OTHER_RISK_EXIT")
+        all(k in ("BASKET_PROFIT_TARGET", "PROFIT_PROTECTION", "RISK_DRAWDOWN",
+                  "RISK_TIMEOUT", "RISK_SPREAD", "EMERGENCY_EXIT",
+                  "MANUAL_EXIT")
             for k in res.exit_reasons), str(res.exit_reasons))
 t.check("cycle rows carry the sequence and the basket at the exit",
         all({"buy", "sell", "triggers", "depth", "floating_at_exit"} <= set(c)

@@ -26,8 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from broker import BUY, BUY_STOP, SELL, SELL_STOP
-from basket import (BASKET_PROFIT_TARGET, RISK_DRAWDOWN, RISK_TIMEOUT,
-                    CycleBasket)
+from basket import (RISK_DRAWDOWN, RISK_TIMEOUT, CycleBasket, ProfitRules)
 
 COMMENT_RE = re.compile(r"^RL(\d+)([BS])(-?\d+)")
 
@@ -188,6 +187,7 @@ class RollingLadderEngine:
         self._triggered_keys = set()      # (side, index) already in the sequence
         self._depth_capped_logged = False
         self._last_place_error = 0.0
+        self._last_telemetry = 0.0
         # There is exactly one active cycle at a time. Between a cycle closing
         # and the next ladder going out the engine is deliberately cycle-less:
         # no ladder, no orders, no new cycle, until the re-entry cooldown has
@@ -384,6 +384,7 @@ class RollingLadderEngine:
         self._levels_done.clear()
         self._triggered_keys.clear()
         self._depth_capped_logged = False
+        self._last_telemetry = 0.0
         self.cycle_active = True
         self.reentry_until = 0.0
         self._cycle_announced = False
@@ -609,13 +610,27 @@ class RollingLadderEngine:
             "drawdown": self.get_cycle_drawdown(cid),
         }
 
-    def mark_to_market(self, tick, positions=None):
+    def profit_rules(self, snap):
+        """The profit-management settings, read live. One source of truth."""
+        return ProfitRules(
+            target=float(snap["basket_profit_target"]),
+            runner_enabled=bool(snap["profit_runner_enabled"]),
+            activation=float(snap["profit_protection_activation"]),
+            trail=float(snap["profit_protection_trail"]),
+            floor=float(snap["min_protected_profit"]),
+        )
+
+    def mark_to_market(self, snap, tick, positions=None):
         """
-        Refresh the basket's floating P/L from what MT5 reports, every pass.
+        Refresh the basket from what MT5 reports, every pass.
 
         This is the only number the normal exit reads: a BUY leg at -1.20 while
         three SELL legs sit at +2.40 is a basket at +1.20. No position is ever
         closed for being individually profitable or individually losing.
+
+        Marking also advances the profit-management state machine - peak, the
+        protection threshold and the timers - so the exit decision below always
+        sees current numbers.
         """
         if self.sequence is None:
             return 0.0
@@ -623,7 +638,7 @@ class RollingLadderEngine:
         if tick is not None:
             self.sequence.update_price(tick.mid)
         floating = self.get_cycle_floating_pnl(self.cycle.cycle_id, legs)
-        self.sequence.update_pnl(floating)
+        self.sequence.mark(floating, self.profit_rules(snap), self.clock())
         return floating
 
     # ================================================================= risk
@@ -714,6 +729,12 @@ class RollingLadderEngine:
 
         # 2. newly triggered levels
         self._detect_triggers(positions, orders, snap, tick)
+
+        # 2b. mark the basket to market once, here, so the telemetry row and
+        #     the exit decision below both read the same current numbers
+        if self.cycle_active:
+            self.mark_to_market(snap, tick, positions)
+        self._telemetry(snap, tick, positions, orders)
 
         # 3. cycle completion / loss - and, on a clean handoff, immediately
         #    continue this same pass so the next ladder goes out at once
@@ -886,7 +907,7 @@ class RollingLadderEngine:
 
             # Live basket P/L, refreshed every pass: the exit reacts to the
             # tick, not to a candle close or any other signal.
-            floating = self.mark_to_market(tick, positions)
+            floating = self.mark_to_market(snap, tick, positions)
             reason_code, detail = self._exit_reason(snap, floating, positions)
             if reason_code is None:
                 return False
@@ -928,8 +949,12 @@ class RollingLadderEngine:
         Priority, highest first:
           1. hard risk - cycle drawdown, then cycle duration. These are
              emergency protection and override everything below;
-          2. the one normal strategy exit: the basket's total floating P/L
-             reaching BASKET_PROFIT_TARGET.
+          2. basket profit management - the target, or the trail protecting a
+             peak that has already been reached.
+
+        Profit protection is deliberately checked BEFORE the emergency
+        drawdown can bite: a basket that was well ahead should be taken on the
+        trail, not left to run all the way down to the drawdown limit.
 
         Returns (reason_code, detail) or (None, "") to keep the cycle running.
         """
@@ -946,13 +971,12 @@ class RollingLadderEngine:
                                   f"(limit {max_minutes:.0f}) - closing out")
 
         # --- 2. the normal exit ----------------------------------------------
-        # One source of truth for the target, read live every pass. There is no
-        # candle wait, no confirmation window and no second condition.
-        target = float(snap["basket_profit_target"])
-        if target > 0 and positions and floating >= target:
-            return BASKET_PROFIT_TARGET, (f"basket floating P/L {floating:+.2f} "
-                                          f"reached the {target:+.2f} target")
-        return None, ""
+        # Basket profit management, decided in one place (CycleBasket) from the
+        # live settings. There is no candle wait and no second condition.
+        if self.sequence is None:
+            return None, ""
+        return self.sequence.should_exit(self.profit_rules(snap),
+                                         has_exposure=bool(positions))
 
     def _advance_close(self, snap, positions, orders):
         """
@@ -1296,6 +1320,55 @@ class RollingLadderEngine:
         for order in orders:
             self._cancel(order, reason)
 
+    # =============================================================== telemetry
+    def _telemetry(self, snap, tick, positions, orders):
+        """
+        Emit one basket snapshot every TELEMETRY_INTERVAL_SECONDS.
+
+        The hook writes it to CSV. Nothing here reaches Telegram, and nothing
+        here decides anything - it reads the same basket the exit reads.
+        """
+        if not self.cycle_active or self.sequence is None:
+            return
+        interval = float(snap.get("telemetry_interval_seconds", 0.0))
+        if interval <= 0:
+            return
+        now = self.clock()
+        if self._last_telemetry and now - self._last_telemetry < interval:
+            return
+        self._last_telemetry = now
+
+        legs = self.cycle_positions(self.cycle.cycle_id, positions)
+        ords = self.cycle_orders(self.cycle.cycle_id, orders)
+        seq = self.sequence
+        self._emit("telemetry", {
+            "symbol": self.broker.symbol,
+            "cycle_id": self.cycle.cycle_id,
+            "elapsed_seconds": round(now - self.cycle.started_at, 1),
+            "bid": tick.bid if tick else "",
+            "ask": tick.ask if tick else "",
+            "spread": tick.spread if tick else "",
+            "current_pnl": round(seq.floating_pnl, 2),
+            "peak_pnl": round(seq.peak_pnl, 2),
+            "drawdown_from_peak": round(seq.drawdown, 2),
+            "realized_pnl": self.get_cycle_realized_pnl(),
+            "open_positions": len(legs),
+            "open_buys": len([p for p in legs if p.side == BUY]),
+            "open_sells": len([p for p in legs if p.side == SELL]),
+            "pending_orders": len(ords),
+            "net_volume": round(sum((1 if p.side == BUY else -1) * p.volume
+                                    for p in legs), 4),
+            "ladder_depth": seq.ladder_depth_used,
+            "triggers": seq.total_triggers,
+            "buy_triggers": seq.buy_triggers,
+            "sell_triggers": seq.sell_triggers,
+            "direction_changes": seq.direction_changes,
+            "basket_profit_target": snap["basket_profit_target"],
+            "protection_active": seq.protection_active,
+            "protection_threshold": round(seq.protection_threshold, 2),
+            "cycle_state": seq.state,
+        })
+
     # ================================================================ reporting
     def snapshot(self):
         """Everything the Telegram STATUS screen needs."""
@@ -1347,6 +1420,17 @@ class RollingLadderEngine:
             "basket_realized_pnl": basket["realized_pnl"],
             "basket_net_pnl": basket["net_pnl"],
             "basket_drawdown_now": basket["drawdown"],
+            # profit management, for the status screen
+            "basket_peak_pnl": (round(self.sequence.peak_pnl, 2)
+                                if self.sequence else 0.0),
+            "basket_giveback": (round(self.sequence.drawdown, 2)
+                                if self.sequence else 0.0),
+            "protection_active": bool(self.sequence and
+                                      self.sequence.protection_active),
+            "protection_threshold": (round(self.sequence.protection_threshold, 2)
+                                     if self.sequence else 0.0),
+            "cycle_state": (self.sequence.state if self.sequence
+                            else "BASKET_BUILDING"),
             # --- one active cycle at a time ---
             "cycle_active": self.cycle_active,
             "reentry_wait_seconds": round(self._reentry_wait(), 1),

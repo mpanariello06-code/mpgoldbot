@@ -67,7 +67,8 @@ t.check("paper broker selected", app.bot.broker.is_paper)
 t.check("monitor thread alive", app.monitor.is_alive())
 t.check("engine not auto-started", app.bot.state == "STOPPED")
 for name in ("trades.csv", "events.csv", "account_snapshots.csv",
-             "rolling_ladder_events.csv", "rolling_ladder_cycles.csv"):
+             "rolling_ladder_events.csv", "rolling_ladder_cycles.csv",
+             "basket_telemetry.csv"):
     t.check(f"{name} created", (TMP / name).exists())
 header = open(TMP / "rolling_ladder_events.csv").readline().strip().split(",")
 for column in ("timestamp", "symbol", "cycle_id", "candle_time", "event_type",
@@ -86,8 +87,21 @@ for column in ("cycle_id", "triggers", "buy_triggers", "sell_triggers",
                "open_buys_at_exit", "open_sells_at_exit",
                "pending_orders_at_exit", "floating_pnl_at_exit",
                "peak_pnl", "drawdown", "duration_seconds",
-               "basket_profit_target", "ladder_depth_used", "net_levels"):
+               "basket_profit_target", "ladder_depth_used", "net_levels",
+               "max_floating_profit", "max_floating_loss", "max_drawdown",
+               "profit_giveback", "time_to_peak", "time_to_profit_target",
+               "time_in_profit", "time_in_protection", "protection_active",
+               "cycle_state", "exit_reason", "final_realized_pnl"):
     t.check(f"cycle log has {column!r}", column in cycle_header)
+telemetry_header = open(TMP / "basket_telemetry.csv").readline().strip().split(",")
+for column in ("timestamp", "symbol", "cycle_id", "elapsed_seconds", "bid",
+               "ask", "spread", "current_pnl", "peak_pnl",
+               "drawdown_from_peak", "realized_pnl", "open_positions",
+               "open_buys", "open_sells", "pending_orders", "net_volume",
+               "ladder_depth", "triggers", "buy_triggers", "sell_triggers",
+               "direction_changes", "basket_profit_target",
+               "protection_active", "protection_threshold", "cycle_state"):
+    t.check(f"telemetry log has {column!r}", column in telemetry_header)
 events = [e["event_type"] for e in rows("events.csv")]
 t.check("startup recorded", "BOT_STARTED" in events and "MT5_CONNECTED" in events,
         str(sorted(set(events))))
@@ -150,15 +164,23 @@ t.check("trade recorded with ladder context",
 
 pos = app.bot.positions()[0]
 t.check("the triggered position has NO take profit", pos.tp == 0, str(pos.tp))
-# a level does not close on its own any more; the whole basket exits together
-mt5.set_price(round(pos.price_open + 2.10, 2))     # basket well past the target
-t.check("the basket exited on its target",
+# A level does not close on its own; the whole basket exits together, and with
+# the profit runner on it is the trail that takes it, not the bare target.
+mt5.set_price(round(pos.price_open + 6.00, 2))     # well past activation
+t.check("the basket ran past the target under protection",
+        wait_for(lambda: app.bot.status().get("protection_active")),
+        str(app.bot.status().get("basket_peak_pnl")))
+peak = app.bot.status().get("basket_peak_pnl", 0)
+mt5.set_price(round(pos.price_open + 6.00 - 2.50, 2))   # give back past the trail
+t.check("the trail closed the whole basket",
         wait_for(lambda: not app.bot.positions()),
-        f"{len(app.bot.positions())} positions")
+        f"{len(app.bot.positions())} positions, peak {peak}")
 t.check("NO per-TP Telegram message", not any("TP HIT" in n for n in notes),
         str(notes))
-t.check("the close names the basket target",
-        any("BASKET PROFIT" in n for n in notes), str(notes[-1:]))
+t.check("the close names profit protection",
+        any("PROFIT PROTECTION" in n for n in notes), str(notes[-1:]))
+t.check("and reports the peak and the give-back",
+        any("Peak:" in n and "Giveback:" in n for n in notes), str(notes[-1:]))
 t.check("entries are still recorded in full",
         any(r["event_type"] == "ORDER_TRIGGERED"
             for r in rows("rolling_ladder_events.csv")))
@@ -211,6 +233,15 @@ app.bot._reconnect_at = 0
 time.sleep(0.4)
 mt5.STATE["fail_symbol_info"] = False
 time.sleep(0.5)
+telemetry_header = open(TMP / "basket_telemetry.csv").readline().strip().split(",")
+for column in ("timestamp", "symbol", "cycle_id", "elapsed_seconds", "bid",
+               "ask", "spread", "current_pnl", "peak_pnl",
+               "drawdown_from_peak", "realized_pnl", "open_positions",
+               "open_buys", "open_sells", "pending_orders", "net_volume",
+               "ladder_depth", "triggers", "buy_triggers", "sell_triggers",
+               "direction_changes", "basket_profit_target",
+               "protection_active", "protection_threshold", "cycle_state"):
+    t.check(f"telemetry log has {column!r}", column in telemetry_header)
 events = [e["event_type"] for e in rows("events.csv")]
 t.check("disconnect logged", "MT5_DISCONNECTED" in events)
 t.check("engine survived the dropout", app.bot.state == "RUNNING")

@@ -261,10 +261,15 @@ class TelegramController:
         spread = f"{s['spread']:.{d}f}" if s.get("spread") is not None else "n/a"
         updated = s.get("last_update")
 
-        cycle_word = ("ACTIVE" if s.get("cycle_active", True) else
-                      "COOLDOWN" if s.get("in_reentry_cooldown") else "CLOSED")
+        if not s.get("cycle_active", True):
+            cycle_word = ("COOLDOWN" if s.get("in_reentry_cooldown")
+                          else "CLOSED")
+        else:
+            cycle_word = (s.get("cycle_state") or "BASKET_BUILDING").replace(
+                "_", " ")
         target = s.get("basket_profit_target", 0.0)
         floating = s.get("basket_floating_pnl", 0.0)
+        protection = s.get("protection_active")
 
         lines = [
             "📊 <b>ROLLING LADDER</b>", "",
@@ -294,11 +299,15 @@ class TelegramController:
             f"Ladder depth used: {s.get('ladder_depth_used', 0)}",
             "",
             "<b>BASKET</b>",
-            f"Floating basket P/L: {_money(floating)}"
+            f"Current P/L: {_money(floating)}"
             + (f"   (target {_money(target)})" if target else ""),
+            f"Peak P/L: {_money(s.get('basket_peak_pnl', 0))}",
+            f"Giveback: {_money(s.get('basket_giveback', 0))}",
+            f"Protection: {'ACTIVE' if protection else 'not active'}"
+            + (f" - closes at {_money(s.get('protection_threshold', 0))}"
+               if protection else ""),
             f"Realized this cycle: {_money(s.get('basket_realized_pnl', 0))}",
             f"Cycle total: {_money(s.get('basket_net_pnl', 0))}",
-            f"Drawdown: {_money(-abs(s.get('basket_drawdown', 0)))}",
             f"Daily P/L: {_money(s.get('daily_profit', 0))}",
             "",
             f"Spacing: {s.get('spacing')}   Lot: {s.get('lot')}",

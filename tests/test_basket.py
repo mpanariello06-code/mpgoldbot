@@ -12,7 +12,8 @@ from harness import Suite, use_stub_mt5
 use_stub_mt5()
 
 import config as cfg
-from basket import BASKET_PROFIT_TARGET, RISK_DRAWDOWN, RISK_TIMEOUT
+from basket import (BASKET_PROFIT_TARGET, PROFIT_PROTECTION, RISK_DRAWDOWN,
+                    RISK_TIMEOUT, CycleBasket, ProfitRules)
 from broker import BUY, BUY_STOP, SELL, SELL_STOP
 from fakes import Recorder, TickFeed, make_paper, trigger_buy, trigger_sell
 from ladder_engine import RollingLadderEngine, State, parse_comment
@@ -80,9 +81,14 @@ def drift(eng, broker, feed, target):
 
 
 def frozen(name, overrides=None, now=None):
-    """A stable two-leg basket with a frozen ladder, ready to be drifted."""
+    """A stable basket with a frozen ladder, ready to be drifted.
+
+    The profit runner is OFF by default here so the plain target behaviour can
+    be tested on its own; the runner and its protection have their own section.
+    """
     opts = {"max_cycle_drawdown": 0, "max_cycle_duration_minutes": 0,
-            "cycle_reentry_cooldown_seconds": 10}
+            "cycle_reentry_cooldown_seconds": 10,
+            "profit_runner_enabled": False}
     opts.update(overrides or {})
     clock = (lambda: now[0]) if now is not None else None
     eng, broker, feed, settings, rec = build(opts, name=name, clock=clock)
@@ -158,6 +164,23 @@ t.check("the cycle is still open", eng.cycle_active and
 t.check("nothing was closed", bool(broker.positions()),
         f"{len(broker.positions())} positions")
 
+t.section("WITH THE RUNNER ON, +2.00 IS NOT A CEILING")
+now = [1500.0]
+eng, broker, feed, settings, rec = frozen(
+    "runner", {"profit_runner_enabled": True}, now=now)
+start_cycle = eng.cycle.cycle_id
+drift(eng, broker, feed, 2.50)
+now[0] += 1
+eng.step()
+t.check("a basket past the target is allowed to run",
+        eng.cycle_active and eng.cycle.cycle_id == start_cycle,
+        f"#{eng.cycle.cycle_id} active={eng.cycle_active}")
+t.check("the state says the target was reached",
+        eng.sequence.state == "PROFIT_TARGET_REACHED", eng.sequence.state)
+t.check("protection is not active yet - the peak is below activation",
+        not eng.sequence.protection_active,
+        f"peak {eng.sequence.peak_pnl:+.2f}")
+
 t.section("TEST 1 - BASKET REACHES EXACTLY +2.00")
 now = [2000.0]
 eng, broker, feed, settings, rec = frozen("t1", now=now)
@@ -211,7 +234,8 @@ t.check("every exit step is logged",
 now = [4500.0]
 eng2, broker2, feed2, settings2, rec2 = build(
     {"basket_profit_target": 0.30, "max_cycle_drawdown": 0,
-     "max_cycle_duration_minutes": 0}, name="t5b", clock=lambda: now[0])
+     "max_cycle_duration_minutes": 0, "profit_runner_enabled": False},
+    name="t5b", clock=lambda: now[0])
 take(eng2, broker2, feed2, BUY_STOP, now)
 for _ in range(12):
     if not eng2.cycle_active:
@@ -279,12 +303,194 @@ t.check("anchored on the CURRENT price, not the old grid",
         f"anchor {eng.cycle.anchor} price {feed().mid:.2f}")
 t.check("the basket starts empty", eng.get_cycle_floating_pnl() == 0.0)
 
+# ===========================================================================
+t.section("PROFIT PROTECTION - PEAK TRACKING")
+now = [10_000.0]
+eng, broker, feed, settings, rec = frozen(
+    "peak", {"profit_runner_enabled": True}, now=now)
+seen = []
+for value in (0.50, 2.20, 4.00, 3.10, 3.60):
+    drift(eng, broker, feed, value)
+    now[0] += 1
+    eng.step()
+    if not eng.cycle_active:
+        break
+    seen.append((round(eng.get_cycle_floating_pnl(), 2),
+                 round(eng.sequence.peak_pnl, 2),
+                 round(eng.sequence.drawdown, 2)))
+t.check("3. peak follows the basket up",
+        [p for _, p, _ in seen] == sorted(p for _, p, _ in seen), str(seen))
+t.check("4. peak never decreases when the basket falls back",
+        seen[-1][1] >= max(v for v, _, _ in seen), str(seen))
+t.check("5. drawdown from peak = peak - current",
+        all(abs(dd - (pk - cur)) < 0.02 for cur, pk, dd in seen), str(seen))
+t.check("2. protection activated once the peak passed the activation level",
+        eng.sequence.protection_active, f"peak {eng.sequence.peak_pnl:+.2f}")
+t.check("and the state says so",
+        eng.sequence.state == "PROFIT_PROTECTION", eng.sequence.state)
+t.check("the threshold it will close at is published",
+        abs(eng.sequence.protection_threshold -
+            (eng.sequence.peak_pnl - settings.get("profit_protection_trail")))
+        < 0.01, str(eng.sequence.protection_threshold))
+t.check("protection stays on even if the basket falls back below activation",
+        eng.sequence.protection_active)
+
+t.section("6. THE TRAIL CLOSES THE BASKET")
+now = [11_000.0]
+eng, broker, feed, settings, rec = frozen(
+    "trail", {"profit_runner_enabled": True,
+              "profit_protection_activation": 3.00,
+              "profit_protection_trail": 1.50}, now=now)
+drift(eng, broker, feed, 8.00)
+now[0] += 1
+eng.step()
+t.check("a basket at +8.00 is protected, not closed",
+        eng.cycle_active and eng.sequence.protection_active,
+        f"active={eng.cycle_active}")
+peak = eng.sequence.peak_pnl
+drift(eng, broker, feed, 6.90)          # 1.10 back - inside the trail
+now[0] += 1
+eng.step()
+t.check("a give-back inside the trail is tolerated", eng.cycle_active,
+        f"giveback {peak - eng.get_cycle_floating_pnl():.2f}")
+drift(eng, broker, feed, 6.50)          # exactly 1.50 back
+now[0] += 1
+eng.step()
+closes = [c for c in rec.cycles if c.kind_of == "complete"]
+t.check("the trail closes it at the threshold", not eng.cycle_active,
+        f"active={eng.cycle_active}")
+t.check("recorded as PROFIT_PROTECTION",
+        closes and closes[-1].kind == PROFIT_PROTECTION,
+        str([c.kind for c in closes]))
+t.check("it banked most of the excursion",
+        closes and closes[-1].context["floating_pnl_at_exit"] >= 6.00,
+        str(closes[-1].context.get("floating_pnl_at_exit") if closes else None))
+t.check("the reason names the peak and the give-back",
+        closes and "peak" in closes[-1].reason and "gave back" in closes[-1].reason,
+        closes[-1].reason if closes else "")
+
+t.section("7. THE PROTECTED FLOOR IS NOT FALLEN THROUGH")
+# A trail wide enough to let the basket bleed out: the floor is the backstop.
+now = [12_000.0]
+eng, broker, feed, settings, rec = frozen(
+    "floor", {"profit_runner_enabled": True,
+              "profit_protection_activation": 3.00,
+              "profit_protection_trail": 100.0,
+              "min_protected_profit": 1.00}, now=now)
+drift(eng, broker, feed, 5.00)
+now[0] += 1
+eng.step()
+t.check("protection is active", eng.sequence.protection_active)
+for value in (4.00, 3.00, 2.00, 1.00):
+    if not eng.cycle_active:
+        break
+    drift(eng, broker, feed, value)
+    now[0] += 1
+    eng.step()
+closes = [c for c in rec.cycles if c.kind_of == "complete"]
+t.check("the floor closed it before it went negative", not eng.cycle_active,
+        f"active={eng.cycle_active}")
+t.check("recorded as PROFIT_PROTECTION",
+        closes and closes[-1].kind == PROFIT_PROTECTION,
+        str([c.kind for c in closes]))
+t.check("it closed at or above the floor, never below",
+        closes and closes[-1].context["floating_pnl_at_exit"] >= 0.99,
+        str(closes[-1].context.get("floating_pnl_at_exit") if closes else None))
+t.check("the reason names the floor",
+        closes and "floor" in closes[-1].reason, closes[-1].reason if closes else "")
+
+t.section("A BASKET THAT ONLY REACHED THE TARGET IS STILL PROTECTED")
+# +2.20 then straight back down: the peak never reached activation, so the
+# trail never armed - the floor still stops it becoming a loss.
+now = [13_000.0]
+eng, broker, feed, settings, rec = frozen(
+    "shallow", {"profit_runner_enabled": True,
+                "profit_protection_activation": 3.00}, now=now)
+drift(eng, broker, feed, 2.20)
+now[0] += 1
+eng.step()
+t.check("it ran past the target", eng.cycle_active and
+        eng.sequence.state == "PROFIT_TARGET_REACHED", eng.sequence.state)
+for value in (1.80, 1.20, 0.90):
+    if not eng.cycle_active:
+        break
+    drift(eng, broker, feed, value)
+    now[0] += 1
+    eng.step()
+closes = [c for c in rec.cycles if c.kind_of == "complete"]
+t.check("the floor took it rather than letting it run to a loss",
+        not eng.cycle_active, f"active={eng.cycle_active}")
+t.check("attributed to the target it had already reached",
+        closes and closes[-1].kind == BASKET_PROFIT_TARGET,
+        str([c.kind for c in closes]))
+
+t.section("THE CYCLE 25 SEQUENCE")
+# +2 +10 +30 +60 +95 +70 ... -9 : the basket must not be allowed to give the
+# whole excursion back. Driven through the real state machine.
+b = CycleBasket(25, 4010.0, 0.30, started_at=0.0)
+rules = ProfitRules()
+path, exit_at, exit_reason = [2, 10, 30, 60, 95, 70, 40, 10, 0, -5, -9], None, ""
+for i, pnl in enumerate(path):
+    b.mark(float(pnl), rules, float(i))
+    reason, _ = b.should_exit(rules)
+    if reason:
+        exit_at, exit_reason = pnl, reason
+        break
+t.check("it exits during the retracement, not at the end",
+        exit_at is not None and exit_at > 0, str(exit_at))
+t.check("recorded as PROFIT_PROTECTION", exit_reason == PROFIT_PROTECTION,
+        exit_reason)
+t.check("the peak was held at the top", b.peak_pnl == 95.0, str(b.peak_pnl))
+t.check("it never reached the negative tail", exit_at >= 70, str(exit_at))
+t.check("the threshold is configurable, not a magic number",
+        ProfitRules(trail=25.0).trail_for(95.0) == 25.0)
+
+t.section("15. PEAK TRACKING RESETS FOR A NEW CYCLE")
+now = [14_000.0]
+eng, broker, feed, settings, rec = build(
+    {"profit_runner_enabled": False, "basket_profit_target": 0.50,
+     "cycle_reentry_cooldown_seconds": 10, "max_cycle_drawdown": 0,
+     "max_cycle_duration_minutes": 0}, name="reset", clock=lambda: now[0])
+take(eng, broker, feed, BUY_STOP, now)
+for _ in range(10):
+    if not eng.cycle_active:
+        break
+    feed.set(round(feed.bid + 0.20, 2))
+    now[0] += 1
+    eng.step()
+first_peak = [c for c in rec.cycles if c.kind_of == "complete"][-1].sequence.peak_pnl
+t.check("the first cycle recorded a peak", first_peak > 0, str(first_peak))
+now[0] += 11
+eng.step()
+t.check("a new cycle started", eng.cycle_active, f"#{eng.cycle.cycle_id}")
+t.check("its peak starts at zero", eng.sequence.peak_pnl == 0.0,
+        str(eng.sequence.peak_pnl))
+t.check("its protection starts off", not eng.sequence.protection_active)
+t.check("and its state starts at BASKET_BUILDING",
+        eng.sequence.state == "BASKET_BUILDING", eng.sequence.state)
+
+t.section("8. A BASKET THAT NEVER PROFITS STILL HITS THE DRAWDOWN LIMIT")
+now = [15_000.0]
+eng, broker, feed, settings, rec = frozen(
+    "never", {"profit_runner_enabled": True, "max_cycle_drawdown": 3.00},
+    now=now)
+drift(eng, broker, feed, -3.50)
+now[0] += 1
+eng.step()
+closes = [c for c in rec.cycles if c.kind_of == "complete"]
+t.check("the emergency drawdown closed it",
+        closes and closes[-1].kind == RISK_DRAWDOWN,
+        str([c.kind for c in closes]))
+t.check("protection never armed - it was never in profit",
+        closes and not closes[-1].sequence.protection_active)
+
 t.section("TEST 8 - BLOCKED WHILE THE OLD CYCLE HOLDS POSITIONS")
 now = [5000.0]
 eng, broker, feed, settings, rec = build(
     {"cycle_close_positions": False, "cooldown_after_loss_minutes": 0,
      "cycle_reentry_cooldown_seconds": 10, "max_cycle_drawdown": 0,
-     "max_cycle_duration_minutes": 0}, name="t8", clock=lambda: now[0])
+     "max_cycle_duration_minutes": 0, "profit_runner_enabled": False},
+    name="t8", clock=lambda: now[0])
 open_basket(eng, broker, feed, now=now)
 drift(eng, broker, feed, 2.50)
 now[0] += 1
@@ -362,7 +568,8 @@ now = [8000.0]
 eng, broker, feed, settings, rec = build(
     {"cycle_reentry_cooldown_seconds": 10, "cooldown_after_loss_minutes": 0,
      "max_cycle_duration_minutes": 0, "max_cycle_drawdown": 0,
-     "basket_profit_target": 0.50}, name="loop", clock=lambda: now[0])
+     "basket_profit_target": 0.50, "profit_runner_enabled": False},
+    name="loop", clock=lambda: now[0])
 ids, overlaps = [], []
 for i in range(120):
     if eng.cycle_active:
@@ -385,11 +592,67 @@ t.check("every close names an exit reason",
         closes and all(c.kind for c in closes),
         str(sorted({c.kind for c in closes})))
 t.check("and only the reasons that still exist",
-        all(c.kind in (BASKET_PROFIT_TARGET, RISK_DRAWDOWN, RISK_TIMEOUT)
-            for c in closes), str(sorted({c.kind for c in closes})))
+        all(c.kind in (BASKET_PROFIT_TARGET, PROFIT_PROTECTION, RISK_DRAWDOWN,
+                       RISK_TIMEOUT) for c in closes),
+        str(sorted({c.kind for c in closes})))
 t.check("one cooldown per close",
         rec.count("CYCLE_COOLDOWN_STARTED") == len(closes),
         f"{rec.count('CYCLE_COOLDOWN_STARTED')} vs {len(closes)}")
+
+t.section("16. TELEMETRY IS RECORDED, 17. NEVER SENT TO TELEGRAM")
+now = [16_000.0]
+eng, broker, feed, settings, rec = build(
+    {"telemetry_interval_seconds": 2.0, "profit_runner_enabled": True,
+     "max_cycle_duration_minutes": 0, "max_cycle_drawdown": 0},
+    name="telem", clock=lambda: now[0])
+take(eng, broker, feed, BUY_STOP, now)
+rows = []
+eng.hooks["telemetry"] = rows.append
+for _ in range(10):
+    feed.set(round(feed.bid + 0.05, 2))
+    now[0] += 1
+    eng.step()
+t.check("snapshots were emitted", len(rows) >= 3, str(len(rows)))
+t.check("at roughly the configured interval, not every pass",
+        len(rows) <= 6, f"{len(rows)} rows over 10 passes at 1s each")
+now[0] += 3                    # one more snapshot, with price held still
+eng.step()
+row = rows[-1]
+wanted = ("symbol", "cycle_id", "elapsed_seconds", "bid", "ask", "spread",
+          "current_pnl", "peak_pnl", "drawdown_from_peak", "realized_pnl",
+          "open_positions", "open_buys", "open_sells", "pending_orders",
+          "net_volume", "ladder_depth", "triggers", "buy_triggers",
+          "sell_triggers", "direction_changes", "basket_profit_target",
+          "protection_active", "protection_threshold", "cycle_state")
+t.check("telemetry carries every required column",
+        not [c for c in wanted if c not in row],
+        str([c for c in wanted if c not in row]))
+t.check("the snapshot is not one poll stale",
+        abs(row["current_pnl"] - eng.get_cycle_floating_pnl()) < 0.01 and
+        abs(row["bid"] - feed().bid) < 1e-9,
+        f"{row['bid']} vs {feed().bid}")
+t.check("the snapshot matches the live basket",
+        abs(row["current_pnl"] - eng.get_cycle_floating_pnl()) < 0.01,
+        f"{row['current_pnl']} vs {eng.get_cycle_floating_pnl()}")
+t.check("and the live peak", abs(row["peak_pnl"] - eng.sequence.peak_pnl) < 0.01)
+t.check("MT5 counts, not historical triggers",
+        row["open_positions"] == len(eng.cycle_positions()) and
+        row["triggers"] >= row["open_positions"],
+        f"{row['open_positions']} open / {row['triggers']} triggers")
+t.check("17. no telemetry message reached Telegram",
+        not any(n.startswith("TELEMETRY") for n in rec.names()),
+        str(rec.names()[-3:]))
+t.check("telemetry can be switched off",
+        (settings._values.__setitem__("telemetry_interval_seconds", 0),
+         rows.clear(), [eng.step() for _ in range(3)], not rows)[3])
+
+t.section("19. NO MARTINGALE, 20. NO INDIVIDUAL TP")
+src = pathlib.Path(__file__).resolve().parent.parent
+engine_src = (src / "ladder_engine.py").read_text()
+t.check("19. lot size is never scaled by a loss or a trade count",
+        "lot * " not in engine_src and "volume *" not in engine_src)
+t.check("20. every desired level is built with tp=0.0",
+        engine_src.count("tp=0.0,") >= 2 and "tp_distance" not in engine_src)
 
 t.section("13. THE CYCLE STATE MACHINE")
 for name in ("IDLE", "SAFETY_CHECK", "BUILDING_LADDER", "LADDER_ACTIVE",

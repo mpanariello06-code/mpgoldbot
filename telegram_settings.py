@@ -48,6 +48,11 @@ class SettingsPanel:
 
     KEY_MENU = {
         "basket_profit_target": "target",
+        "profit_runner_enabled": "target",
+        "profit_protection_activation": "target",
+        "profit_protection_trail": "target",
+        "min_protected_profit": "target",
+        "telemetry_interval_seconds": "notify",
         "stop_loss_distance": "sl",
         "pip_points": "pip",
         "lot_size": "lot", "max_lot_size": "maxlot",
@@ -72,6 +77,14 @@ class SettingsPanel:
     PROMPTS = {
         "basket_profit_target": "Send the basket profit target in account "
                                 "currency (e.g. 2.00).",
+        "profit_protection_activation": "Send the peak profit at which "
+                                        "protection turns on (e.g. 3.00).",
+        "profit_protection_trail": "Send how much give-back from the peak is "
+                                   "tolerated (e.g. 1.50).",
+        "min_protected_profit": "Send the protected floor in account currency "
+                                "(e.g. 1.00).",
+        "telemetry_interval_seconds": "Send how often a basket snapshot is "
+                                      "written to CSV, in seconds (0 = off).",
         "stop_loss_distance": "Send the SL distance in price units (0 = no stop loss).",
         "pip_points": "Send how many points make 1 pip (0 = auto-detect).",
         "lot_size": "Send the fixed lot size (e.g. 0.01).",
@@ -265,7 +278,9 @@ class SettingsPanel:
             "⚙️ <b>CURRENT SETTINGS</b>", "",
             f"Symbol: {getattr(self.engine, 'symbol', '')}  ({s['timeframe']})",
             "",
-            f"🎯 Basket target: {self._d('basket_profit_target')}",
+            f"🎯 Basket target: {self._d('basket_profit_target')}"
+            + (f"  ·  runner ON, trail {self._d('profit_protection_trail')}"
+               if s["profit_runner_enabled"] else "  ·  runner OFF"),
             f"🛑 SL: {self._d('stop_loss_distance')}",
             f"📐 {self._pip_line()}",
             "",
@@ -306,18 +321,23 @@ class SettingsPanel:
     # ---- the one normal exit ----------------------------------------------
     def _menu_target(self):
         s = self.settings.snapshot()
+        runner = s["profit_runner_enabled"]
         text = "\n".join([
-            "🎯 <b>BASKET PROFIT TARGET</b>", "",
-            f"Current: {self._d('basket_profit_target')}",
-            f"Lot: {s['lot_size']}   Spacing: {self._d('ladder_spacing')}", "",
-            "The ONE normal exit. When the current cycle's TOTAL floating P/L",
-            "reaches this, every position and every pending order of the cycle",
-            "is closed, and a new ladder follows after the re-entry cooldown.",
+            "🎯 <b>BASKET PROFIT</b>", "",
+            f"Target: {self._d('basket_profit_target')}",
+            f"Profit runner: {'ON' if runner else 'OFF'}",
+            f"Protection from: {self._d('profit_protection_activation')}",
+            f"Trail: {self._d('profit_protection_trail')}",
+            f"Protected floor: {self._d('min_protected_profit')}", "",
+            "With the runner OFF the basket closes the moment its total",
+            "floating P/L reaches the target.", "",
+            "With the runner ON it is allowed past the target. Once the peak",
+            "passes the activation level, the profit is trailed: give back",
+            "more than the trail and the basket is taken. The floor is the",
+            "backstop, so a cycle that was well ahead does not end negative.",
             "",
             "Ladder positions carry no individual take profit - a triggered",
             "level is one leg of the basket, never a trade of its own.",
-            "",
-            "OFF leaves only the hard risk limits to end a cycle.",
         ])
         row = [_btn(f"{self._mark(s['basket_profit_target'] == v)}"
                     f"{'OFF' if v == 0 else f'${v:g}'}",
@@ -325,7 +345,13 @@ class SettingsPanel:
                for v in (1, 2, 3, 5)]
         return text, _rows(
             row[:2], row[2:],
-            [_btn("✏️ CUSTOM", "custom:basket_profit_target")],
+            [_btn("✏️ CUSTOM TARGET", "custom:basket_profit_target"),
+             _btn(f"RUNNER: {'ON' if runner else 'OFF'}",
+                  f"confirm:profit_runner_enabled:"
+                  f"{'false' if runner else 'true'}")],
+            [_btn("🛡 PROTECT FROM", "custom:profit_protection_activation"),
+             _btn("📉 TRAIL", "custom:profit_protection_trail")],
+            [_btn("🧱 PROTECTED FLOOR", "custom:min_protected_profit")],
             [_btn(BACK, "settings")],
         )
 
@@ -621,7 +647,9 @@ class SettingsPanel:
             "🔔 <b>NOTIFICATIONS</b>", "",
             f"Status updates: {'ON' if s['telegram_status_updates'] else 'OFF'}"
             f"  (every {s['telegram_status_interval_minutes']:g} min)",
-            f"Error throttle: {s['telegram_error_throttle_seconds']:g}s", "",
+            f"Error throttle: {s['telegram_error_throttle_seconds']:g}s",
+            f"Basket telemetry: {self._d('telemetry_interval_seconds')} (CSV only)",
+            "",
             "Telegram carries important events only: a cycle closing, the next",
             "ladder going live, risk events and errors. There is no message",
             "per level, per order, per trigger or per P/L update - all of that",
@@ -633,7 +661,8 @@ class SettingsPanel:
                   f"apply:telegram_status_updates:"
                   f"{'false' if s['telegram_status_updates'] else 'true'}"),
              _btn("⏱ INTERVAL", "custom:telegram_status_interval_minutes")],
-            [_btn("⏳ ERROR THROTTLE", "custom:telegram_error_throttle_seconds")],
+            [_btn("⏳ ERROR THROTTLE", "custom:telegram_error_throttle_seconds"),
+             _btn("📈 TELEMETRY", "custom:telemetry_interval_seconds")],
             [_btn(BACK, "settings")],
         )
 

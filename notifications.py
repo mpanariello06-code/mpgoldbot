@@ -107,7 +107,8 @@ class TelegramNotifier:
     # --------------------------------------------------------------- cycles
     def cycle_closed(self, symbol, cycle_id, total, buys, sells, reason_word,
                      direction, duration_seconds, next_cycle_id,
-                     next_ladder_seconds=0.0, kind=""):
+                     next_ladder_seconds=0.0, kind="", peak=None,
+                     giveback=None):
         """
         One message when the cycle is confirmed closed and flat.
 
@@ -124,8 +125,10 @@ class TelegramNotifier:
         return self._emit(
             f"{icon} <b>CYCLE #{cycle_id} CLOSED</b>\n\n"
             f"{symbol}\n\n"
-            f"Result: {total:+.2f}\n\n"
-            f"BUY: {buys}\n"
+            f"Result: {total:+.2f}\n"
+            + (f"Peak: {peak:+.2f}   Giveback: {giveback:.2f}\n"
+               if peak is not None else "")
+            + f"\nBUY: {buys}\n"
             f"SELL: {sells}\n\n"
             f"Exit: {reason_word}\n"
             f"Direction: {direction or '-'}\n"
@@ -186,7 +189,10 @@ class TelegramNotifier:
             f"Ladder depth: {status.get('ladder_depth_used', 0)}\n\n"
             f"Floating basket: {status.get('basket_floating_pnl', 0):+.2f}"
             + (f" / {target:.2f}" if target else "") + "\n"
-            f"Realized: {status.get('basket_realized_pnl', 0):+.2f}"
+            f"Peak: {status.get('basket_peak_pnl', 0):+.2f}   "
+            f"Giveback: {status.get('basket_giveback', 0):.2f}\n"
+            + ("Protection: ACTIVE\n" if status.get("protection_active") else "")
+            + f"Realized: {status.get('basket_realized_pnl', 0):+.2f}"
         )
 
     # --------------------------------------------------------------- metrics

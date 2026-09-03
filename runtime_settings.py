@@ -94,6 +94,12 @@ VALIDATORS = {
     # The ONE normal strategy exit. Everything else that ends a cycle is a hard
     # risk limit.
     "basket_profit_target": (lambda v: _num(v, float, "Basket profit target", 0.0, 100000.0), "Basket Target", True),
+    # profit management: let a winner run, then protect what it made
+    "profit_runner_enabled": (lambda v: _flag(v, "Profit runner"), "Profit Runner", True),
+    "profit_protection_activation": (lambda v: _num(v, float, "Protection activation", 0.0, 100000.0), "Protection At", True),
+    "profit_protection_trail": (lambda v: _num(v, float, "Protection trail", 0.01, 100000.0), "Protection Trail", True),
+    "min_protected_profit": (lambda v: _num(v, float, "Protected floor", 0.0, 100000.0), "Protected Floor", True),
+    "telemetry_interval_seconds": (lambda v: _num(v, float, "Telemetry interval", 0.0, 3600.0), "Telemetry Interval", False),
     "cycle_close_positions": (lambda v: _flag(v, "Close positions on cycle end"), "Close On Cycle End", True),
     # --- risk ---
     "lot_size":            (lambda v: _num(v, float, "Lot size", 0.001, 100.0), "Lot Size", True),
@@ -127,7 +133,8 @@ VALIDATORS = {
 PRICE_KEYS = ("ladder_spacing", "first_level_offset",
               "stop_loss_distance", "max_spread")
 MONEY_KEYS = ("max_daily_drawdown", "max_cycle_drawdown",
-              "basket_profit_target")
+              "basket_profit_target", "profit_protection_activation",
+              "profit_protection_trail", "min_protected_profit")
 
 
 class RuntimeSettings:
@@ -197,6 +204,20 @@ class RuntimeSettings:
             )
             self._values["lot_size"] = self._defaults["lot_size"]
             self._values["max_lot_size"] = self._defaults["max_lot_size"]
+        # A floor above the activation level would close every protected basket
+        # the instant protection turned on.
+        if self._values["min_protected_profit"] > \
+                self._values["profit_protection_activation"]:
+            problems.append(
+                f"min_protected_profit "
+                f"({self._values['min_protected_profit']}) above "
+                f"profit_protection_activation "
+                f"({self._values['profit_protection_activation']}) - "
+                f"restored defaults")
+            self._values["min_protected_profit"] = \
+                self._defaults["min_protected_profit"]
+            self._values["profit_protection_activation"] = \
+                self._defaults["profit_protection_activation"]
         return problems
 
     # -------------------------------------------------------------- accessors
@@ -246,7 +267,8 @@ class RuntimeSettings:
             return "AUTO" if not value else f"{value} pts"
         if key in ("cooldown_after_loss_minutes", "max_cycle_duration_minutes"):
             return "OFF" if not value else f"{float(value):g} min"
-        if key == "cycle_reentry_cooldown_seconds":
+        if key in ("cycle_reentry_cooldown_seconds",
+                   "telemetry_interval_seconds"):
             return "OFF" if not value else f"{float(value):g}s"
         if key == "telegram_status_interval_minutes":
             return f"{float(value):g} min"
@@ -275,6 +297,19 @@ class RuntimeSettings:
                 raise SettingError(
                     f"Max lot ({new}) must not be below the lot size "
                     f"({self._values['lot_size']})"
+                )
+            if key == "min_protected_profit" and \
+                    new > self._values["profit_protection_activation"]:
+                raise SettingError(
+                    f"Protected floor ({new}) must not exceed the protection "
+                    f"activation level "
+                    f"({self._values['profit_protection_activation']})"
+                )
+            if key == "profit_protection_activation" and \
+                    new < self._values["min_protected_profit"]:
+                raise SettingError(
+                    f"Protection activation ({new}) must not be below the "
+                    f"protected floor ({self._values['min_protected_profit']})"
                 )
         return new
 

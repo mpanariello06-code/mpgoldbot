@@ -70,6 +70,7 @@ CSV = CsvLogger(
     cfg.ACCOUNT_LOG_FILE,
     cfg.LADDER_LOG_FILE,
     cfg.CYCLE_LOG_FILE,
+    cfg.TELEMETRY_FILE,
 )
 
 
@@ -692,6 +693,7 @@ class LadderBot:
             "closed": self._on_closed,
             "cycle_started": self._on_cycle_started,
             "cycle_complete": self._on_cycle_complete,
+            "telemetry": self._on_telemetry,
             "risk_blocked": self._on_risk_blocked,
         }
 
@@ -768,6 +770,11 @@ class LadderBot:
             row.setdefault("cycle_id", seq["cycle_id"])
         CSV.log_ladder(event, digits=spec.digits if spec else 2, **row)
 
+    def _on_telemetry(self, row):
+        """One intra-cycle basket snapshot -> basket_telemetry.csv only."""
+        spec = self.engine.spec if self.engine else None
+        CSV.log_telemetry(digits=spec.digits if spec else 2, **row)
+
     def _on_entry(self, position, index, cycle):
         """
         A level triggered: recorded in the CSV, never announced.
@@ -834,8 +841,20 @@ class LadderBot:
             pending_orders_at_exit=ctx.get("pending_orders_at_exit", ""),
             floating_pnl_at_exit=ctx.get("floating_pnl_at_exit", ""),
             realized_pnl=total,
+            final_realized_pnl=total,
             peak_pnl=seq.get("peak_pnl", ""),
             drawdown=seq.get("basket_drawdown", ""),
+            max_floating_profit=seq.get("max_floating_profit", ""),
+            max_floating_loss=seq.get("max_floating_loss", ""),
+            max_drawdown=seq.get("max_drawdown", ""),
+            profit_giveback=seq.get("profit_giveback", ""),
+            time_to_peak=seq.get("time_to_peak", ""),
+            time_to_profit_target=seq.get("time_to_profit_target", ""),
+            time_in_profit=seq.get("time_in_profit", ""),
+            time_in_protection=seq.get("time_in_protection", ""),
+            protection_active=seq.get("protection_active", ""),
+            cycle_state=seq.get("cycle_state", ""),
+            exit_reason=kind,
             end_kind=kind,
             end_reason=reason,
             daily_profit=self.engine.daily_profit if self.engine else "",
@@ -843,11 +862,12 @@ class LadderBot:
 
         reason_word = {
             "BASKET_PROFIT_TARGET": "BASKET PROFIT",
+            "PROFIT_PROTECTION": "PROFIT PROTECTION",
             "RISK_DRAWDOWN": "RISK DRAWDOWN",
             "RISK_TIMEOUT": "RISK TIMEOUT",
             "RISK_SPREAD": "RISK SPREAD",
-            "MANUAL_STOP": "MANUAL STOP",
-            "OTHER_RISK_EXIT": "RISK EXIT",
+            "EMERGENCY_EXIT": "EMERGENCY EXIT",
+            "MANUAL_EXIT": "MANUAL EXIT",
         }.get(kind, kind.replace("_", " "))
         self._cycles_closed = getattr(self, "_cycles_closed", 0) + 1
         wait = float(next_ladder_seconds or 0.0)
@@ -861,7 +881,8 @@ class LadderBot:
             duration_seconds=duration,
             next_cycle_id=next_cycle_id if next_cycle_id is not None
             else cycle.cycle_id + 1,
-            next_ladder_seconds=wait, kind=kind)
+            next_ladder_seconds=wait, kind=kind,
+            peak=seq.get("peak_pnl"), giveback=seq.get("profit_giveback"))
 
     def _on_risk_blocked(self, reason):
         self.notifier.risk_event(

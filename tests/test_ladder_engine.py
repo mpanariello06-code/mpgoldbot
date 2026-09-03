@@ -146,7 +146,8 @@ t.check("the basket is in profit", engine.get_cycle_floating_pnl() > 0,
 # ===========================================================================
 t.section("A CLEAN RUN IS NOT CLOSED BY A TRADE COUNT")
 engine, broker, feed, settings, rec = build(
-    {"basket_profit_target": 0}, name="cycle")     # normal exit disabled
+    {"basket_profit_target": 0, "profit_runner_enabled": False},
+    name="cycle")                                  # normal exit disabled
 start_cycle = engine.cycle.cycle_id
 for i in range(5):
     engine.step()
@@ -170,10 +171,11 @@ t.check("with the target off, only risk can end it",
         f"{engine.get_cycle_floating_pnl():+.2f}")
 
 t.section("THE BASKET TARGET ENDS THE CYCLE")
-# the re-entry cooldown has its own section in test_continuous; here the
-# question is only whether the target ends the cycle cleanly
+# The cooldown has its own section in test_continuous and profit protection
+# has its own suite; here the question is only whether the target ends the
+# cycle cleanly, so the runner is off.
 engine, broker, feed, settings, rec = build(
-    {"basket_profit_target": 0.50,
+    {"basket_profit_target": 0.50, "profit_runner_enabled": False,
      "cycle_reentry_cooldown_seconds": 0}, name="target")
 engine.step()
 buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],

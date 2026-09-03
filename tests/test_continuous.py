@@ -28,7 +28,13 @@ TMP.mkdir(parents=True)
 
 
 def build(overrides=None, name="c", feed=None, clock=None):
+    """
+    These tests are about the cycle handoff, not the profit policy, so the
+    profit runner is off: a cycle then ends deterministically at the target.
+    The runner and its protection are covered in test_basket.
+    """
     settings = RuntimeSettings(cfg.runtime_defaults(), TMP / f"{name}_set.json")
+    settings._values["profit_runner_enabled"] = False
     for key, value in (overrides or {}).items():
         settings._values[key] = value
     broker, feed = make_paper(feed=feed or TickFeed(4010.00),

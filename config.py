@@ -154,6 +154,18 @@ PIP_POINTS = _get_int("PIP_POINTS", 0)
 # figure. 0 disables the normal exit entirely, leaving only the hard risk
 # limits, which is almost certainly not what you want.
 BASKET_PROFIT_TARGET = _get_float("BASKET_PROFIT_TARGET", 2.00)
+# With the profit runner ON a basket is allowed past the target instead of
+# being cut off at it, and the accumulated profit is trailed instead. OFF
+# restores the plain "close at the target" behaviour.
+PROFIT_RUNNER_ENABLED = _get_bool("PROFIT_RUNNER_ENABLED", True)
+# Peak floating P/L at which profit protection turns on for the cycle. Once on
+# it stays on, even if the basket falls back below this.
+PROFIT_PROTECTION_ACTIVATION = _get_float("PROFIT_PROTECTION_ACTIVATION", 3.00)
+# How much give-back from the peak is tolerated before the basket is taken.
+PROFIT_PROTECTION_TRAIL = _get_float("PROFIT_PROTECTION_TRAIL", 1.50)
+# The protected floor: a basket that has been in profit is never knowingly let
+# through this on the way down.
+MIN_PROTECTED_PROFIT = _get_float("MIN_PROTECTED_PROFIT", 1.00)
 CYCLE_CLOSE_POSITIONS = _get_bool("CYCLE_CLOSE_POSITIONS", True)
 
 # ---------------------------------------------------------------------------
@@ -246,6 +258,10 @@ LADDER_STATE_FILE = _get_str("LADDER_STATE_FILE", "ladder_state.json")
 PAPER_STATE_FILE = _get_str("PAPER_STATE_FILE", "paper_state.json")
 
 ACCOUNT_SNAPSHOT_INTERVAL = _get_int("ACCOUNT_SNAPSHOT_INTERVAL", 300)
+# How often an intra-cycle basket snapshot is written to basket_telemetry.csv
+# while a cycle is open. CSV only - never Telegram. 0 = off.
+TELEMETRY_INTERVAL_SECONDS = _get_float("TELEMETRY_INTERVAL_SECONDS", 2.0)
+TELEMETRY_FILE = _get_str("TELEMETRY_FILE", "basket_telemetry.csv")
 
 DATA_PATH = Path(DATA_DIRECTORY)
 if not DATA_PATH.is_absolute():
@@ -276,6 +292,11 @@ def runtime_defaults():
         "rearm_levels": REARM_LEVELS,
         # take profit
         "basket_profit_target": BASKET_PROFIT_TARGET,
+        "profit_runner_enabled": PROFIT_RUNNER_ENABLED,
+        "profit_protection_activation": PROFIT_PROTECTION_ACTIVATION,
+        "profit_protection_trail": PROFIT_PROTECTION_TRAIL,
+        "min_protected_profit": MIN_PROTECTED_PROFIT,
+        "telemetry_interval_seconds": TELEMETRY_INTERVAL_SECONDS,
         "stop_loss_distance": STOP_LOSS_DISTANCE,
         "pip_points": PIP_POINTS,
         # cycle / adaptive exit
@@ -339,6 +360,23 @@ def validate():
         errors.append("LADDER_DEPTH must be at least 1")
     if BASKET_PROFIT_TARGET < 0:
         errors.append("BASKET_PROFIT_TARGET cannot be negative")
+    if PROFIT_PROTECTION_TRAIL <= 0 and PROFIT_RUNNER_ENABLED:
+        errors.append("PROFIT_PROTECTION_TRAIL must be greater than 0 when "
+                      "PROFIT_RUNNER_ENABLED is true")
+    if MIN_PROTECTED_PROFIT > BASKET_PROFIT_TARGET > 0:
+        warnings.append(
+            f"MIN_PROTECTED_PROFIT ({MIN_PROTECTED_PROFIT:.2f}) is above "
+            f"BASKET_PROFIT_TARGET ({BASKET_PROFIT_TARGET:.2f}) - the floor is "
+            f"capped at the target, since a basket is never held for more "
+            f"profit than it would have been closed at")
+    if MIN_PROTECTED_PROFIT > PROFIT_PROTECTION_ACTIVATION:
+        errors.append("MIN_PROTECTED_PROFIT cannot be above "
+                      "PROFIT_PROTECTION_ACTIVATION")
+    if PROFIT_RUNNER_ENABLED and PROFIT_PROTECTION_ACTIVATION < BASKET_PROFIT_TARGET:
+        warnings.append(
+            f"PROFIT_PROTECTION_ACTIVATION ({PROFIT_PROTECTION_ACTIVATION:.2f}) "
+            f"is below BASKET_PROFIT_TARGET ({BASKET_PROFIT_TARGET:.2f}) - "
+            f"protection will be active before the target is ever reached")
     if BASKET_PROFIT_TARGET == 0:
         warnings.append(
             "BASKET_PROFIT_TARGET is 0 - the normal exit is disabled and only "
