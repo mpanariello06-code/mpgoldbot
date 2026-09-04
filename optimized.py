@@ -71,6 +71,7 @@ CSV = CsvLogger(
     cfg.LADDER_LOG_FILE,
     cfg.CYCLE_LOG_FILE,
     cfg.TELEMETRY_FILE,
+    cfg.ENTRY_LOG_FILE,
 )
 
 
@@ -266,6 +267,8 @@ class LadderBot:
         self.notifier = TelegramNotifier(self.notify, settings=self.settings)
         self._reconnect_at = 0.0
         self._last_candle_check = 0.0
+        self._last_entry_bar_check = 0.0
+        self._entry_bar = None
 
     # ------------------------------------------------------------ plumbing
     def set_notifier(self, fn):
@@ -370,6 +373,8 @@ class LadderBot:
             settings=self.settings,
             hooks=self._hooks(),
             state_path=cfg.DATA_PATH / cfg.LADDER_STATE_FILE,
+            # a new cycle is evaluated once per CLOSED entry candle
+            bar_time=self.closed_entry_bar,
         )
 
     def _live_tick(self):
@@ -663,9 +668,8 @@ class LadderBot:
 
     def _check_new_candle(self):
         """
-        M5 candles are context only - the ladder never waits for a candle close,
-        neither to start nor after a cycle ends. Polling for one every 0.5s
-        would be wasted work, so it is checked a few times a minute.
+        Context candle for the log and the optional re-anchor. The ENTRY
+        candle is a separate feed - see `closed_entry_bar()`.
         """
         now = time.time()
         if now - self._last_candle_check < 5.0:
@@ -685,6 +689,26 @@ class LadderBot:
         if self.settings.get("m5_candle_reset"):
             self.engine.reanchor(reason="new candle")
 
+    def closed_entry_bar(self):
+        """
+        Open time of the most recently CLOSED entry-timeframe candle.
+
+        `copy_rates_from_pos(0, 2)` returns [closed, forming]; index -2 is the
+        last CLOSED bar. The forming candle is never used to start a cycle.
+        Cached for a couple of seconds so the 0.5s poll does not hammer MT5.
+        """
+        now = time.time()
+        if now - self._last_entry_bar_check < 2.0:
+            return self._entry_bar
+        self._last_entry_bar_check = now
+        tf = MT5_TIMEFRAMES.get(self.settings.get("entry_timeframe"),
+                                mt5.TIMEFRAME_M1)
+        rates = get_rates(SYMBOL, tf, 2)
+        if len(rates) < 2:
+            return self._entry_bar
+        self._entry_bar = int(rates[-2]["time"])       # -2 = the CLOSED bar
+        return self._entry_bar
+
     # --------------------------------------------------------------- hooks
     def _hooks(self):
         return {
@@ -694,6 +718,7 @@ class LadderBot:
             "cycle_started": self._on_cycle_started,
             "cycle_complete": self._on_cycle_complete,
             "telemetry": self._on_telemetry,
+            "entry_evaluation": self._on_entry_evaluation,
             "risk_blocked": self._on_risk_blocked,
         }
 
@@ -791,6 +816,11 @@ class LadderBot:
             "closed_positions": len(seq.closures) if seq else 0,
         }
 
+    def _on_entry_evaluation(self, row):
+        """One M1 entry decision -> entry_evaluations.csv only, never Telegram."""
+        spec = self.engine.spec if self.engine else None
+        CSV.log_entry_evaluation(digits=spec.digits if spec else 2, **row)
+
     def _on_telemetry(self, row):
         """One intra-cycle basket snapshot -> basket_telemetry.csv only."""
         spec = self.engine.spec if self.engine else None
@@ -869,6 +899,13 @@ class LadderBot:
             max_floating_loss=seq.get("max_floating_loss", ""),
             max_drawdown=seq.get("max_drawdown", ""),
             profit_giveback=seq.get("profit_giveback", ""),
+            max_ladder_depth_reached=seq.get("ladder_depth_used", ""),
+            total_triggers=seq.get("total_triggers", ""),
+            floating_pnl_before_close=ctx.get("floating_pnl_before_close", ""),
+            realized_pnl_after_close=ctx.get("realized_pnl_after_close", ""),
+            pnl_slippage=ctx.get("pnl_slippage", ""),
+            entry_bar_time=(self.engine.last_entry_bar if self.engine else ""),
+            entry_timeframe=self.settings.get("entry_timeframe"),
             time_to_peak=seq.get("time_to_peak", ""),
             time_to_profit_target=seq.get("time_to_profit_target", ""),
             time_in_profit=seq.get("time_in_profit", ""),

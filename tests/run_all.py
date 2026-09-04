@@ -18,6 +18,7 @@ SUITES = [
     "test_basket.py",
     "test_ladder_engine.py",
     "test_ladder_lifecycle.py",
+    "test_entry_gate.py",
     "test_continuous.py",
     "test_notifications.py",
     "test_replay.py",

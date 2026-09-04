@@ -120,6 +120,8 @@ VALIDATORS = {
     "m5_candle_reset":     (lambda v: _flag(v, "Candle reset"), "Candle Reset", False),
     # --- context / direction ---
     "timeframe":           (lambda v: _upper_choice(v, TIMEFRAMES, "Timeframe"), "Timeframe", False),
+    # a new cycle is evaluated once per closed candle of this timeframe
+    "entry_timeframe":     (lambda v: _upper_choice(v, TIMEFRAMES, "Entry timeframe"), "Entry Timeframe", True),
     "direction_filter":    (lambda v: _choice(v, DIRECTION_MODES, "Direction filter"), "Direction", True),
 
     # --- telegram notification policy ---

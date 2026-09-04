@@ -113,6 +113,9 @@ POSSIBLE_MT5_PATHS = [
 # ---------------------------------------------------------------------------
 SYMBOL = _get_str("SYMBOL", "XAUUSD")
 TIMEFRAME = _get_str("TIMEFRAME", "M5").upper()
+# A new cycle is evaluated once per CLOSED candle of this timeframe, never on
+# a tick. M1 or M5; the architecture takes any of the supported timeframes.
+ENTRY_TIMEFRAME = _get_str("ENTRY_TIMEFRAME", "M1").upper()
 
 # ---------------------------------------------------------------------------
 # TRADING MODE
@@ -188,6 +191,9 @@ MAX_LOT_SIZE = _get_float("MAX_LOT_SIZE", 0.10)
 MAX_OPEN_POSITIONS = _get_int("MAX_OPEN_POSITIONS", 22)
 # Must allow a whole ladder (2 x LADDER_DEPTH) or it deploys short.
 MAX_PENDING_ORDERS = _get_int("MAX_PENDING_ORDERS", 22)
+# Levels a single cycle may consume before it stops adding exposure. The
+# remaining pending orders are cancelled at the cap; the basket already open is
+# still managed by the exit rules. Worth testing across 5..12 and up.
 MAX_LADDER_DEPTH = _get_int("MAX_LADDER_DEPTH", 22)    # levels used per cycle
 MAX_SPREAD = _get_float("MAX_SPREAD", 0.50)             # price units, 0 = off
 MAX_SLIPPAGE = _get_int("MAX_SLIPPAGE", 20)             # deviation points
@@ -271,6 +277,7 @@ ACCOUNT_SNAPSHOT_INTERVAL = _get_int("ACCOUNT_SNAPSHOT_INTERVAL", 300)
 # while a cycle is open. CSV only - never Telegram. 0 = off.
 TELEMETRY_INTERVAL_SECONDS = _get_float("TELEMETRY_INTERVAL_SECONDS", 2.0)
 TELEMETRY_FILE = _get_str("TELEMETRY_FILE", "basket_telemetry.csv")
+ENTRY_LOG_FILE = _get_str("ENTRY_LOG_FILE", "entry_evaluations.csv")
 
 DATA_PATH = Path(DATA_DIRECTORY)
 if not DATA_PATH.is_absolute():
@@ -293,6 +300,7 @@ def runtime_defaults():
     """
     return {
         "timeframe": TIMEFRAME,
+        "entry_timeframe": ENTRY_TIMEFRAME,
         # ladder
         "ladder_spacing": LADDER_SPACING,
         "ladder_depth": LADDER_DEPTH,

@@ -45,6 +45,8 @@ class State:
     """
     IDLE = "IDLE"
     INITIALIZING = "INITIALIZING"
+    WAITING_FOR_ENTRY = "WAITING_FOR_ENTRY"    # flat, waiting for an M1 close
+    ENTRY_EVALUATION = "ENTRY_EVALUATION"      # a new bar closed: decide once
     SAFETY_CHECK = "SAFETY_CHECK"        # risk + spread gates before deploying
     BUILDING_LADDER = "BUILDING_LADDER"  # placing the first ladder of a cycle
     LADDER_ACTIVE = "LADDER_ACTIVE"      # ladder live, no position yet
@@ -145,10 +147,16 @@ class RollingLadderEngine:
     """One ladder, one cycle at a time, reconciled against the broker."""
 
     def __init__(self, broker, settings, hooks=None, state_path=None,
-                 clock=time.time):
+                 clock=time.time, bar_time=None):
         # Injectable so a replay can run on simulated time: cooldowns, order
         # ages and trigger gaps then behave the same as they would live.
         self.clock = clock
+        # Returns the open time of the most recently CLOSED entry-timeframe
+        # bar, or None. A new cycle may only begin on a bar this has not
+        # already been evaluated on. Left as None the gate is off and cycles
+        # start as soon as the safety gates pass (the pre-M1 behaviour).
+        self.bar_time = bar_time
+        self.last_entry_bar = None
         self.broker = broker
         self.settings = settings          # RuntimeSettings (thread-safe)
         self.hooks = hooks or {}
@@ -232,6 +240,8 @@ class RollingLadderEngine:
                 "reentry_until": self.reentry_until,
                 "streak_paused": self._streak_paused,
                 "total_trades": self.total_trades,
+                # so a restart cannot re-decide a candle already evaluated
+                "last_entry_bar": self.last_entry_bar,
                 "levels_done": sorted(f"{s}:{i}" for s, i in self._levels_done),
             }
             tmp = self._path.with_suffix(".tmp")
@@ -261,6 +271,8 @@ class RollingLadderEngine:
         self.reentry_until = float(data.get("reentry_until", 0.0))
         self._streak_paused = bool(data.get("streak_paused", False))
         self.total_trades = int(data.get("total_trades", 0))
+        bar = data.get("last_entry_bar")
+        self.last_entry_bar = int(bar) if bar else None
         for item in data.get("levels_done", []):
             side, _, idx = item.partition(":")
             try:
@@ -309,6 +321,16 @@ class RollingLadderEngine:
             self._event("COOLDOWN_STARTED",
                         f"restart during the re-entry cooldown - next ladder in "
                         f"{_seconds(self._reentry_wait())}", status="COOLDOWN")
+        elif self.bar_time is not None:
+            # The entry gate is on: the first ladder of a run waits for a newly
+            # closed entry bar like every other one, rather than deploying the
+            # moment the bot starts.
+            self.cycle_active = False
+            self.state = State.WAITING_FOR_ENTRY
+            self._event("WAITING_FOR_ENTRY",
+                        "flat - waiting for the next closed "
+                        f"{self.settings.get('entry_timeframe')} candle before "
+                        f"evaluating a new cycle", status="WAITING")
         elif not self.cycle.anchor or not self.cycle_active:
             self.create_new_ladder(
                 new_id=self.cycle.cycle_id if not self.cycle.anchor else None,
@@ -405,9 +427,18 @@ class RollingLadderEngine:
                 return False
         tick = self.last_tick or self.broker.tick()
         anchor = self.spec.normalize_price(tick.mid) if self.spec else tick.mid
-        # a cycle id is never reused, even after a restart or an adopted cycle
+        # a cycle id is never reused, even after a restart or an adopted cycle.
+        # The placeholder cycle a fresh engine starts with (id 1, no anchor,
+        # nothing traded) IS the first ladder: without this the first ladder of
+        # a run would be numbered #2 and #1 would never exist.
+        fresh = self.max_cycle_id == 0 and not self.cycle.anchor
         self.max_cycle_id = max(self.max_cycle_id, self.cycle.cycle_id)
-        cid = new_id if new_id is not None else self.max_cycle_id + 1
+        if new_id is not None:
+            cid = new_id
+        elif fresh:
+            cid = self.cycle.cycle_id
+        else:
+            cid = self.max_cycle_id + 1
         self.max_cycle_id = max(self.max_cycle_id, cid)
         # started_at must come from the engine's clock, not the wall clock, or
         # cycle age (and therefore the timeout) is meaningless under replay.
@@ -979,7 +1010,12 @@ class RollingLadderEngine:
                     "open_sells_at_exit": len([p for p in positions
                                                if p.side == SELL]),
                     "pending_orders_at_exit": len(orders),
+                    # what the basket was worth BEFORE the closing orders went
+                    # out; the realized figure below comes from MT5's own deal
+                    # history once they have settled, and the two differ by
+                    # spread, slippage, commission and swap.
                     "floating_pnl_at_exit": floating,
+                    "floating_pnl_before_close": floating,
                 },
             }
             return self._advance_close(snap, positions, orders)
@@ -1128,6 +1164,11 @@ class RollingLadderEngine:
                     cycle_profit=total, daily_profit=self.daily_profit,
                     status="LOSS" if lost else "OK")
 
+        # PART 12: realized comes from the deals MT5 actually reports, never
+        # from the floating figure the exit was decided on.
+        info["context"]["realized_pnl_after_close"] = round(total, 2)
+        info["context"]["pnl_slippage"] = round(
+            total - float(info["context"].get("floating_pnl_before_close", 0.0)), 2)
         duration = self.clock() - self.cycle.started_at
         closed_cycle = self.cycle
         self._closing_cycle = None
@@ -1170,7 +1211,8 @@ class RollingLadderEngine:
         is verified flat: no ladder, no pending orders, no cycle. Anything the
         close left behind is cleaned up and re-verified instead.
         """
-        self.state = State.COOLDOWN_AFTER_EXIT
+        self.state = (State.COOLDOWN_AFTER_EXIT if self._reentry_wait() > 0
+                      else State.WAITING_FOR_ENTRY)
 
         # Leftovers cannot exist at this point, but if the broker produced one
         # anyway (a late fill, a manual order) it is cleared before re-entry
@@ -1193,6 +1235,102 @@ class RollingLadderEngine:
             for trade in self.broker.poll_closed():
                 self._on_closed(trade, snap)
 
+        # --- the entry gate --------------------------------------------------
+        # A new cycle is a DELIBERATE decision taken once per newly closed
+        # entry-timeframe candle, never a reaction to a tick. Between candles
+        # the engine simply waits.
+        bar = self._closed_bar()
+        if bar is None:
+            # No bar feed wired: the gate is off and the old behaviour stands -
+            # deploy as soon as the cooldown has elapsed and the book is flat.
+            return self._try_deploy(snap, tick)
+        if bar == self.last_entry_bar:
+            # the cooldown, while it runs, is the more precise description of
+            # what the engine is doing; it is not overwritten here
+            if self._reentry_wait() <= 0:
+                self.state = State.WAITING_FOR_ENTRY
+            if not self.block_reason:
+                self.block_reason = (
+                    f"waiting for the next closed "
+                    f"{snap['entry_timeframe']} candle")
+            return "pending"
+
+        # exactly one evaluation per candle, whatever the outcome
+        self.last_entry_bar = bar
+        self.state = State.ENTRY_EVALUATION
+        return self._evaluate_entry(snap, tick, bar)
+
+    def _closed_bar(self):
+        """Open time of the most recently CLOSED entry bar, or None."""
+        if self.bar_time is None:
+            return None
+        try:
+            return self.bar_time()
+        except Exception as exc:
+            self._event("ERROR", f"entry bar feed failed: {exc}", status="ERROR")
+            return None
+
+    def _evaluate_entry(self, snap, tick, bar):
+        """
+        Decide, once, whether this closed candle starts a new cycle.
+
+        The conditions are the ones the engine already had - cooldown elapsed,
+        the account verified flat at the broker, risk not blocking, spread
+        acceptable. No indicator has been added: the change is WHEN this is
+        asked, not what is asked. Every evaluation is recorded, accepted or
+        not, so accepted and rejected candles can be compared later.
+        """
+        live_positions = self.broker.positions()
+        live_orders = self.broker.orders()
+        wait = self._reentry_wait()
+        allow_risk, risk_reason = self.risk_check(snap, tick, live_positions,
+                                                  live_orders)
+        spread_ok = self.spread_ok(snap, tick)
+
+        if wait > 0:
+            accepted, reason = False, f"cooldown ({_seconds(wait)} left)"
+        elif live_positions or live_orders:
+            accepted, reason = False, (
+                f"not flat: {len(live_positions)} positions / "
+                f"{len(live_orders)} orders")
+        elif not allow_risk:
+            accepted, reason = False, f"risk: {risk_reason}"
+        elif not spread_ok:
+            accepted, reason = False, (
+                f"spread {tick.spread:.2f} > limit {snap['max_spread']}")
+        else:
+            accepted, reason = True, "all entry conditions met"
+
+        record = {
+            "bar_time": bar,
+            "timeframe": snap["entry_timeframe"],
+            "symbol": self.broker.symbol,
+            "bid": tick.bid if tick else "",
+            "ask": tick.ask if tick else "",
+            "spread": tick.spread if tick else "",
+            "accepted": accepted,
+            "reason": reason,
+            "cooldown_left": round(wait, 1),
+            "open_positions": len(live_positions),
+            "pending_orders": len(live_orders),
+            "risk_ok": allow_risk,
+            "spread_ok": spread_ok,
+            "next_cycle_id": self.max_cycle_id + 1,
+        }
+        self._emit("entry_evaluation", record)
+        self._event("ENTRY_EVALUATED",
+                    f"{snap['entry_timeframe']} candle {bar}: "
+                    f"{'ACCEPTED' if accepted else 'REJECTED'} - {reason}",
+                    status="OK" if accepted else "REJECTED")
+        if not accepted:
+            self.block_reason = reason
+            self.state = State.WAITING_FOR_ENTRY
+            return "pending"
+        self.block_reason = ""
+        return self._try_deploy(snap, tick)
+
+    def _try_deploy(self, snap, tick):
+        """Cooldown + flat verification, then the one ladder creation call."""
         wait = self._reentry_wait()
         if wait > 0:
             self.block_reason = f"cycle re-entry cooldown ({_seconds(wait)} left)"
@@ -1216,7 +1354,7 @@ class RollingLadderEngine:
                                          "waiting to go flat")):
             self.block_reason = ""
         # anchored on the CURRENT price, never the old grid
-        if not self.create_new_ladder(reason="continuous re-entry"):
+        if not self.create_new_ladder(reason="entry accepted"):
             return "pending"
         return "restarted"
 
@@ -1263,19 +1401,24 @@ class RollingLadderEngine:
             seen.add(key)
 
         # --- place missing levels -------------------------------------------
-        # The depth cap limits how far a cycle may EXTEND. It deliberately does
-        # not cancel the live ladder: pulling every pending order while
-        # positions are still open removes the strategy's eyes without reducing
-        # exposure, and leaves the cycle with nothing left to react to.
+        # The ladder is placed once and never replenished, so "place no more"
+        # is not enough to stop exposure growing - the untouched pendings are
+        # already sitting at the broker waiting to fill. At the cap they are
+        # cancelled: no further exposure is added, and the basket already open
+        # is still managed by the exit rules.
         max_depth = int(snap["max_ladder_depth"])
         used = self.sequence.ladder_depth_used if self.sequence else 0
         depth_capped = max_depth > 0 and used >= max_depth
         if depth_capped and not self._depth_capped_logged:
             self._depth_capped_logged = True
             self._event("LADDER_DEPTH_CAP",
-                        f"depth {used}/{max_depth} reached - no further levels "
-                        f"this cycle; the live ladder and the exit logic carry on",
+                        f"depth {used}/{max_depth} reached - cancelling the "
+                        f"remaining {len(orders)} pending levels; no further "
+                        f"exposure this cycle, the basket carries on",
                         cycle_id=self.cycle.cycle_id, status="CAPPED")
+        if depth_capped and orders:
+            self._cancel_all(orders, f"ladder depth cap {used}/{max_depth}")
+            return 0
         room_orders = 0 if depth_capped else \
             int(snap["max_pending_orders"]) - len(seen)
         failures = 0
@@ -1430,11 +1573,15 @@ class RollingLadderEngine:
                                     for p in legs), 4),
             "ladder_depth": seq.ladder_depth_used,
             "triggers": seq.total_triggers,
+            "total_triggers": seq.total_triggers,
+            "m1_bar_time": self.last_entry_bar or "",
             "buy_triggers": seq.buy_triggers,
             "sell_triggers": seq.sell_triggers,
             "direction_changes": seq.direction_changes,
             "basket_profit_target": snap["basket_profit_target"],
             "protection_active": seq.protection_active,
+            "protection_activation": snap["profit_protection_activation"],
+            "protection_trail": snap["profit_protection_trail"],
             "protection_threshold": round(seq.protection_threshold, 2),
             "cycle_state": seq.state,
         })
@@ -1512,6 +1659,10 @@ class RollingLadderEngine:
             "closed_positions": (len(self.sequence.closures)
                                  if self.sequence else 0),
             "cooldown_left": round(self._reentry_wait(), 1),
+            "entry_timeframe": snap["entry_timeframe"],
+            "last_entry_bar": self.last_entry_bar,
+            "waiting_for_entry": (not self.cycle_active and
+                                  self._reentry_wait() <= 0),
             # --- one active cycle at a time ---
             "cycle_active": self.cycle_active,
             "reentry_wait_seconds": round(self._reentry_wait(), 1),

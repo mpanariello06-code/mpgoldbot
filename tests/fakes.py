@@ -92,6 +92,7 @@ class Recorder:
         self.closed = []
         self.cycles = []
         self.blocks = []
+        self.entry_evals = []
 
     def hooks(self):
         return {
@@ -109,6 +110,7 @@ class Recorder:
                                                context or {},
                                                next_ladder_seconds)),
             "risk_blocked": lambda r: self.blocks.append(r),
+            "entry_evaluation": lambda rec: self.entry_evals.append(rec),
         }
 
     def names(self):

@@ -44,6 +44,11 @@ def rows(name):
         return list(csv.DictReader(fh))
 
 
+def new_m1_candle():
+    """A new entry candle closed: the gate only evaluates once per bar."""
+    mt5.STATE["bar_offset"] += 1
+
+
 def wait_for(predicate, timeout=5.0):
     end = time.time() + timeout
     while time.time() < end:
@@ -201,7 +206,13 @@ t.check("close recorded in trades.csv",
         any(r["reason"] == "CLOSE" for r in rows("trades.csv")))
 t.check("paper balance grew", app.bot.account().balance > 1000.0,
         str(app.bot.account().balance))
-t.check("the next ladder follows the cooldown",
+# entry is M1-confirmed: the cooldown alone does not re-enter, the next
+# closed candle does
+time.sleep(1.2)                                   # past the 1s cooldown
+t.check("no re-entry on the same candle as the exit",
+        not app.bot.orders(), f"{len(app.bot.orders())} orders")
+new_m1_candle()
+t.check("the next ladder follows the cooldown and a new M1 candle",
         wait_for(lambda: len([o for o in app.bot.orders()
                               if o.side == BUY_STOP]) == 5, timeout=8.0),
         f"{len(app.bot.orders())} orders")
@@ -288,6 +299,9 @@ t.check("restart adopts the stored cycle",
         f"{app2.bot.engine.cycle.cycle_id} vs {cycle_before}")
 t.check("restart recovers the open position",
         len(app2.bot.positions()) == positions_before)
+# a restart on a flat book is still an M1-confirmed entry: it waits for the
+# next closed candle rather than deploying the instant the process comes up
+new_m1_candle()
 t.check("no duplicate ladder after restart",
         wait_for(lambda: 0 < len(app2.bot.orders()) <= 10),
         f"{len(app2.bot.orders())} orders")

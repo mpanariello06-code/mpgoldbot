@@ -74,13 +74,17 @@ CYCLE_HEADER = [
     "direction_changes", "ladder_depth_used", "net_levels",
     "path_levels", "basket_profit_target",
     "positions_at_exit", "open_buys_at_exit", "open_sells_at_exit",
-    "pending_orders_at_exit", "floating_pnl_at_exit",
+    "pending_orders_at_exit",
+    # floating before the close vs what MT5 actually realized after it
+    "floating_pnl_at_exit", "floating_pnl_before_close",
+    "realized_pnl_after_close", "pnl_slippage",
     "realized_pnl", "final_realized_pnl", "peak_pnl", "drawdown",
     # how the profit-management state machine ran this cycle
     "max_floating_profit", "max_floating_loss", "max_drawdown",
     "profit_giveback", "time_to_peak", "time_to_profit_target",
     "time_in_profit", "time_in_protection", "protection_active",
-    "cycle_state", "exit_reason",
+    "cycle_state", "exit_reason", "max_ladder_depth_reached", "total_triggers",
+    "entry_bar_time", "entry_timeframe",
     "end_kind", "end_reason", "daily_profit",
 ]
 
@@ -92,9 +96,20 @@ TELEMETRY_HEADER = [
     "bid", "ask", "spread",
     "current_pnl", "peak_pnl", "drawdown_from_peak", "realized_pnl",
     "open_positions", "open_buys", "open_sells", "pending_orders",
-    "net_volume", "ladder_depth", "triggers", "buy_triggers", "sell_triggers",
+    "net_volume", "ladder_depth", "triggers", "total_triggers",
+    "buy_triggers", "sell_triggers",
     "direction_changes", "basket_profit_target", "protection_active",
-    "protection_threshold", "cycle_state",
+    "protection_activation", "protection_trail", "protection_threshold",
+    "m1_bar_time", "cycle_state",
+]
+
+# One row per entry evaluation - accepted or rejected. This is what makes it
+# possible to compare the candles a cycle was started on against the ones it
+# was not.
+ENTRY_HEADER = [
+    "timestamp", "bar_time", "timeframe", "symbol", "bid", "ask", "spread",
+    "accepted", "reason", "cooldown_left", "open_positions", "pending_orders",
+    "risk_ok", "spread_ok", "next_cycle_id",
 ]
 
 ACCOUNT_HEADER = [
@@ -128,7 +143,8 @@ class CsvLogger:
     def __init__(self, data_dir, trade_file, event_file, account_file,
                  ladder_file="rolling_ladder_events.csv",
                  cycle_file="rolling_ladder_cycles.csv",
-                 telemetry_file="basket_telemetry.csv"):
+                 telemetry_file="basket_telemetry.csv",
+                 entry_file="entry_evaluations.csv"):
         self.dir = Path(data_dir)
         self.trade_path = self.dir / trade_file
         self.event_path = self.dir / event_file
@@ -136,6 +152,7 @@ class CsvLogger:
         self.ladder_path = self.dir / ladder_file
         self.cycle_path = self.dir / cycle_file
         self.telemetry_path = self.dir / telemetry_file
+        self.entry_path = self.dir / entry_file
 
         self._lock = threading.Lock()
         # Keys of trade rows already written -> prevents duplicates across restarts
@@ -152,6 +169,7 @@ class CsvLogger:
         self._ensure_file(self.ladder_path, LADDER_HEADER)
         self._ensure_file(self.cycle_path, CYCLE_HEADER)
         self._ensure_file(self.telemetry_path, TELEMETRY_HEADER)
+        self._ensure_file(self.entry_path, ENTRY_HEADER)
         self._load_trade_keys()
 
     @staticmethod
@@ -335,7 +353,8 @@ class CsvLogger:
                             "drawdown", "floating_pnl_at_exit", "daily_profit",
                             "basket_profit_target", "max_floating_profit",
                             "max_floating_loss", "max_drawdown",
-                            "profit_giveback"):
+                            "profit_giveback", "floating_pnl_before_close",
+                            "realized_pnl_after_close", "pnl_slippage"):
                 row.append(_fmt(value, 2))
             else:
                 row.append(_fmt(value))
@@ -409,6 +428,21 @@ class CsvLogger:
             self._append(self.telemetry_path, row)
         except Exception as exc:
             print(f"[csv_logger] telemetry write failed: {exc}")
+
+    def log_entry_evaluation(self, digits=2, **fields):
+        """One row per entry evaluation, accepted or rejected. CSV only."""
+        fields.setdefault("timestamp", _now())
+        row = []
+        for column in ENTRY_HEADER:
+            value = fields.get(column, "")
+            if column in ("bid", "ask", "spread"):
+                row.append(_fmt(value, digits))
+            else:
+                row.append(_fmt(value))
+        try:
+            self._append(self.entry_path, row)
+        except Exception as exc:
+            print(f"[csv_logger] entry write failed: {exc}")
 
     def log_account(self, balance, equity, margin, free_margin, margin_level,
                     open_positions):

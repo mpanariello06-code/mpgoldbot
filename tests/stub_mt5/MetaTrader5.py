@@ -112,13 +112,19 @@ def symbol_info_tick(symbol):
     return SimpleNamespace(bid=STATE["bid"], ask=STATE["ask"], time=time.time())
 
 
+# seconds per bar, so an M1 request really does return one-minute bars
+_PERIOD = {TIMEFRAME_M1: 60, TIMEFRAME_M5: 300, TIMEFRAME_M15: 900,
+           TIMEFRAME_M30: 1800, TIMEFRAME_H1: 3600}
+
+
 def copy_rates_from_pos(symbol, timeframe, start, count):
     if not STATE["initialized"]:
         return None
-    now = int(time.time() // 300 * 300) + STATE["bar_offset"] * 300
+    period = _PERIOD.get(timeframe, 300)
+    now = int(time.time() // period * period) + STATE["bar_offset"] * period
     dtype = [("time", "<i8"), ("open", "<f8"), ("high", "<f8"), ("low", "<f8"),
              ("close", "<f8"), ("tick_volume", "<i8")]
-    rows = [(now - (count - 1 - i) * 300, STATE["bid"], STATE["bid"] + 0.5,
+    rows = [(now - (count - 1 - i) * period, STATE["bid"], STATE["bid"] + 0.5,
              STATE["bid"] - 0.5, STATE["bid"], 100) for i in range(count)]
     return np.array(rows, dtype=dtype)
 

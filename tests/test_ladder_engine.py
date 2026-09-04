@@ -317,7 +317,7 @@ t.check("SPREAD_CLEARED logged", rec.count("SPREAD_CLEARED") == 1)
 t.check("spread block logged only once while blocked",
         rec.count("SPREAD_BLOCK") == 1)
 
-t.section("LADDER DEPTH CAP LIMITS GROWTH, IT DOES NOT BLIND THE BOT")
+t.section("LADDER DEPTH CAP STOPS EXPOSURE, IT DOES NOT BLIND THE BOT")
 engine, broker, feed, settings, rec = build({"max_ladder_depth": 2}, name="depthcap")
 engine.step()
 buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
@@ -325,19 +325,22 @@ buys = sorted([o for o in broker.orders() if o.side == BUY_STOP],
 trigger_buy(feed, buys[1].price)
 engine.step()
 engine.step()
-live = broker.orders()
-t.check("the live ladder is NOT cancelled by the cap", len(live) > 0,
-        f"{len(live)} orders")
+t.check("the depth cap was reached",
+        engine.sequence.ladder_depth_used >= 2,
+        f"{engine.sequence.ladder_depth_used} levels used")
+t.check("the remaining pendings are cancelled at the cap",
+        not broker.orders(), f"{len(broker.orders())} orders")
+t.check("the open basket is NOT closed by the cap",
+        bool(broker.positions()), f"{len(broker.positions())} positions")
 t.check("the cap is logged once",
         len([e for e in rec.events if e[0] == "LADDER_DEPTH_CAP"]) == 1,
         str([e[0] for e in rec.events if e[0] == "LADDER_DEPTH_CAP"]))
 t.check("no risk block is raised for depth", "depth" not in engine.block_reason.lower(),
         engine.block_reason)
-before = len(broker.orders())
 for _ in range(5):
     engine.step()
-t.check("no further levels are added beyond the cap",
-        len(broker.orders()) <= before, f"{before} -> {len(broker.orders())}")
+t.check("no ladder orders are re-placed after the cap",
+        not broker.orders(), f"{len(broker.orders())} orders")
 t.check("the cycle can still reach an exit decision",
         engine.sequence is not None and engine.cycle_active)
 
