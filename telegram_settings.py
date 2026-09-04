@@ -69,6 +69,7 @@ class SettingsPanel:
         "cycle_reentry_cooldown_seconds": "reentry",
         "order_max_age_seconds": "age",
         "direction_filter": "direction", "timeframe": "settings",
+        "entry_timeframe": "entry",
         "telegram_status_updates": "notify",
         "telegram_status_interval_minutes": "notify",
         "telegram_error_throttle_seconds": "notify",
@@ -534,7 +535,7 @@ class SettingsPanel:
             "Levels a single cycle may use before new entries stop.\n"
             "The cycle can still close normally through the exit engine.")
 
-    # ---- risk ---    # ---- risk -------------------------------------------------------------
+    # ---- risk -------------------------------------------------------------
     def _menu_risk(self):
         s = self.settings.snapshot()
         text = "\n".join([
@@ -549,6 +550,8 @@ class SettingsPanel:
             f"Losing cycles allowed: {s['max_consecutive_losing_cycles']}",
             f"Cooldown after loss: {self._d('cooldown_after_loss_minutes')}",
             f"Re-entry cooldown: {self._d('cycle_reentry_cooldown_seconds')}",
+            f"Entry timeframe: {s['entry_timeframe']} "
+            f"(new cycles start on a closed candle)",
             f"Order max age: {self._d('order_max_age_seconds')}", "",
             "When a limit trips: new entries stop and pending orders are",
             "cancelled. Open positions keep running under their own rules.",
@@ -562,7 +565,8 @@ class SettingsPanel:
              _btn("🚫 LOSING CYCLES", "settings_streak")],
             [_btn("⏳ COOLDOWN", "settings_cooldown"),
              _btn("🔁 RE-ENTRY", "settings_reentry")],
-            [_btn("🕒 ORDER AGE", "settings_age")],
+            [_btn("🕒 ORDER AGE", "settings_age"),
+             _btn("🕯 ENTRY TIMEFRAME", "settings_entry")],
             [_btn(BACK, "settings")],
         )
 
@@ -632,6 +636,23 @@ class SettingsPanel:
             "Settle time AFTER a cycle has fully exited, before the next\n"
             "ladder is built. It never applies between ladder levels or\n"
             "triggers inside a running cycle.")
+
+    def _menu_entry(self):
+        s = self.settings.snapshot()
+        text = "\n".join([
+            "🕯 <b>ENTRY TIMEFRAME</b>", "",
+            f"Current: {s['entry_timeframe']}", "",
+            "A new cycle is evaluated ONCE per newly CLOSED candle on this",
+            "timeframe - never on the forming candle, and never on a bare",
+            "tick. Between candles the bot waits.",
+            "",
+            "This decides WHEN a new cycle may start. It does not change the",
+            "ladder, the spacing, the exit, or anything inside a cycle that",
+            "is already running.",
+        ])
+        row = [_btn(f"{self._mark(s['entry_timeframe'] == tf)}{tf}",
+                    f"confirm:entry_timeframe:{tf}") for tf in ("M1", "M5")]
+        return text, _rows(row, [_btn(BACK, "settings_risk")])
 
     def _menu_age(self):
         return self._simple_menu(

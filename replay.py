@@ -227,7 +227,8 @@ class ReplayResult:
 # ===========================================================================
 def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
                commission_per_lot=0.0, steps_per_leg=4, adverse_first=True,
-               start_balance=1000.0, progress=None):
+               start_balance=1000.0, progress=None, bar_seconds=300.0,
+               entry_gate=True):
     """Replay `bars` through the live engine. Returns a ReplayResult."""
     spec = spec or SymbolSpec(name=cfg.SYMBOL, digits=2, point=0.01,
                               tick_size=0.01, tick_value=1.0)
@@ -250,6 +251,12 @@ def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
                          commission_per_lot=commission_per_lot,
                          clock=sim_clock)
 
+    # The entry gate, replayed honestly: during bar i the most recently CLOSED
+    # bar is i-1. The forming bar is never visible, so there is no look-ahead,
+    # and a new cycle can only begin once per closed bar - exactly as live.
+    closed_bar = {"time": None}
+    bar_time = (lambda: closed_bar["time"]) if entry_gate else None
+
     result = ReplayResult(balance_start=start_balance)
     result.assumptions = [
         f"intrabar path: open -> "
@@ -259,6 +266,12 @@ def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
         f"commission: {commission_per_lot:.2f} per lot round turn",
         f"slippage: capped at {settings.get('max_slippage')} points on stop fills",
         "pending stop orders fill at the level unless price gapped past it",
+        (f"entry: one evaluation per CLOSED replay bar "
+         f"({bar_seconds:g}s). ENTRY_TIMEFRAME="
+         f"{settings.get('entry_timeframe')} is NOT resampled - the replay "
+         f"bar IS the entry candle" if entry_gate
+         else "entry: gate OFF - a cycle starts as soon as the safety gates "
+              "pass (pre-M1 behaviour)"),
     ]
 
     def on_cycle(cycle, sequence, total, reason, kind, lost,
@@ -294,7 +307,7 @@ def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
                "event": lambda *a: None,
                "cycle_started": lambda *a: None,
                "risk_blocked": lambda *a: None},
-        state_path=None, clock=sim_clock)
+        state_path=None, clock=sim_clock, bar_time=bar_time)
 
     first = bars[0]
     feed.set(first["open"], ts=first["time"], spread=first.get("spread") or spread)
@@ -305,7 +318,9 @@ def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
     for i, bar in enumerate(bars):
         bar_spread = bar.get("spread") or spread
         path = bar_path(bar, steps_per_leg, adverse_first)
-        seconds = 300.0 / max(1, len(path))
+        seconds = bar_seconds / max(1, len(path))
+        # bar i is forming; the last CLOSED bar is the one before it
+        closed_bar["time"] = int(bars[i - 1]["time"]) if i else None
         for step, price in enumerate(path):
             # walk simulated time across the bar so trigger gaps, order ages
             # and cooldowns are measured in market time
@@ -324,6 +339,12 @@ def run_replay(bars, spec=None, overrides=None, data_dir=None, spread=0.08,
     return result
 
 
+# how long one bar of each timeframe lasts, so simulated time advances at the
+# rate the replayed data actually represents
+_BAR_SECONDS = {"M1": 60.0, "M5": 300.0, "M15": 900.0, "M30": 1800.0,
+                "H1": 3600.0}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Replay the rolling ladder")
     ap.add_argument("--csv", help="bar file: time,open,high,low,close[,spread]")
@@ -335,6 +356,22 @@ def main(argv=None):
     ap.add_argument("--target", type=float,
                     help="basket profit target in account currency")
     ap.add_argument("--lot", type=float)
+    ap.add_argument("--entry-timeframe", choices=("M1", "M5", "M15", "M30", "H1"),
+                    help="timeframe whose CLOSED candle may start a cycle")
+    ap.add_argument("--no-entry-gate", action="store_true",
+                    help="start cycles on any tick (the pre-M1 behaviour)")
+    ap.add_argument("--max-depth", type=int,
+                    help="MAX_LADDER_DEPTH: levels a cycle may consume")
+    ap.add_argument("--activation", type=float,
+                    help="peak profit at which protection turns on")
+    ap.add_argument("--trail", type=float,
+                    help="give-back from the peak that closes the basket")
+    ap.add_argument("--floor", type=float,
+                    help="protected floor once the basket has run")
+    ap.add_argument("--no-runner", action="store_true",
+                    help="close at the target instead of trailing past it")
+    ap.add_argument("--cycle-drawdown", type=float,
+                    help="MAX_CYCLE_DRAWDOWN in account currency (0 = off)")
     ap.add_argument("--spread", type=float, default=0.08)
     ap.add_argument("--commission", type=float, default=cfg.COMMISSION_PER_LOT)
     ap.add_argument("--steps", type=int, default=4, help="price steps per bar leg")
@@ -362,6 +399,20 @@ def main(argv=None):
         overrides["basket_profit_target"] = args.target
     if args.lot:
         overrides["lot_size"] = args.lot
+    if args.entry_timeframe:
+        overrides["entry_timeframe"] = args.entry_timeframe
+    if args.max_depth is not None:
+        overrides["max_ladder_depth"] = args.max_depth
+    if args.activation is not None:
+        overrides["profit_protection_activation"] = args.activation
+    if args.trail is not None:
+        overrides["profit_protection_trail"] = args.trail
+    if args.floor is not None:
+        overrides["min_protected_profit"] = args.floor
+    if args.no_runner:
+        overrides["profit_runner_enabled"] = False
+    if args.cycle_drawdown is not None:
+        overrides["max_cycle_drawdown"] = args.cycle_drawdown
 
     started = time.time()
     result = run_replay(bars, spec=spec, overrides=overrides,
@@ -369,6 +420,8 @@ def main(argv=None):
                         steps_per_leg=args.steps,
                         adverse_first=not args.optimistic,
                         start_balance=args.balance,
+                        bar_seconds=_BAR_SECONDS.get(args.timeframe, 300.0),
+                        entry_gate=not args.no_entry_gate,
                         progress=max(1, len(bars) // 10))
     print(result.summary())
     print(f"(replayed in {time.time() - started:.1f}s)")

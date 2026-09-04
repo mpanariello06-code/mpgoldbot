@@ -180,10 +180,25 @@ class CycleBasket:
 
     def record_close(self, side, index, price_open, price_close, profit,
                      reason="", ts=None):
+        """
+        A leg has left the book: its money moves from floating to realized.
+
+        The subtraction matters. `floating_pnl` still holds this leg's share
+        until the next mark, so adding the same money to `realized_pnl` without
+        taking it out of `floating_pnl` would make `realized + floating` count
+        it twice - and `peak_pnl` only ever goes up, so that inflated total
+        would be latched for the rest of the cycle, arming protection early and
+        reporting a peak the basket was never worth. The leg's floating share
+        at the moment it closes IS its realized profit (they differ only by the
+        closing costs), and the next mark overwrites the estimate with the
+        truth.
+        """
+        profit = float(profit)
         self.closures.append(Closure(side, int(index), float(price_open),
-                                     float(price_close), float(profit),
+                                     float(price_close), profit,
                                      ts or time.time(), reason))
-        self.realized_pnl += float(profit)
+        self.realized_pnl += profit
+        self.floating_pnl -= profit
         self._update_extremes()
 
     def update_price(self, price, ts=None):

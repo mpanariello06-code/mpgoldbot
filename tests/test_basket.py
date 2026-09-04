@@ -335,6 +335,47 @@ t.check("the threshold it will close at is published",
 t.check("protection stays on even if the basket falls back below activation",
         eng.sequence.protection_active)
 
+t.section("A CLOSING LEG MOVES MONEY, IT DOES NOT CREATE IT")
+# Regression: record_close() used to ADD the profit to realized while the same
+# money was still sitting in floating, so realized+floating counted it twice.
+# peak_pnl only ever goes up, so the inflated total was latched for the rest of
+# the cycle - arming protection early and reporting a peak the basket was never
+# worth.
+from basket import CycleBasket, ProfitRules
+rules = ProfitRules(target=2.0, runner_enabled=True, activation=3.0,
+                    trail=1.5, floor=1.0)
+b = CycleBasket(1, 4010.0, 0.30, started_at=0.0)
+b.mark(1.90, rules, 1.0)                      # three legs floating at +1.90
+t.check("the peak is the basket total", abs(b.peak_pnl - 1.90) < 1e-9,
+        f"{b.peak_pnl}")
+t.check("protection is not armed at +1.90", not b.protection_active)
+for profit in (1.00, 0.60, 0.30):             # the same +1.90, leg by leg
+    b.record_close("BUY", 1, 4010.0, 4011.0, profit)
+t.check("realized is the money that was banked",
+        abs(b.realized_pnl - 1.90) < 1e-9, f"{b.realized_pnl}")
+t.check("floating gave up exactly what realized took",
+        abs(b.floating_pnl) < 1e-9, f"{b.floating_pnl}")
+t.check("the basket total did NOT double",
+        abs(b.basket_pnl - 1.90) < 1e-9, f"{b.basket_pnl}")
+t.check("and the peak was not inflated by the close",
+        abs(b.peak_pnl - 1.90) < 1e-9, f"{b.peak_pnl}")
+t.check("so protection is still not armed by money that never existed",
+        not b.protection_active, f"peak {b.peak_pnl}")
+b.mark(0.0, rules, 2.0)                       # the next mark: flat book
+t.check("the next mark agrees", abs(b.basket_pnl - 1.90) < 1e-9, f"{b.basket_pnl}")
+t.check("give-back is not invented either", abs(b.drawdown) < 1e-9,
+        f"{b.drawdown}")
+
+# a genuine peak is still tracked across a partial close
+b2 = CycleBasket(2, 4010.0, 0.30, started_at=0.0)
+b2.mark(5.00, rules, 1.0)
+b2.record_close("BUY", 1, 4010.0, 4012.0, 2.00)   # one leg banked
+b2.mark(3.00, rules, 2.0)                          # the rest still float
+t.check("a partial close keeps the real peak",
+        abs(b2.peak_pnl - 5.00) < 1e-9, f"{b2.peak_pnl}")
+t.check("the total is realized + what is still floating",
+        abs(b2.basket_pnl - 5.00) < 1e-9, f"{b2.basket_pnl}")
+
 t.section("6. THE TRAIL CLOSES THE BASKET")
 now = [11_000.0]
 eng, broker, feed, settings, rec = frozen(

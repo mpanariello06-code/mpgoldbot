@@ -172,6 +172,49 @@ individual TP the basket accumulates until the cycle closes, and a low cap would
 stop the ladder after N triggers — which is a fixed trade count, not a strategy.
 `config.validate()` warns when it is below `LADDER_DEPTH`.
 
+## Cycle entry
+
+A new cycle is a **deliberate decision taken once per newly CLOSED
+`ENTRY_TIMEFRAME` candle** (default `M1`) — never on the forming candle, and
+never on a bare tick.
+
+```
+flat -> WAITING_FOR_ENTRY  (between candles: nothing is evaluated)
+     -> a new candle closes
+     -> ENTRY_EVALUATION   (exactly once for that candle, whatever the outcome)
+     -> accepted -> CREATE_LADDER
+     -> rejected -> WAITING_FOR_ENTRY, with the reason recorded
+```
+
+`copy_rates_from_pos(0, 2)` returns `[closed, forming]`; index `-2` is the last
+closed bar, and its open time is what the engine gates on. That bar time is
+stored (`last_entry_bar`) and persisted, so the same candle is never evaluated
+twice — not by a faster tick, not by a restart.
+
+**The conditions are the ones the engine already had:** the re-entry cooldown
+has elapsed, the account is verified flat at the broker, risk is not blocking,
+and the spread is acceptable. No indicator was added — the change is *when* the
+question is asked, not what is asked.
+
+Two consequences worth being explicit about:
+
+* **The ladder is not rebuilt every candle.** Candle closes only decide whether
+  a NEW cycle begins. While a cycle is live the entry gate is not consulted at
+  all; the ladder is managed by the reconciler and closed by the exit rules.
+* **The cooldown alone does not re-enter.** After `CYCLE_REENTRY_COOLDOWN`
+  expires the engine sits in `WAITING_FOR_ENTRY` until the *next* candle
+  closes. The cooldown is a floor on re-entry, not a trigger for it.
+
+Every evaluated candle is written to `data/entry_evaluations.csv` — accepted or
+rejected, with the reason, the cooldown left, the live position and order
+counts, and the risk/spread verdicts — so accepted and rejected candles can be
+compared after the fact.
+
+If the bar feed fails or is not wired at all, the gate is **off** and the
+pre-M1 behaviour stands (deploy as soon as the safety gates pass). The failure
+is logged as an `ERROR`; the bot does not stall waiting for a candle it cannot
+see.
+
 ## The ladder lifecycle
 
 **One active ladder = one ladder ID.** A ladder is `LADDER_DEPTH` BUY STOP plus
@@ -179,9 +222,11 @@ stop the ladder after N triggers — which is a fixed trade count, not a strateg
 starts and **never replenished**:
 
 ```
-IDLE -> CREATE_LADDER -> PLACE 22 PENDING ORDERS -> ACTIVE_LADDER
+IDLE -> WAITING_FOR_ENTRY -> ENTRY_EVALUATION (one closed M1 candle)
+     -> CREATE_LADDER -> PLACE 22 PENDING ORDERS -> ACTIVE_LADDER
      -> MANAGE_CURRENT_LADDER -> FINAL CLOSE CONDITION -> verify flat
-     -> COOLDOWN (CYCLE_REENTRY_COOLDOWN, 10s) -> IDLE -> CREATE_NEW_LADDER
+     -> COOLDOWN (CYCLE_REENTRY_COOLDOWN, 10s) -> WAITING_FOR_ENTRY
+     -> ENTRY_EVALUATION -> CREATE_NEW_LADDER
 ```
 
 `create_new_ladder()` is the only function in the engine that creates a ladder,
@@ -228,9 +273,11 @@ the ladder runs as placed — **a second ladder is never created to compensate**
   anchor, so a restart continues the existing ladder instead of stacking a
   second one on top of it.
 
-`ROLL_MODE=extend` (default) keeps a full ladder ahead of price.
-`ROLL_MODE=static` pins the grid where the cycle started and lets price consume
-it — the behaviour visible in the reference recording.
+`ROLL_MODE=static` (default) pins the grid where the cycle started and lets
+price consume it — the behaviour visible in the reference recording.
+`ROLL_MODE=extend` keeps a full ladder ahead of price by replacing consumed
+levels; the config warns when it is set, because it is what makes a ladder look
+like it is being rebuilt.
 
 ## The exit
 
@@ -383,13 +430,22 @@ broker quotes gold differently.
 
 Fixed lots only — **no martingale, no size increase after a loss, no recovery
 doubling.** `MAX_OPEN_POSITIONS`, `MAX_PENDING_ORDERS`, `MAX_LOT_SIZE`,
-`MAX_DAILY_LOSS`, `MAX_CYCLE_LOSS`, `MAX_CYCLE_DURATION`,
-`MAX_CONSECUTIVE_LOSING_CYCLES`, `MAX_SPREAD`, `MAX_SLIPPAGE`,
-`COOLDOWN_AFTER_LOSS` and `CYCLE_REENTRY_COOLDOWN` are all enforced. When a
-limit trips: new entries stop and pending orders are cancelled (they would breach
-the limit the moment they trigger); **open positions keep running** until the
-basket is closed. The bot resumes by itself once the condition clears — the spread
-filter in particular blocks and un-blocks automatically.
+`MAX_LADDER_DEPTH`, `MAX_DAILY_DRAWDOWN`, `MAX_CYCLE_DRAWDOWN`,
+`MAX_CYCLE_DURATION`, `MAX_CONSECUTIVE_LOSING_CYCLES`, `MAX_SPREAD`,
+`MAX_SLIPPAGE`, `COOLDOWN_AFTER_LOSS` and `CYCLE_REENTRY_COOLDOWN` are all
+enforced. When a limit trips: new entries stop and pending orders are cancelled
+(they would breach the limit the moment they trigger); **open positions keep
+running** until the basket is closed. The bot resumes by itself once the
+condition clears — the spread filter in particular blocks and un-blocks
+automatically.
+
+**`MAX_LADDER_DEPTH` caps how much exposure one cycle may take on.** The ladder
+is placed once and never replenished, so "place no more levels" is not enough —
+the untouched pendings are already at the broker waiting to fill. When the cap
+is reached (`LADDER_DEPTH_CAP`, logged once) the **remaining pendings are
+cancelled**: no further exposure is added this cycle. The basket already open
+is not closed by the cap — it keeps being managed by the exit rules, and the
+cycle ends normally.
 
 ## Data
 
@@ -405,6 +461,7 @@ filter in particular blocks and un-blocks automatically.
   `EXIT_POSITIONS_FOUND`, `EXIT_CLOSE_SENT`, `EXIT_CLOSE_CONFIRMED`,
   `EXIT_RECONCILED`, `CYCLE_FLAT`,
   `CYCLE_ACTIVE`),
+  the entry gate (`WAITING_FOR_ENTRY`, `ENTRY_EVALUATED`),
   `RISK_BLOCK`, `SPREAD_BLOCK`, `ERROR`) with the **state of the basket at that
   moment**: trigger counts by side, last/previous side, direction changes, depth
   used, distance travelled, net levels, the basket's floating / realized / total
@@ -426,6 +483,11 @@ filter in particular blocks and un-blocks automatically.
   close at. **This is the file the exit thresholds should be fitted on** — a
   cycle summary alone cannot show that a basket was +95 before it was −9. CSV
   only; none of it reaches Telegram.
+* `data/entry_evaluations.csv` — one row per evaluated entry candle:
+  `bar_time`, timeframe, bid/ask/spread, `accepted`, the `reason`, the cooldown
+  left, live position and pending counts, `risk_ok`, `spread_ok` and the id the
+  next cycle would take. Rejected candles are recorded in full — the file is
+  there so a candle the bot *did not* trade is as auditable as one it did.
 * `data/trades.csv` — one row per open and close, with cycle and level context
 * `data/events.csv` — bot events (start/stop/pause/settings/errors)
 * `data/account_snapshots.csv` — periodic balance/equity/margin
@@ -450,8 +512,17 @@ half-updated ladder.
 ```bash
 python replay.py --bars 3000                      # M5 bars straight from MT5
 python replay.py --csv gold_m5.csv                # time,open,high,low,close[,spread]
-python replay.py --csv g.csv --spacing 0.20 --tp-levels 2 --exit-threshold 60
+python replay.py --csv g.csv --spacing 0.20 --target 3.00
+python replay.py --csv g.csv --entry-timeframe M5 --max-depth 12 \
+                 --activation 4 --trail 2 --floor 1.25 --cycle-drawdown 25
+python replay.py --csv g.csv --no-entry-gate      # the pre-M1 behaviour
 ```
+
+Backtest flags: `--entry-timeframe`, `--no-entry-gate`, `--max-depth`
+(`MAX_LADDER_DEPTH`), `--target` (`BASKET_PROFIT_TARGET`), `--activation`,
+`--trail`, `--floor`, `--no-runner`, `--cycle-drawdown`
+(`MAX_CYCLE_DRAWDOWN`), plus `--spacing`, `--depth`, `--lot`, `--spread`,
+`--commission`, `--steps`, `--optimistic` and `--balance`.
 
 The replay drives the **real** engine and the **real** paper broker, so what is
 measured is the shipped strategy. Bars are fed one at a time and walked as a
@@ -461,6 +532,12 @@ is derived from the current bar alone — no look-ahead. Spread, commission,
 slippage and the broker's minimum stop distance are all applied, and simulated
 time drives cooldowns, order ages and trigger gaps. The summary prints its own
 assumptions, because at this timescale they matter more than the strategy.
+
+The entry gate is replayed too: during bar *i* the most recently closed bar is
+*i-1*, so a cycle can only start once per closed replay bar, exactly as live.
+**The replay bar IS the entry candle** — `ENTRY_TIMEFRAME` is not resampled, so
+replaying M5 data gates entries on M5 closes whatever `ENTRY_TIMEFRAME` says.
+The summary states this rather than hiding it.
 
 When fitting parameters, split the data: development → validation → a holdout
 you only touch once.

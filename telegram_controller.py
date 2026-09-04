@@ -58,6 +58,16 @@ def _money(value):
         return "n/a"
 
 
+def _bar(bar_time):
+    """The open time of an entry candle, as a readable clock time."""
+    if not bar_time:
+        return "none yet"
+    try:
+        return datetime.fromtimestamp(int(bar_time)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return str(bar_time)
+
+
 class TelegramController:
     def __init__(self, engine, csv_logger, settings=None):
         self.engine = engine
@@ -313,7 +323,19 @@ class TelegramController:
             f"Historical BUY triggers: {s.get('historical_buy_triggers', 0)}",
             f"Historical SELL triggers: {s.get('historical_sell_triggers', 0)}",
             f"Direction changes: {s.get('direction_changes', 0)}",
-            f"Ladder depth used: {s.get('ladder_depth_used', 0)}",
+            f"Ladder depth used: {s.get('ladder_depth_used', 0)}"
+            + (f" / {s.get('max_ladder_depth')} max"
+               if s.get('max_ladder_depth') else "")
+            + ("   ⛔ CAPPED" if s.get("depth_capped") else ""),
+            "",
+            "<b>ENTRY</b>",
+            f"Timeframe: {s.get('entry_timeframe', 'M1')} "
+            f"(new cycles start on a CLOSED candle)",
+            f"Last candle evaluated: {_bar(s.get('last_entry_bar'))}",
+            f"Waiting for entry: "
+            f"{'yes' if s.get('waiting_for_entry') else 'no'}"
+            + (f" - {s.get('block_reason')}"
+               if s.get("waiting_for_entry") and s.get("block_reason") else ""),
             "",
             "<b>BASKET</b>",
             f"Current P/L: {_money(floating)}"

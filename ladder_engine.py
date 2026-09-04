@@ -1030,9 +1030,11 @@ class RollingLadderEngine:
           2. basket profit management - the target, or the trail protecting a
              peak that has already been reached.
 
-        Profit protection is deliberately checked BEFORE the emergency
-        drawdown can bite: a basket that was well ahead should be taken on the
-        trail, not left to run all the way down to the drawdown limit.
+        Hard risk is checked first so the reason reported is the one that
+        actually happened. In practice a basket that got ahead is taken by the
+        trail long before the emergency drawdown is reached - the engine polls
+        every pass, so the descent crosses the protection threshold first -
+        and the drawdown limit only wins when price gapped straight through it.
 
         Returns (reason_code, detail) or (None, "") to keep the cycle running.
         """
@@ -1659,6 +1661,10 @@ class RollingLadderEngine:
             "closed_positions": (len(self.sequence.closures)
                                  if self.sequence else 0),
             "cooldown_left": round(self._reentry_wait(), 1),
+            "max_ladder_depth": int(snap["max_ladder_depth"]),
+            "depth_capped": bool(
+                int(snap["max_ladder_depth"]) > 0 and self.sequence and
+                self.sequence.ladder_depth_used >= int(snap["max_ladder_depth"])),
             "entry_timeframe": snap["entry_timeframe"],
             "last_entry_bar": self.last_entry_bar,
             "waiting_for_entry": (not self.cycle_active and

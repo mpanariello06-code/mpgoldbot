@@ -97,6 +97,9 @@ class FakeEngine:
             "buy_triggers": 2, "sell_triggers": 5, "last_side": "SELL",
             "previous_side": "BUY", "direction_changes": 1,
             "ladder_depth_used": 5, "basket_drawdown": 0.42,
+            "max_ladder_depth": 22, "depth_capped": False,
+            "entry_timeframe": "M1", "last_entry_bar": 1700000040,
+            "waiting_for_entry": False,
             "state": "LADDER_ACTIVE",
             **self.state_overrides,
         }
@@ -218,6 +221,8 @@ async def run():
                   "Open SELL: 5", "THIS CYCLE SO FAR",
                   "Historical BUY triggers: 2", "Historical SELL triggers: 5",
                   "Direction changes: 1", "Ladder depth used: 5",
+                  "ENTRY", "Timeframe: M1", "Last candle evaluated:",
+                  "Waiting for entry: no", "Ladder depth used: 5 / 22 max",
                   "BASKET", "Current P/L", "Peak P/L: $10.21",
                   "Giveback: $2.79", "Protection: ACTIVE",
                   "Realized this cycle", "Cycle total", "(target $2.00)"]:
@@ -236,6 +241,19 @@ async def run():
                      "scenario", "imbalance")),
             text.replace("\n", " | ")[:240])
     t.check("status never leaks the token", "TESTTOKEN" not in text)
+
+    t.section("STATUS REPORTS THE ENTRY GATE")
+    engine.state_overrides = {"waiting_for_entry": True, "cycle_active": False,
+                              "block_reason": "cooldown (4s left)",
+                              "last_entry_bar": None, "depth_capped": True}
+    text, _, _ = await press("status")
+    t.check("a bot waiting for a candle says so",
+            "Waiting for entry: yes" in text, text.replace("\n", " | ")[:200])
+    t.check("and gives the reason", "cooldown (4s left)" in text)
+    t.check("no candle evaluated yet is stated honestly",
+            "Last candle evaluated: none yet" in text)
+    t.check("a capped ladder is flagged", "CAPPED" in text)
+    engine.state_overrides = {}
 
     t.section("STATUS FLAGS A LADDER THAT IS NOT LIVE")
     engine.state_overrides = {"orders": 0, "positions": 0,
@@ -283,7 +301,7 @@ async def run():
              "settings_pending",
              "settings_spread", "settings_daily", "settings_cycleloss",
              "settings_streak", "settings_cooldown", "settings_age",
-             "settings_direction"]
+             "settings_reentry", "settings_entry", "settings_direction"]
     seen = set()
     for m in menus:
         text, markup = panel.render(m, 111)
@@ -316,6 +334,21 @@ async def run():
             [l for l in text.splitlines() if "pip" in l])
     t.check("settings say changes affect new levels", "NEW levels only" in text)
 
+    t.section("ENTRY TIMEFRAME MENU")
+    text, markup = panel.render("settings_entry", 111)
+    t.check("the entry menu names the current timeframe",
+            f"Current: {S.get('entry_timeframe')}" in text, text[:80])
+    t.check("it explains that entry is candle-confirmed",
+            "CLOSED candle" in text, text.replace("\n", " | ")[:120])
+    t.check("it offers M1 and M5",
+            buttons(markup)[:2] == ["confirm:entry_timeframe:M1",
+                                    "confirm:entry_timeframe:M5"],
+            str(buttons(markup)))
+    text, _ = panel.render("settings_risk", 111)
+    t.check("the risk screen reports the entry timeframe",
+            "Entry timeframe:" in text,
+            [l for l in text.splitlines() if "Entry" in l])
+
     t.section("CONFIRMATION FLOW")
     text, markup = panel.render("confirm:ladder_spacing:0.5", 111)
     t.check("confirm screen shown", "CONFIRM CHANGE" in text and "0.3 → 0.5" in text,
@@ -333,6 +366,7 @@ async def run():
                           ("confirm:lot_size:0.02", "lot_size", 0.02),
                           ("confirm:ladder_depth:8", "ladder_depth", 8),
                           ("confirm:max_open_positions:2", "max_open_positions", 2),
+                          ("confirm:entry_timeframe:M5", "entry_timeframe", "M5"),
                           ("confirm:direction_filter:buy_bias", "direction_filter",
                            "buy_bias")]:
         before = S.get(key)

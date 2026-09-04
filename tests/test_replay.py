@@ -164,6 +164,71 @@ t.check("an epoch is still an epoch", replay.parse_bar_time("1000", 0) == 1000.0
 t.check("an unreadable time falls back to the row index",
         replay.parse_bar_time("not a time", 7) == 7.0)
 
+t.section("THE ENTRY GATE IS REPLAYED, NOT SKIPPED")
+gated = replay.run_replay(bars_from_closes(trend()), spec=SPEC, data_dir=TMP,
+                          start_balance=1000.0,
+                          overrides={"cooldown_after_loss_minutes": 0})
+ungated = replay.run_replay(bars_from_closes(trend()), spec=SPEC, data_dir=TMP,
+                            start_balance=1000.0, entry_gate=False,
+                            overrides={"cooldown_after_loss_minutes": 0})
+t.check("the gate is on by default and stated in the assumptions",
+        any("one evaluation per CLOSED replay bar" in a
+            for a in gated.assumptions), str(gated.assumptions[-1]))
+t.check("turning it off is stated too, not silent",
+        any("gate OFF" in a for a in ungated.assumptions),
+        str(ungated.assumptions[-1]))
+t.check("the gate is honest about not resampling the entry timeframe",
+        any("NOT resampled" in a for a in gated.assumptions))
+t.check("a gated run still trades", gated.triggers > 0, str(gated.triggers))
+t.check("the gate cannot start MORE cycles than an ungated run",
+        len(gated.cycles) <= len(ungated.cycles),
+        f"{len(gated.cycles)} gated vs {len(ungated.cycles)} ungated")
+
+t.section("BACKTEST FLAGS REACH THE SETTINGS")
+def parsed(argv):
+    """Run main()'s argument handling without replaying anything."""
+    captured = {}
+
+    def fake_run(bars, **kw):
+        captured["overrides"] = kw.get("overrides")
+        captured["entry_gate"] = kw.get("entry_gate")
+        captured["bar_seconds"] = kw.get("bar_seconds")
+        return replay.ReplayResult(balance_start=0.0)
+
+    real = replay.run_replay
+    replay.run_replay = fake_run
+    try:
+        replay.main(argv)
+    finally:
+        replay.run_replay = real
+    return captured
+
+
+csv_path = TMP / "flags.csv"
+csv_path.write_text("time,open,high,low,close\n"
+                    "2024-01-01 00:00,4010,4011,4009,4010.5\n"
+                    "2024-01-01 00:05,4010.5,4012,4010,4011.5\n")
+got = parsed(["--csv", str(csv_path), "--entry-timeframe", "M5",
+              "--max-depth", "8", "--target", "3.5", "--activation", "4",
+              "--trail", "2", "--floor", "1.25", "--cycle-drawdown", "25"])
+over = got["overrides"]
+for key, want in [("entry_timeframe", "M5"), ("max_ladder_depth", 8),
+                  ("basket_profit_target", 3.5),
+                  ("profit_protection_activation", 4.0),
+                  ("profit_protection_trail", 2.0),
+                  ("min_protected_profit", 1.25),
+                  ("max_cycle_drawdown", 25.0)]:
+    t.check(f"--{key} reaches the run", over.get(key) == want,
+            f"{key}={over.get(key)!r} want {want!r}")
+t.check("the gate is on unless it is switched off", got["entry_gate"] is True)
+got = parsed(["--csv", str(csv_path), "--no-entry-gate", "--no-runner"])
+t.check("--no-entry-gate switches it off", got["entry_gate"] is False)
+t.check("--no-runner switches the runner off",
+        got["overrides"].get("profit_runner_enabled") is False)
+got = parsed(["--csv", str(csv_path), "--timeframe", "M1"])
+t.check("simulated time advances at the replayed timeframe's rate",
+        got["bar_seconds"] == 60.0, str(got["bar_seconds"]))
+
 t.section("SIMULATED TIME DRIVES THE DAILY GUARD")
 # The daily drawdown guard resets on the engine's own clock. On the wall clock
 # a multi-day replay would spend the whole run blocked after its first bad day.
