@@ -129,8 +129,16 @@ def copy_rates_from_pos(symbol, timeframe, start, count):
     return np.array(rows, dtype=dtype)
 
 
+def _mark(pos):
+    """MT5 fills `profit` in on every read; the engine's basket P/L reads it."""
+    price = STATE["bid"] if pos.type == POSITION_TYPE_BUY else STATE["ask"]
+    sign = 1 if pos.type == POSITION_TYPE_BUY else -1
+    pos.profit = round(sign * (price - pos.price_open) * 100 * pos.volume, 2)
+    return pos
+
+
 def positions_get(symbol=None, ticket=None):
-    poss = STATE["positions"]
+    poss = [_mark(p) for p in STATE["positions"]]
     if ticket is not None:
         return tuple(p for p in poss if p.ticket == ticket)
     if symbol is not None:
