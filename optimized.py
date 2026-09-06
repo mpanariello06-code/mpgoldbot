@@ -248,6 +248,9 @@ class LadderBot:
 
         self._lock = threading.RLock()
         self._thread = None
+        self._exit_thread = None
+        self.exit_checks = 0          # how many times the fast path has looked
+        self.exit_checks_fired = 0    # how many of those committed an exit
         self._stop = threading.Event()
         self._pause = threading.Event()
 
@@ -455,6 +458,13 @@ class LadderBot:
             self._thread = threading.Thread(
                 target=self._run, name="ladder-engine", daemon=True)
             self._thread.start()
+            # The exit monitor is a SEPARATE thread on purpose. The ladder loop
+            # does a lot of work per pass - reads, reconciliation, telemetry,
+            # candle checks - and a basket at its target cannot wait behind any
+            # of it. This thread does two MT5 reads and a decision.
+            self._exit_thread = threading.Thread(
+                target=self._run_exit_monitor, name="exit-monitor", daemon=True)
+            self._exit_thread.start()
 
         log_event("BOT_STARTED", f"Rolling ladder started on {SYMBOL} "
                                  f"({self.broker.name})", symbol=SYMBOL)
@@ -508,12 +518,17 @@ class LadderBot:
         """
         with self._lock:
             thread = self._thread
+            exit_thread = self._exit_thread
             if not (thread and thread.is_alive()):
                 self._set_state(BotState.STOPPED)
                 return False, "Engine is already stopped."
             self._stop.set()
 
         thread.join(timeout=max(5.0, POLL_SECONDS * 20))
+        if exit_thread and exit_thread.is_alive():
+            exit_thread.join(timeout=max(2.0, cfg.EXIT_POLL_SECONDS * 40))
+        with self._lock:
+            self._exit_thread = None
         cancelled = 0
         try:
             if self.engine and cfg.TRADING_MODE:
@@ -665,6 +680,27 @@ class LadderBot:
 
         if self.state != BotState.ERROR:
             self._set_state(BotState.STOPPED)
+
+    def _run_exit_monitor(self):
+        """
+        The highest-priority loop in the bot: is this basket done?
+
+        Nothing in here touches Telegram, CSV, candles, indicators or the
+        ladder. It asks the engine's one exit authority and, when that says
+        exit, the close requests go out on this thread immediately.
+        """
+        interval = max(0.005, float(cfg.EXIT_POLL_SECONDS))
+        while not self._stop.is_set():
+            try:
+                if self.state == BotState.RUNNING and self._mt5_ready:
+                    reason = self.engine.check_exit_now()
+                    if reason:
+                        self.exit_checks_fired += 1
+                self.exit_checks += 1
+            except Exception as exc:
+                # never let this thread die: it is the profit protection
+                log(f"⚠ Exit monitor error: {exc}")
+            self._stop.wait(interval)
 
     def _check_new_candle(self):
         """
@@ -1120,6 +1156,12 @@ class Application:
             except Exception as exc:
                 log(f"⚠ Telegram stop error: {exc}")
         log_event("BOT_STOPPED", "Application shutdown", symbol=SYMBOL)
+        # every queued telemetry row reaches disk before the process ends
+        try:
+            if not CSV.close(timeout=10.0):
+                log("⚠ CSV writer did not stop cleanly")
+        except Exception as exc:
+            log(f"⚠ CSV flush error: {exc}")
         with MT5_LOCK:
             mt5.shutdown()
         log("MT5 connection closed")

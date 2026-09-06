@@ -7,15 +7,22 @@ Three files live inside DATA_DIRECTORY (created automatically with headers):
     events.csv             meaningful bot events only (never per poll cycle)
     account_snapshots.csv  periodic account state
 
-All writes go through a single threading.Lock so the trading engine, the
-background monitor and the Telegram controller can never corrupt a file.
-Appends are cheap (open -> write one row -> close) so the 0.5s trading loop is
-never meaningfully delayed.
+Row building and the in-memory bookkeeping (de-duplication keys) happen on the
+caller's thread under a lock; the actual disk write is handed to a single
+background writer thread. The trading engine therefore never waits on disk -
+an exit that has to close a basket is not delayed behind a telemetry row - and
+because one thread owns every append, files still cannot be interleaved or
+corrupted.
+
+Anything that READS a file flushes the queue first, so a reader never sees a
+stale file while rows are still in flight.
 """
 
 import csv
 import os
+import queue
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -139,6 +146,93 @@ def _fmt(value, digits=None):
     return str(value)
 
 
+class AsyncWriter:
+    """
+    A single background thread that owns every CSV append.
+
+    The trading thread must never wait on disk. Callers enqueue a
+    (path, row) pair and return immediately; this thread does the open/write/
+    close. One thread and one FIFO queue means rows keep the order they were
+    produced in, per file and across files.
+
+    A logging failure is reported and dropped - it never propagates into the
+    trading path. Set `queue_limit` to bound memory; when the queue is full the
+    OLDEST pending row is dropped rather than blocking a close request.
+    """
+
+    def __init__(self, queue_limit=10000):
+        self._queue = queue.Queue(maxsize=queue_limit)
+        self._stop = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
+        self.dropped = 0
+        self.written = 0
+        self._thread = threading.Thread(target=self._run, name="csv-writer",
+                                        daemon=True)
+        self._thread.start()
+
+    def submit(self, path, row):
+        """Queue one row. Never blocks, never raises."""
+        try:
+            self._idle.clear()
+            self._queue.put_nowait((path, row))
+        except queue.Full:
+            # Losing the oldest telemetry row is strictly better than making a
+            # close request wait for a disk that is not keeping up.
+            self.dropped += 1
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+                self._queue.put_nowait((path, row))
+            except queue.Empty:
+                pass
+            except queue.Full:
+                pass
+        except Exception as exc:
+            self.dropped += 1
+            print(f"[csv_logger] enqueue failed: {exc}")
+
+    def _run(self):
+        while True:
+            try:
+                item = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                self._idle.set()
+                if self._stop.is_set():
+                    return
+                continue
+            try:
+                path, row = item
+                with open(path, "a", newline="", encoding="utf-8") as fh:
+                    csv.writer(fh).writerow(row)
+                self.written += 1
+            except Exception as exc:                # logging never kills trading
+                self.dropped += 1
+                print(f"[csv_logger] write failed: {exc}")
+            finally:
+                self._queue.task_done()
+
+    def flush(self, timeout=5.0):
+        """Block until everything queued so far is on disk. Returns True if so."""
+        end = time.time() + timeout
+        while time.time() < end:
+            if self._queue.unfinished_tasks == 0:
+                return True
+            time.sleep(0.005)
+        return self._queue.unfinished_tasks == 0
+
+    def stop(self, timeout=5.0):
+        """Flush what is queued, then end the thread."""
+        self.flush(timeout=timeout)
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+        return not self._thread.is_alive()
+
+    @property
+    def pending(self):
+        return self._queue.unfinished_tasks
+
+
 class CsvLogger:
     def __init__(self, data_dir, trade_file, event_file, account_file,
                  ladder_file="rolling_ladder_events.csv",
@@ -157,6 +251,8 @@ class CsvLogger:
         self._lock = threading.Lock()
         # Keys of trade rows already written -> prevents duplicates across restarts
         self._trade_keys = set()
+        # Every append goes to this thread; the caller never waits on disk.
+        self._writer = AsyncWriter()
 
         self._bootstrap()
 
@@ -242,9 +338,20 @@ class CsvLogger:
 
     # ------------------------------------------------------------ raw writing
     def _append(self, path, row):
-        with self._lock:
-            with open(path, "a", newline="", encoding="utf-8") as fh:
-                csv.writer(fh).writerow(row)
+        """Hand the row to the writer thread. Returns without touching disk."""
+        self._writer.submit(path, row)
+
+    def flush(self, timeout=5.0):
+        """Wait for queued rows to reach disk. Used by readers and shutdown."""
+        return self._writer.flush(timeout=timeout)
+
+    def close(self, timeout=5.0):
+        """Flush and stop the writer thread. Safe to call more than once."""
+        return self._writer.stop(timeout=timeout)
+
+    @property
+    def pending_writes(self):
+        return self._writer.pending
 
     # ---------------------------------------------------------------- events
     def log_event(self, event_type, message="", symbol="", ticket="", status="OK"):
@@ -365,6 +472,7 @@ class CsvLogger:
 
     def ladder_stats(self, day=None):
         """Today's ladder activity, straight from ladder.csv."""
+        self.flush()          # rows may still be in the writer queue
         day = day or datetime.now().strftime("%Y-%m-%d")
         counts = {}
         realized = 0.0
@@ -461,6 +569,7 @@ class CsvLogger:
 
     # ----------------------------------------------------------------- stats
     def _read_trades(self):
+        self.flush()          # a reader must never see a half-written history
         with self._lock:
             try:
                 with open(self.trade_path, "r", newline="", encoding="utf-8") as fh:

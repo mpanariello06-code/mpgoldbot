@@ -26,7 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from broker import BUY, BUY_STOP, SELL, SELL_STOP
-from basket import (RISK_DRAWDOWN, RISK_TIMEOUT, CycleBasket, ProfitRules)
+from basket import (EXITING_STATE, RISK_DRAWDOWN, RISK_REASONS, RISK_TIMEOUT,
+                    CycleBasket, ProfitRules)
 
 COMMENT_RE = re.compile(r"^RL(\d+)([BS])(-?\d+)")
 
@@ -53,6 +54,14 @@ class State:
     POSITION_ACTIVE = "POSITION_ACTIVE"  # a.k.a. TRADING: the basket is open
     TRADING = "POSITION_ACTIVE"          # alias, same state
     ROLLING = "ROLLING"
+    # Basket-state views of an ACTIVE cycle. They describe what the basket is
+    # doing, never what the engine is executing, and they can only be entered
+    # while the cycle is live.
+    UNDERWATER = "UNDERWATER"
+    RECOVERING = "RECOVERING"
+    PROFITABLE = "PROFITABLE"
+    PROFIT_PROTECTION = "PROFIT_PROTECTION"
+    EXITING = "EXITING"                  # the exit is committed and irrevocable
     CLOSING_CYCLE = "CLOSING_CYCLE"      # closing the basket out
     VERIFYING_FLAT = "VERIFYING_FLAT"    # re-reading MT5 until it confirms flat
     CYCLE_COMPLETE = "CYCLE_COMPLETE"
@@ -203,6 +212,13 @@ class RollingLadderEngine:
         self.cycle_active = True
         self.reentry_until = 0.0
         self._cycle_announced = False     # the new ladder's one deploy message
+        # ONE-WAY LATCH. Set the instant an exit is decided, cleared only when
+        # the next cycle is created. While it is set nothing may place an
+        # order, extend the ladder, or trigger a second exit: an exit that has
+        # begun is irrevocable, and a cycle in EXITING never returns to ACTIVE.
+        self.exit_in_progress = False
+        # Timestamps for the exit, filled in as it happens (PHASE 17).
+        self.exit_timing = {}
 
     # =================================================================== utils
     def _today(self):
@@ -398,6 +414,13 @@ class RollingLadderEngine:
         still live at the broker. Nothing else in the engine may create,
         replace or reset a ladder.
         """
+        # 0. an exit that has begun owns the account until it is verified flat
+        if self.exit_in_progress:
+            self._event("LADDER_REJECTED_ALREADY_ACTIVE",
+                        f"refusing to create a ladder: cycle "
+                        f"#{self.cycle.cycle_id} is EXITING ({reason})",
+                        cycle_id=self.cycle.cycle_id, status="REJECTED")
+            return False
         # 1. one active ladder, ever
         if self.ladder_active:
             self._event("LADDER_REJECTED_ALREADY_ACTIVE",
@@ -984,18 +1007,96 @@ class RollingLadderEngine:
             reason_code, detail = self._exit_reason(snap, floating, positions)
             if reason_code is None:
                 return False
+            if not self.commit_exit(reason_code, detail, tick, positions,
+                                    orders, floating):
+                return "pending"
+            return self._advance_close(snap, positions, orders)
 
-            # What the cycle looked like at the moment the exit was decided.
-            # Captured here, not after the close, so the CSV records the state
-            # that caused the exit rather than the empty state that follows it.
-            self._event("EXIT_TRIGGERED",
-                        f"Cycle #{self.cycle.cycle_id} exit [{reason_code}]: "
-                        f"{detail} - {len(positions)} positions / "
-                        f"{len(orders)} pending orders to clear",
-                        cycle_id=self.cycle.cycle_id, status="CLOSING")
+    def check_exit_now(self):
+        """
+        THE FAST EXIT PATH. Called many times a second, off the ladder loop.
+
+        This is the whole reason a basket can be taken at the price it reached
+        rather than the price it fell back to. It does the least work that can
+        possibly decide an exit:
+
+            tick + positions  ->  mark  ->  the one exit authority  ->  close
+
+        Deliberately NOT here: order reads, deal-history polling, ladder
+        reconciliation, entry evaluation, candle checks, telemetry, Telegram.
+        Two MT5 reads, then a decision. When it decides to exit it closes the
+        positions in the same call - the pendings and the flat verification are
+        finished by the ordinary pass, which is the right place for them
+        because they are no longer holding money.
+
+        Returns the exit reason if this call committed an exit, else None.
+        """
+        if not self.cycle_active or self.exit_in_progress or \
+                self._closing_cycle is not None or self.paused:
+            return None
+        if self.sequence is None:
+            return None
+        try:
+            snap = self.settings.snapshot()
+            tick = self.broker.tick()
+            positions = self.broker.positions()
+        except Exception as exc:
+            # a momentary read failure is not an exit decision; the ordinary
+            # pass logs and handles connectivity
+            self._event("ERROR", f"fast exit check failed: {exc}",
+                        status="ERROR")
+            return None
+        self.last_tick = tick
+
+        floating = self.mark_to_market(snap, tick, positions)
+        reason_code, detail = self._exit_reason(snap, floating, positions)
+        if reason_code is None:
+            return None
+
+        detected_at = time.time()
+        # orders are NOT read here - the count is only for the log line, and a
+        # round trip to make a message prettier is exactly the kind of delay
+        # this path exists to remove
+        if not self.commit_exit(reason_code, detail, tick, positions, (),
+                                floating, detected_at=detected_at):
+            return None
+        with self._transition_lock:
+            self._advance_close(snap, positions, None, tick=tick,
+                                spec=self.spec)
+        return reason_code
+
+    def commit_exit(self, reason_code, detail, tick, positions, orders,
+                    floating, detected_at=None):
+        """
+        Commit the cycle to EXITING. Irrevocable, and only ever done once.
+
+        This is the moment the decision becomes an action. It is deliberately
+        tiny: set the latch, record what the basket was worth, timestamp it.
+        No disk, no network, no Telegram - the close request follows straight
+        after, and everything else about this exit is written up later.
+
+        Returns True if THIS call committed the exit, False if it was already
+        committed (a duplicate trigger, which is not an error).
+        """
+        with self._transition_lock:
+            if self.exit_in_progress or self._closing_cycle is not None:
+                return False
+            now = time.time()
+            # one-way latch: nothing may place orders or start a cycle now
+            self.exit_in_progress = True
+            self.state = State.EXITING
+            self.exit_timing = {
+                # when the condition became true, if the caller knows (the
+                # fast monitor does); otherwise when we noticed it
+                "target_crossed_at": detected_at or now,
+                "target_detected_at": detected_at or now,
+                "exit_state_entered_at": now,
+            }
+            if self.sequence is not None:
+                self.sequence.state = EXITING_STATE
             self._closing_cycle = {
                 "cycle_id": self.cycle.cycle_id,
-                "forced": reason_code.startswith("RISK"),
+                "forced": reason_code in RISK_REASONS,
                 "kind": reason_code,
                 "reason": detail,
                 "attempts": 0,
@@ -1011,14 +1112,21 @@ class RollingLadderEngine:
                                                if p.side == SELL]),
                     "pending_orders_at_exit": len(orders),
                     # what the basket was worth BEFORE the closing orders went
-                    # out; the realized figure below comes from MT5's own deal
+                    # out; the realized figure comes from MT5's own deal
                     # history once they have settled, and the two differ by
                     # spread, slippage, commission and swap.
                     "floating_pnl_at_exit": floating,
                     "floating_pnl_before_close": floating,
+                    "basket_pnl_at_target_detection": floating,
                 },
             }
-            return self._advance_close(snap, positions, orders)
+        # logging is asynchronous, so this costs the caller microseconds
+        self._event("EXIT_TRIGGERED",
+                    f"Cycle #{self.cycle.cycle_id} exit [{reason_code}]: "
+                    f"{detail} - {len(positions)} positions / "
+                    f"{len(orders)} pending orders to clear",
+                    cycle_id=self.cycle.cycle_id, status="CLOSING")
+        return True
 
     def _exit_reason(self, snap, floating, positions):
         """
@@ -1058,56 +1166,78 @@ class RollingLadderEngine:
         return self.sequence.should_exit(self.profit_rules(snap),
                                          has_exposure=bool(positions))
 
-    def _advance_close(self, snap, positions, orders):
+    def _advance_close(self, snap, positions, orders, tick=None, spec=None):
         """
         Close the cycle out. The next cycle is NOT started here.
 
-        EXIT -> cancel -> close -> VERIFY against what MT5 actually reports ->
-        record -> FLAT -> cooldown. Every step is logged, because a cycle that
-        opens and closes in seconds is otherwise impossible to audit. If the
-        broker refused something, the leftovers are retried on the next pass
-        instead of building a second ladder on top of the first.
+        EXIT -> CLOSE POSITIONS -> cancel pendings -> VERIFY against what MT5
+        actually reports -> record -> FLAT -> cooldown.
+
+        POSITIONS GO FIRST, and that ordering is the whole point. The money is
+        in the open positions; a pending order at a price the market has not
+        reached is worth nothing and cancelling it costs a round trip each.
+        Cancelling 16 pendings before the first close request measured 34ms of
+        pure delay on a basket that was already at its target - long enough on
+        XAUUSD to give the profit back. A pending that fills in the gap is
+        caught by the flat verification below and closed on the next pass.
+
+        Every step is logged asynchronously, so the audit trail costs the
+        trading thread microseconds. If the broker refused something the
+        leftovers are retried on the next pass instead of building a second
+        ladder on top of the first.
         """
         info = self._closing_cycle
         info["attempts"] += 1
-        self.state = State.CLOSING_CYCLE
         first = info["attempts"] == 1
         cid = info["cycle_id"]
         # the basket, not "whatever is open": only this cycle's legs are touched
-        orders = self.cycle_orders(cid, orders)
         positions = self.cycle_positions(cid, positions)
+        timing = self.exit_timing
+        # `orders is None` means "read them when you get there" - the caller on
+        # the fast path has not read the order book and must not pay for it
+        # before the positions are closed
 
-        # --- cancel every pending order belonging to the cycle ---------------
-        if orders:
-            if first:
-                self._event("EXIT_ORDERS_FOUND",
-                            f"Cycle #{cid}: {len(orders)} pending orders to "
-                            f"cancel ({', '.join(str(o.ticket) for o in orders)})",
-                            cycle_id=cid, status="CLOSING")
-            self._event("EXIT_CANCEL_SENT",
-                        f"Cycle #{cid}: cancel requests sent for "
-                        f"{len(orders)} orders", cycle_id=cid, status="CLOSING")
-            self._cancel_all(orders, f"cycle end: {info['reason']}")
-
-        # --- close every open position belonging to the cycle ----------------
+        # --- close every open position belonging to the cycle - FIRST --------
         close_positions = info["forced"] or snap["cycle_close_positions"]
         if close_positions and positions:
+            # read once, reuse for every close: without this each position
+            # costs an extra positions_get + symbol_info_tick + symbol_info.
+            # The fast path already has both and passes them straight through.
+            if tick is None:
+                try:
+                    tick = self.broker.tick()
+                except Exception:
+                    tick = self.last_tick
+            if spec is None:
+                try:
+                    spec = self.broker.symbol_spec()
+                except Exception:
+                    spec = self.spec
             if first:
+                timing.setdefault("close_request_started_at", time.time())
                 self._event("EXIT_POSITIONS_FOUND",
                             f"Cycle #{cid}: {len(positions)} open positions to "
                             f"close ({', '.join(str(p.ticket) for p in positions)})",
                             cycle_id=cid, status="CLOSING")
-            self._event("EXIT_CLOSE_SENT",
-                        f"Cycle #{cid}: close requests sent for "
-                        f"{len(positions)} positions",
-                        cycle_id=cid, status="CLOSING")
+            failures = 0
             for pos in positions:
-                ok, msg = self.broker.close_position(pos.ticket, comment="cycle end")
+                ok, msg = self.broker.close_position(
+                    pos.ticket, comment="cycle end",
+                    position=pos, tick=tick, spec=spec)
                 if not ok:
+                    failures += 1
                     # the broker's own retcode, never a bare failure
                     self._event("ERROR", f"close {pos.ticket} failed: {msg}",
                                 cycle_id=cid, position_ticket=pos.ticket,
                                 status="ERROR")
+            info["close_failures"] = info.get("close_failures", 0) + failures
+            if first:
+                timing.setdefault("close_request_completed_at", time.time())
+            self._event("EXIT_CLOSE_SENT",
+                        f"Cycle #{cid}: close requests sent for "
+                        f"{len(positions)} positions"
+                        + (f", {failures} refused" if failures else ""),
+                        cycle_id=cid, status="CLOSING")
             closed = self.broker.poll_closed()
             for trade in closed:
                 self._on_closed(trade, snap)
@@ -1117,8 +1247,28 @@ class RollingLadderEngine:
                             f"P/L {sum(t.profit for t in closed):+.2f}",
                             cycle_id=cid, status="CLOSING")
 
+        # --- then cancel every pending order belonging to the cycle ----------
+        orders = self.cycle_orders(cid, orders)
+        if orders:
+            if first:
+                timing.setdefault("pending_cancel_started_at", time.time())
+                self._event("EXIT_ORDERS_FOUND",
+                            f"Cycle #{cid}: {len(orders)} pending orders to "
+                            f"cancel ({', '.join(str(o.ticket) for o in orders)})",
+                            cycle_id=cid, status="CLOSING")
+            cancelled = self._cancel_all(orders, f"cycle end: {info['reason']}")
+            info["cancel_failures"] = info.get("cancel_failures", 0) + \
+                (len(orders) - cancelled)
+            if first:
+                timing.setdefault("pending_cancel_completed_at", time.time())
+            self._event("EXIT_CANCEL_SENT",
+                        f"Cycle #{cid}: cancel requests sent for "
+                        f"{len(orders)} orders", cycle_id=cid, status="CLOSING")
+        self.state = State.CLOSING_CYCLE
+
         # --- verify against MT5: the old cycle must be gone ------------------
         self.state = State.VERIFYING_FLAT
+        timing.setdefault("flat_verification_started_at", time.time())
         left_orders = self.cycle_orders(cid)
         left_positions = self.cycle_positions(cid) if close_positions else []
         self._event("EXIT_RECONCILED",
@@ -1178,6 +1328,14 @@ class RollingLadderEngine:
         # --- the cycle is CLOSED; there is now no active cycle ---------------
         # The FINAL CLOSE CONDITION has been satisfied and verified flat. This
         # is the ONLY transition out of an active ladder.
+        #
+        # The exit latch is released HERE and only here: MT5 has confirmed
+        # 0 positions and 0 pending orders, so the exit is finished rather than
+        # abandoned. The cycle does not go back to ACTIVE - it is over. What
+        # stops another cycle starting from this point is the re-entry cooldown
+        # and the M1 entry gate, not the latch.
+        timing["fully_flat_at"] = time.time()
+        self.exit_in_progress = False
         self.cycle_active = False
         self.sequence = None
         self.reentry_until = self.clock() + self._reentry_cooldown(snap)
@@ -1363,6 +1521,11 @@ class RollingLadderEngine:
     # ---------------------------------------------------------- reconciliation
     def _reconcile(self, snap, tick, positions, orders):
         """Place what is missing, cancel what should not be there. Idempotent."""
+        # An exit in flight stops ladder placement dead. This is checked before
+        # anything else so a level cannot be placed into a basket that is being
+        # closed - the close would then leave it behind.
+        if self.exit_in_progress:
+            return len(orders)
         desired = self.desired_levels(tick, snap, orders)
         desired_by_key = {(d.side, d.index): d for d in desired}
 
@@ -1425,6 +1588,10 @@ class RollingLadderEngine:
             int(snap["max_pending_orders"]) - len(seen)
         failures = 0
         first_deploy = not orders and room_orders > 0
+        # the fast exit monitor runs on its own thread: re-check the latch
+        # between orders so a commit lands at most one level late
+        if self.exit_in_progress:
+            return len(seen)
         if first_deploy:
             self._event("LADDER_DEPLOY_START",
                         f"{self.broker.symbol} bid={tick.bid} ask={tick.ask} "
@@ -1439,6 +1606,10 @@ class RollingLadderEngine:
         for key, level in sorted(desired_by_key.items(),
                                  key=lambda kv: abs(kv[1].price - tick.mid)):
             if room_orders <= 0:
+                break
+            if self.exit_in_progress:
+                # an exit committed on the fast thread mid-placement: stop
+                # here rather than adding a level the close would leave behind
                 break
             if key in seen or not level.placeable:
                 continue
@@ -1532,8 +1703,8 @@ class RollingLadderEngine:
         return ok
 
     def _cancel_all(self, orders, reason):
-        for order in orders:
-            self._cancel(order, reason)
+        """Cancel each order; returns how many the broker actually accepted."""
+        return sum(1 for order in orders if self._cancel(order, reason))
 
     # =============================================================== telemetry
     def _telemetry(self, snap, tick, positions, orders):

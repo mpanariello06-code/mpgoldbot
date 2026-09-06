@@ -124,14 +124,39 @@ class Mt5Broker:
         self._seen_positions = {}
         self._reported_deals = set()
         self._history_from = time.time() - 3600
+        # A symbol's contract spec (digits, point, stops level, volume steps)
+        # changes at most a few times a day, but it was being re-read on every
+        # engine pass AND once per position inside close_position - 24 of the
+        # 51 MT5 calls in a ladder placement were this. Cached briefly, with an
+        # explicit invalidate for anything that must see a change at once.
+        self._spec = None
+        self._spec_at = 0.0
+        self.spec_ttl = 5.0
 
     # ------------------------------------------------------------ market data
-    def symbol_spec(self):
+    def symbol_spec(self, max_age=None):
+        max_age = self.spec_ttl if max_age is None else max_age
+        now = time.time()
+        cached = self._spec
+        if cached is not None and (now - self._spec_at) < max_age:
+            return cached
         with MT5_LOCK:
             info = mt5.symbol_info(self.symbol)
         if info is None:
+            if cached is not None:
+                # A momentary gap in symbol_info must not abort an exit that is
+                # already under way; the last known spec is used and the next
+                # call retries.
+                return cached
             raise BrokerError(f"symbol_info({self.symbol}) unavailable")
-        return SymbolSpec.from_mt5(info, self.pip_points_override)
+        self._spec = SymbolSpec.from_mt5(info, self.pip_points_override)
+        self._spec_at = now
+        return self._spec
+
+    def invalidate_spec(self):
+        """Force the next symbol_spec() to re-read MT5."""
+        self._spec = None
+        self._spec_at = 0.0
 
     def tick(self):
         with MT5_LOCK:
@@ -291,19 +316,36 @@ class Mt5Broker:
                        f"({self.RETCODES.get(retcode, 'UNKNOWN')}) "
                        f"{getattr(result, 'comment', '')}")
 
-    def close_position(self, ticket, comment="cycle"):
-        with MT5_LOCK:
-            found = mt5.positions_get(ticket=int(ticket))
-        if not found:
-            return False, "position not found"
-        pos = found[0]
-        tick = self.tick()
-        spec = self.symbol_spec()
-        is_buy = pos.type == mt5.POSITION_TYPE_BUY
+    def close_position(self, ticket, comment="cycle", position=None, tick=None,
+                       spec=None):
+        """
+        Close one position.
+
+        `position`, `tick` and `spec` let a caller that has ALREADY read them
+        hand them in. The exit path has all three in hand, and passing them
+        turns four MT5 round trips per position into one - which is the
+        difference between a basket closing now and a basket closing after the
+        market has moved. Called without them the safe path is unchanged: the
+        position is re-read from MT5 first.
+        """
+        if position is None:
+            with MT5_LOCK:
+                found = mt5.positions_get(ticket=int(ticket))
+            if not found:
+                return False, "position not found"
+            pos = found[0]
+            volume, symbol = pos.volume, pos.symbol
+            is_buy = pos.type == mt5.POSITION_TYPE_BUY
+        else:
+            # an OpenPosition the caller just read from this same broker
+            volume, symbol = position.volume, position.symbol
+            is_buy = position.side == BUY
+        tick = tick or self.tick()
+        spec = spec or self.symbol_spec()
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": pos.symbol,
-            "volume": pos.volume,
+            "symbol": symbol,
+            "volume": volume,
             "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
             "position": int(ticket),
             "price": spec.normalize_price(tick.bid if is_buy else tick.ask),
@@ -550,12 +592,14 @@ class PaperBroker:
             self._save()
         return True, "OK (paper)"
 
-    def close_position(self, ticket, comment="cycle"):
+    def close_position(self, ticket, comment="cycle", position=None, tick=None,
+                       spec=None):
+        """Same signature as the live broker, so the exit path is identical."""
         with self._lock:
             pos = self._positions.get(int(ticket))
         if pos is None:
             return False, "position not found"
-        t = self.tick()
+        t = tick or self.tick()
         self._close(pos, t.bid if pos.side == BUY else t.ask, "CLOSED")
         return True, "OK (paper)"
 

@@ -231,6 +231,11 @@ DIRECTION_FILTER = _get_str("DIRECTION_FILTER", "off").lower()
 # ---------------------------------------------------------------------------
 MAGIC = _get_int("MAGIC", 88001199)
 POLL_SECONDS = _get_float("POLL_SECONDS", 0.5)
+# How often the basket exit monitor re-checks live P/L. This is the highest
+# priority loop in the bot and does two MT5 reads per pass, nothing else.
+# It is deliberately far faster than POLL_SECONDS: the ladder can be
+# reconciled twice a second, but a basket at its target cannot wait that long.
+EXIT_POLL_SECONDS = _get_float("EXIT_POLL_SECONDS", 0.05)
 DIAGNOSTICS = _get_bool("DIAGNOSTICS", True)
 
 # ---------------------------------------------------------------------------
@@ -424,6 +429,13 @@ def validate():
             f"{LADDER_DEPTH}+{LADDER_DEPTH} ladder per cycle")
     if POLL_SECONDS <= 0:
         errors.append("POLL_SECONDS must be greater than 0")
+    if EXIT_POLL_SECONDS <= 0:
+        errors.append("EXIT_POLL_SECONDS must be greater than 0")
+    if EXIT_POLL_SECONDS > POLL_SECONDS:
+        warnings.append(
+            f"EXIT_POLL_SECONDS ({EXIT_POLL_SECONDS}) is slower than "
+            f"POLL_SECONDS ({POLL_SECONDS}) - the exit monitor is supposed to "
+            f"be the fastest loop in the bot")
     if ROLL_MODE not in ("extend", "static"):
         errors.append("ROLL_MODE must be 'extend' or 'static'")
     if DIRECTION_FILTER not in ("off", "both", "buy_bias", "sell_bias", "none"):
@@ -475,6 +487,7 @@ def strategy_summary():
         "Max Spread": MAX_SPREAD,
         "Magic": MAGIC,
         "Poll": f"{POLL_SECONDS}s",
+        "Exit poll": f"{EXIT_POLL_SECONDS}s",
     }
 
 

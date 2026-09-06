@@ -188,6 +188,7 @@ async def run():
     u = upd(999)
     await tc.cmd_status(u, None)
     t.check("unauthorized /status refused", u.effective_message.replies == ["Unauthorized."])
+    CSV.flush()                 # writes are async; a reader must flush first
     events = open(cfg.DATA_PATH / "events.csv").read()
     t.check("unauthorized attempts logged", events.count("UNAUTHORIZED") == 3,
             str(events.count("UNAUTHORIZED")))
@@ -457,6 +458,7 @@ async def run():
     text, _, _ = await press("status")
     t.check("engine error reported, never raised", "Command failed" in text)
     engine.explode = False
+    CSV.flush()
     t.check("telegram errors logged to events.csv",
             "TELEGRAM" in open(cfg.DATA_PATH / "events.csv").read())
     tc.notify("no loop running - must be a no-op")
