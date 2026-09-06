@@ -279,7 +279,40 @@ price consume it — the behaviour visible in the reference recording.
 levels; the config warns when it is set, because it is what makes a ladder look
 like it is being rebuilt.
 
-## The exit
+## The exit path
+
+The exit is the highest-priority operation in the bot, and it runs on its own
+thread (`EXIT_POLL_SECONDS`, default 0.05s):
+
+```
+tick + positions  ->  mark the basket  ->  the ONE exit authority
+   -> EXITING (atomic latch)  ->  CLOSE POSITIONS  ->  cancel pendings
+   -> verify flat against MT5  ->  realized P/L from deal history
+   -> COOLDOWN  ->  WAITING_FOR_ENTRY
+```
+
+Deliberately **not** on that path: order-book reads, deal-history polling,
+ladder reconciliation, entry evaluation, candle checks, telemetry, Telegram,
+CSV writes. Measured against the real `Mt5Broker` with a 1.5 ms-per-call cost
+model, detection to first close request went from **42.2 ms to 3.5 ms**.
+
+**Positions are closed before pendings are cancelled.** The money is in the
+open positions; a pending at a price the market has not reached is worth
+nothing and costs a round trip each to cancel. Cancelling 16 of them first
+measured 34 ms of pure delay on a basket already at its target. A pending that
+fills in the gap is caught by the flat verification.
+
+`exit_in_progress` is a **one-way latch**. Set under the transition lock, so a
+duplicate trigger is a no-op rather than a second close; while it is set no
+order may be placed and no cycle may be created; it is released only when MT5
+confirms 0 positions and 0 orders. A cycle in EXITING never returns to ACTIVE.
+
+CSV logging is asynchronous — a single writer thread, ~4 µs per row on the
+caller — so the audit trail cannot delay a close. Telegram was already
+fire-and-forget and is tested to prove it: a notifier that sleeps a full second
+in the event hook does not stop the basket closing.
+
+## The exit decision
 
 The normal strategy exit is **basket profit management** — one state machine,
 one decision path:
@@ -317,6 +350,27 @@ simplest thing that reliably stops a winner becoming a loser.
 `ProfitRules.trail_for(peak)` is the one place it is computed — a
 percentage-of-peak, volatility-adjusted or ladder-depth-adjusted trail replaces
 that method body and nothing else.
+
+### Basket state
+
+`CycleBasket.decide()` returns **HOLD / PROTECT / EXIT** with a reason. It is
+the only place a strategy exit is decided; the engine adds hard risk limits
+above it and then does what it says. It reads four things:
+
+| input | what it answers |
+|---|---|
+| **basket profit** | current, peak, lowest — all measured on realized + floating, so peak ≥ current ≥ lowest always holds |
+| **recovery state** | NORMAL / UNDERWATER / RECOVERING / PROFITABLE / PROFIT_PROTECTION / EXITING — what the basket has *been through*, not just what it is worth |
+| **price movement** | a short window (`PRICE_MOVEMENT_WINDOW`): recent change, velocity, distance from the anchor and from the basket's average entry, read as FAVORABLE / ADVERSE / FLAT relative to which way the basket leans |
+| **drawdown behaviour** | give-back from peak, both absolute and as a fraction of that peak |
+
+A basket that clawed back from −15 to +1 is not the same as one that walked up
+to +1, and is taken earlier (`RECOVERY_PROFIT`) — it has already shown how far
+it can go the other way.
+
+**None of these thresholds are validated.** They are explainable starting
+points, not fitted values, and they are configurable precisely so they can be
+fitted later on a real sample.
 
 ### Order of precedence
 
