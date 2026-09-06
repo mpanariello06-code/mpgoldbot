@@ -708,6 +708,11 @@ class RollingLadderEngine:
             activation=float(snap["profit_protection_activation"]),
             trail=float(snap["profit_protection_trail"]),
             floor=float(snap["min_protected_profit"]),
+            underwater_at=float(snap["underwater_threshold"]),
+            recovery_fraction=float(snap["recovery_fraction"]),
+            recovery_take=float(snap["recovery_take_profit"]),
+            giveback_fraction=float(snap["profit_giveback_fraction"]),
+            movement_window=float(snap["price_movement_window"]),
         )
 
     def mark_to_market(self, snap, tick, positions=None):
@@ -725,10 +730,14 @@ class RollingLadderEngine:
         if self.sequence is None:
             return 0.0
         legs = self.cycle_positions(self.cycle.cycle_id, positions)
+        now = self.clock()
         if tick is not None:
             self.sequence.update_price(tick.mid)
+            # the movement window and the basket's average entry, from the legs
+            # that actually exist right now
+            self.sequence.observe_price(tick.mid, now, legs)
         floating = self.get_cycle_floating_pnl(self.cycle.cycle_id, legs)
-        self.sequence.mark(floating, self.profit_rules(snap), self.clock())
+        self.sequence.mark(floating, self.profit_rules(snap), now)
         return floating
 
     # ================================================================= risk

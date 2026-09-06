@@ -99,6 +99,11 @@ VALIDATORS = {
     "profit_protection_activation": (lambda v: _num(v, float, "Protection activation", 0.0, 100000.0), "Protection At", True),
     "profit_protection_trail": (lambda v: _num(v, float, "Protection trail", 0.01, 100000.0), "Protection Trail", True),
     "min_protected_profit": (lambda v: _num(v, float, "Protected floor", 0.0, 100000.0), "Protected Floor", True),
+    "underwater_threshold": (lambda v: _num(v, float, "Underwater threshold", 0.0, 100000.0), "Underwater At", True),
+    "recovery_fraction":   (lambda v: _num(v, float, "Recovery fraction", 0.0, 1.0), "Recovery Fraction", True),
+    "recovery_take_profit": (lambda v: _num(v, float, "Recovery take profit", 0.0, 100000.0), "Recovery Take", True),
+    "profit_giveback_fraction": (lambda v: _num(v, float, "Give-back fraction", 0.0, 1.0), "Give-back Fraction", True),
+    "price_movement_window": (lambda v: _num(v, float, "Movement window", 1.0, 3600.0), "Movement Window", False),
     "telemetry_interval_seconds": (lambda v: _num(v, float, "Telemetry interval", 0.0, 3600.0), "Telemetry Interval", False),
     "cycle_close_positions": (lambda v: _flag(v, "Close positions on cycle end"), "Close On Cycle End", True),
     # --- risk ---
@@ -136,7 +141,8 @@ PRICE_KEYS = ("ladder_spacing", "first_level_offset",
               "stop_loss_distance", "max_spread")
 MONEY_KEYS = ("max_daily_drawdown", "max_cycle_drawdown",
               "basket_profit_target", "profit_protection_activation",
-              "profit_protection_trail", "min_protected_profit")
+              "profit_protection_trail", "min_protected_profit",
+              "underwater_threshold", "recovery_take_profit")
 
 
 class RuntimeSettings:

@@ -177,6 +177,27 @@ PROFIT_PROTECTION_TRAIL = _get_float("PROFIT_PROTECTION_TRAIL", 1.50)
 # The protected floor: a basket that has been in profit is never knowingly let
 # through this on the way down.
 MIN_PROTECTED_PROFIT = _get_float("MIN_PROTECTED_PROFIT", 1.00)
+
+# --- basket state engine ---------------------------------------------------
+# NONE of these defaults are validated. They are starting points chosen to be
+# explainable, not optimal, and they exist to be fitted once there is enough
+# telemetry to fit them on.
+#
+# How far under water counts as meaningfully negative rather than noise.
+UNDERWATER_THRESHOLD = _get_float("UNDERWATER_THRESHOLD", 2.00)
+# How much of the hole must be climbed back before it counts as a recovery,
+# as a fraction of how deep the hole was.
+RECOVERY_FRACTION = _get_float("RECOVERY_FRACTION", 0.50)
+# A recovered basket is taken at this profit instead of the full target: it has
+# already shown how far it can go the other way.
+RECOVERY_TAKE_PROFIT = _get_float("RECOVERY_TAKE_PROFIT", 0.50)
+# Give-back allowed from a peak that reached the target but never reached
+# PROFIT_PROTECTION_ACTIVATION, as a fraction of that peak. This closes the
+# dead band that let a +2.45 basket ride back to -0.10.
+PROFIT_GIVEBACK_FRACTION = _get_float("PROFIT_GIVEBACK_FRACTION", 0.40)
+# Seconds of price history behind the favorable/adverse movement reading.
+PRICE_MOVEMENT_WINDOW = _get_float("PRICE_MOVEMENT_WINDOW", 20.0)
+
 CYCLE_CLOSE_POSITIONS = _get_bool("CYCLE_CLOSE_POSITIONS", True)
 
 # ---------------------------------------------------------------------------
@@ -318,6 +339,11 @@ def runtime_defaults():
         "profit_protection_activation": PROFIT_PROTECTION_ACTIVATION,
         "profit_protection_trail": PROFIT_PROTECTION_TRAIL,
         "min_protected_profit": MIN_PROTECTED_PROFIT,
+        "underwater_threshold": UNDERWATER_THRESHOLD,
+        "recovery_fraction": RECOVERY_FRACTION,
+        "recovery_take_profit": RECOVERY_TAKE_PROFIT,
+        "profit_giveback_fraction": PROFIT_GIVEBACK_FRACTION,
+        "price_movement_window": PRICE_MOVEMENT_WINDOW,
         "telemetry_interval_seconds": TELEMETRY_INTERVAL_SECONDS,
         "stop_loss_distance": STOP_LOSS_DISTANCE,
         "pip_points": PIP_POINTS,

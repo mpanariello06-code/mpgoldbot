@@ -22,6 +22,7 @@ resurrected from here.
 """
 
 import time
+from collections import deque
 from dataclasses import dataclass
 
 BUY = "BUY"
@@ -31,6 +32,12 @@ SELL = "SELL"
 # Normal strategy exits.
 BASKET_PROFIT_TARGET = "BASKET_PROFIT_TARGET"
 PROFIT_PROTECTION = "PROFIT_PROTECTION"
+# A basket that clawed back from a deep hole and is now green: the recovery
+# itself is the reason to take it, because giving it back is how a recovered
+# basket becomes a loss again.
+RECOVERY_PROFIT = "RECOVERY_PROFIT"
+# Profit given back from a peak that never reached the protection activation.
+PROFIT_GIVEBACK = "PROFIT_GIVEBACK"
 # Hard risk protection - these override the strategy.
 RISK_DRAWDOWN = "RISK_DRAWDOWN"
 RISK_TIMEOUT = "RISK_TIMEOUT"
@@ -38,8 +45,9 @@ RISK_SPREAD = "RISK_SPREAD"
 EMERGENCY_EXIT = "EMERGENCY_EXIT"
 MANUAL_EXIT = "MANUAL_EXIT"
 
-EXIT_REASONS = (BASKET_PROFIT_TARGET, PROFIT_PROTECTION, RISK_DRAWDOWN,
-                RISK_TIMEOUT, RISK_SPREAD, EMERGENCY_EXIT, MANUAL_EXIT)
+EXIT_REASONS = (BASKET_PROFIT_TARGET, PROFIT_PROTECTION, RECOVERY_PROFIT,
+                PROFIT_GIVEBACK, RISK_DRAWDOWN, RISK_TIMEOUT, RISK_SPREAD,
+                EMERGENCY_EXIT, MANUAL_EXIT)
 
 RISK_REASONS = (RISK_DRAWDOWN, RISK_TIMEOUT, RISK_SPREAD, EMERGENCY_EXIT,
                 MANUAL_EXIT)
@@ -51,6 +59,31 @@ PROFIT_PROTECTION_STATE = "PROFIT_PROTECTION"
 EXITING_STATE = "EXITING"
 BASKET_STATES = (BASKET_BUILDING, PROFIT_TARGET_REACHED,
                  PROFIT_PROTECTION_STATE, EXITING_STATE)
+
+# ------------------------------------------------------------ recovery state
+# What the basket has BEEN THROUGH, not just what it is worth now. The
+# difference between a basket that walked up from +0.50 to +3.00 and one that
+# clawed back from -15.00 to +1.00 is invisible to a P/L number alone, and the
+# two deserve different treatment.
+NORMAL = "NORMAL"              # near flat, nothing notable has happened
+UNDERWATER = "UNDERWATER"      # meaningfully negative, no recovery shown yet
+RECOVERING = "RECOVERING"      # was deeply underwater, now climbing back
+PROFITABLE = "PROFITABLE"      # meaningfully positive
+PROTECTING = "PROFIT_PROTECTION"   # enough profit that it is worth defending
+EXITING_RECOVERY = "EXITING"   # the exit is committed
+RECOVERY_STATES = (NORMAL, UNDERWATER, RECOVERING, PROFITABLE, PROTECTING,
+                   EXITING_RECOVERY)
+
+# ------------------------------------------------------------- price movement
+FAVORABLE = "FAVORABLE"        # recent movement is helping the basket
+ADVERSE = "ADVERSE"            # recent movement is hurting it
+FLAT_MOVE = "FLAT"             # no meaningful movement either way
+PRICE_STATES = (FAVORABLE, ADVERSE, FLAT_MOVE)
+
+# ------------------------------------------------------------- exit decisions
+HOLD = "HOLD"
+PROTECT = "PROTECT"
+EXIT = "EXIT"
 
 
 @dataclass
@@ -66,6 +99,20 @@ class ProfitRules:
     activation: float = 3.00        # PROFIT_PROTECTION_ACTIVATION
     trail: float = 1.50             # PROFIT_PROTECTION_TRAIL
     floor: float = 1.00             # MIN_PROTECTED_PROFIT
+    # --- basket-state thresholds (all configurable, none validated yet) ---
+    # How far under water counts as "meaningfully negative" rather than noise.
+    underwater_at: float = 2.00     # UNDERWATER_THRESHOLD
+    # How far back up from the worst point counts as a real recovery, as a
+    # FRACTION of how deep the hole was. 0.5 = "climbed back half of it".
+    recovery_fraction: float = 0.50  # RECOVERY_FRACTION
+    # A recovered basket is taken at this profit rather than being asked to
+    # reach the full target - it has already proved it can go the other way.
+    recovery_take: float = 0.50     # RECOVERY_TAKE_PROFIT
+    # Give-back from a peak that never reached `activation`, as a FRACTION of
+    # that peak. This closes the dead band between target and activation.
+    giveback_fraction: float = 0.40  # PROFIT_GIVEBACK_FRACTION
+    # Seconds of price history the movement window looks at.
+    movement_window: float = 20.0   # PRICE_MOVEMENT_WINDOW_SECONDS
 
     @property
     def protected_floor(self):
@@ -79,6 +126,21 @@ class ProfitRules:
         if self.target > 0:
             return min(float(self.floor), float(self.target))
         return float(self.floor)
+
+    def giveback_limit(self, peak):
+        """
+        How much of an un-activated peak may be handed back before the basket
+        is taken.
+
+        This exists because of a real, observed failure: with target 2.00 and
+        activation 3.00 there was a DEAD BAND. A basket that peaked at +2.45
+        armed no protection at all, and the only backstop was the floor, tested
+        as `pnl <= floor`. Cycle 90 went +2.35, +2.45, +1.60, -0.10 and was
+        still holding at -0.10. Nothing was slow; there was simply no rule
+        covering a peak between the target and the activation level.
+        """
+        peak = max(0.0, float(peak))
+        return max(0.0, peak * max(0.0, float(self.giveback_fraction)))
 
     def trail_for(self, peak):
         """
@@ -140,14 +202,37 @@ class CycleBasket:
 
         self.realized_pnl = 0.0
         self.floating_pnl = 0.0
-        # Peak floating P/L for THIS cycle. It only ever goes up while the
-        # cycle is open, and it starts at 0 for every new cycle because a new
-        # CycleBasket is built with it.
+        # PEAK AND LOWEST TRACK THE BASKET TOTAL (realized + floating), and so
+        # does everything derived from them. Mixing the two is what let
+        # telemetry report current_pnl (floating alone) above peak_pnl (the
+        # net peak) whenever a leg had been banked at a loss. `basket_pnl` is
+        # the one number these are all measured against.
         self.peak_pnl = 0.0
+        self.lowest_pnl = 0.0
         self.trough_pnl = 0.0
         self.max_floating_profit = 0.0
         self.max_floating_loss = 0.0
         self.max_drawdown = 0.0
+
+        # --- recovery (PHASE 11/12) ---
+        self.recovery_state = NORMAL
+        self.lowest_at = None            # seconds from start of the worst point
+        self.recovery_start_at = None    # when the climb back began
+        self.recovery_start_pnl = None   # what it was worth at the bottom
+        self.time_underwater = 0.0
+        self.time_since_peak = 0.0
+        self.was_underwater = False      # sticky: it happened, even if fixed
+
+        # --- price movement (PHASE 13) ---
+        # A short rolling window of (timestamp, price). Deliberately small:
+        # this is here to answer "is this basket still going my way?", not to
+        # become an indicator library.
+        self._price_window = deque(maxlen=64)
+        self.price_state = FLAT_MOVE
+        self.recent_price_change = 0.0
+        self.price_velocity = 0.0        # price units per second
+        self.basket_average_entry = 0.0
+        self.net_volume = 0.0
 
         # --- profit management ---
         self.state = BASKET_BUILDING
@@ -215,15 +300,132 @@ class CycleBasket:
         self._update_extremes(now)
 
     def _update_extremes(self, now=None):
-        total = self.realized_pnl + self.floating_pnl
+        """
+        Peak and lowest, both measured on the BASKET TOTAL.
+
+        Everything here is a function of `basket_pnl` (realized + floating), so
+        peak >= current >= lowest holds by construction. The floating-only
+        extremes are kept alongside for the record, clearly named, and are
+        never compared against the peak.
+        """
+        total = self.basket_pnl
         if total > self.peak_pnl:
             self.peak_pnl = total
             self.peak_at = (now - self.started_at) if now is not None else None
-        self.trough_pnl = min(self.trough_pnl, total)
+            if now is not None:
+                self._peak_wall = now
+        if total < self.lowest_pnl:
+            self.lowest_pnl = total
+            self.lowest_at = (now - self.started_at) if now is not None else None
+        self.trough_pnl = self.lowest_pnl
         self.max_floating_profit = max(self.max_floating_profit,
                                        self.floating_pnl)
         self.max_floating_loss = min(self.max_floating_loss, self.floating_pnl)
         self.max_drawdown = max(self.max_drawdown, self.drawdown)
+
+    # ------------------------------------------------------- price movement
+    def observe_price(self, price, now, positions=()):
+        """
+        Feed the short movement window and the basket's average entry.
+
+        `positions` are the cycle's open legs, so the average entry and net
+        volume describe the basket that actually exists rather than a
+        remembered one.
+        """
+        price = float(price)
+        window = float(getattr(self, "_movement_window", 20.0))
+        self._price_window.append((now, price))
+        while len(self._price_window) > 1 and \
+                now - self._price_window[0][0] > window:
+            self._price_window.popleft()
+
+        first_ts, first_price = self._price_window[0]
+        self.recent_price_change = round(price - first_price, 5)
+        span = max(1e-6, now - first_ts)
+        self.price_velocity = round(self.recent_price_change / span, 6)
+
+        volume = 0.0
+        weighted = 0.0
+        net = 0.0
+        for p in positions:
+            volume += p.volume
+            weighted += p.price_open * p.volume
+            net += (p.volume if p.side == BUY else -p.volume)
+        self.basket_average_entry = round(weighted / volume, 5) if volume else 0.0
+        self.net_volume = round(net, 4)
+
+        # "Favorable" means the recent move helps THIS basket, which depends on
+        # which way the basket is leaning. A net-long basket likes price up.
+        move = self.recent_price_change
+        if abs(move) < self.spacing * 0.1 or not net:
+            self.price_state = FLAT_MOVE
+        elif (move > 0) == (net > 0):
+            self.price_state = FAVORABLE
+        else:
+            self.price_state = ADVERSE
+        return self.price_state
+
+    @property
+    def price_vs_anchor(self):
+        return round(self.price - self.anchor, 5)
+
+    @property
+    def price_vs_average_entry(self):
+        if not self.basket_average_entry:
+            return 0.0
+        return round(self.price - self.basket_average_entry, 5)
+
+    # ------------------------------------------------------------- recovery
+    def _update_recovery(self, rules, now):
+        """
+        Where this basket is in its own story.
+
+        The point is to tell a basket that has only ever gone up apart from one
+        that fell into a hole and climbed out. The second has already shown the
+        market can take it back, so it is treated more defensively.
+        """
+        pnl = self.basket_pnl
+        if pnl <= -abs(rules.underwater_at):
+            self.was_underwater = True
+            if self.recovery_start_at is None:
+                self.recovery_start_pnl = self.lowest_pnl
+
+        depth = abs(min(0.0, self.lowest_pnl))
+        recovered = pnl - self.lowest_pnl
+        # a real climb back, not a one-tick bounce
+        meaningful = (self.was_underwater and depth > 0 and
+                      recovered >= depth * max(0.0, rules.recovery_fraction))
+        if meaningful and self.recovery_start_at is None:
+            self.recovery_start_at = now - self.started_at
+
+        if self.state == EXITING_STATE:
+            self.recovery_state = EXITING_RECOVERY
+        elif self.protection_active:
+            self.recovery_state = PROTECTING
+        elif meaningful and pnl < max(rules.target, 0.0):
+            self.recovery_state = RECOVERING
+        elif pnl <= -abs(rules.underwater_at):
+            self.recovery_state = UNDERWATER
+        elif pnl >= max(rules.recovery_take, 0.0) and pnl > 0:
+            self.recovery_state = PROFITABLE
+        else:
+            self.recovery_state = NORMAL
+        return self.recovery_state
+
+    @property
+    def recovery_amount(self):
+        """How much has been clawed back from the worst point."""
+        return round(self.basket_pnl - self.lowest_pnl, 2)
+
+    @property
+    def recovery_speed(self):
+        """Recovery per second since the climb began. 0 when not recovering."""
+        if self.recovery_start_at is None or self._last_mark is None:
+            return 0.0
+        elapsed = (self._last_mark - self.started_at) - self.recovery_start_at
+        if elapsed <= 0:
+            return 0.0
+        return round(self.recovery_amount / elapsed, 4)
 
     # ------------------------------------------------- profit management
     def mark(self, floating, rules, now):
@@ -233,17 +435,22 @@ class CycleBasket:
         Called once per poll, before any exit decision, so peak tracking, the
         timers and the state are always current when `should_exit` is asked.
         """
+        self._movement_window = rules.movement_window
         self.update_pnl(floating, now=now)
 
         elapsed = 0.0 if self._last_mark is None else max(0.0, now - self._last_mark)
         self._last_mark = now
-        if self.floating_pnl > 0:
+        if self.basket_pnl > 0:
             self.time_in_profit += elapsed
+        if self.basket_pnl < 0:
+            self.time_underwater += elapsed
         if self.protection_active:
             self.time_in_protection += elapsed
+        peak_wall = getattr(self, "_peak_wall", None)
+        self.time_since_peak = 0.0 if peak_wall is None else max(0.0, now - peak_wall)
 
         if self.target_at is None and rules.target > 0 and \
-                self.floating_pnl >= rules.target:
+                self.basket_pnl >= rules.target:
             self.target_at = now - self.started_at
 
         # Activation is sticky: once a cycle has been worth protecting it stays
@@ -253,63 +460,112 @@ class CycleBasket:
             self.protection_active = True
             self.protection_at = now - self.started_at
 
-        if self.protection_active:
+        if self.state == EXITING_STATE:
+            pass                      # committed; nothing re-opens this
+        elif self.protection_active:
             self.state = PROFIT_PROTECTION_STATE
             self.protection_threshold = round(
                 max(self.peak_pnl - rules.trail_for(self.peak_pnl),
                     rules.protected_floor), 2)
         elif self.target_at is not None:
             self.state = PROFIT_TARGET_REACHED
-            self.protection_threshold = round(rules.protected_floor, 2)
+            # The dead band, closed. A peak that reached the target but not the
+            # activation level is still defended - by the larger of the floor
+            # and "keep most of the peak" - instead of being left to run all
+            # the way back to zero.
+            self.protection_threshold = round(
+                max(rules.protected_floor,
+                    self.peak_pnl - rules.giveback_limit(self.peak_pnl)), 2)
         else:
             self.state = BASKET_BUILDING
             self.protection_threshold = 0.0
+        self._update_recovery(rules, now)
         return self.state
+
+    def decide(self, rules, has_exposure=True):
+        """
+        THE ONE BASKET DECISION. Returns (action, reason, detail).
+
+        `action` is HOLD, PROTECT or EXIT. There is no second opinion anywhere
+        in the codebase: the engine adds hard risk limits ABOVE this and then
+        does what this says. Every branch names why.
+
+        The inputs are the four the basket actually knows about:
+        profit, what the basket has been through (recovery), which way price is
+        moving, and how much of a peak has been handed back.
+        """
+        if not has_exposure:
+            return HOLD, None, ""
+        pnl = self.basket_pnl
+        peak = self.peak_pnl
+
+        # --- 1. the baseline target, when the runner is off ------------------
+        if not rules.runner_enabled:
+            if rules.target > 0 and pnl >= rules.target:
+                return EXIT, BASKET_PROFIT_TARGET, (
+                    f"basket P/L {pnl:+.2f} reached the {rules.target:+.2f} "
+                    f"target (profit runner off)")
+            return HOLD, None, ""
+
+        # --- 2. a peak worth protecting has been given back ------------------
+        if self.protection_active:
+            trail = rules.trail_for(peak)
+            giveback = peak - pnl
+            if giveback >= trail:
+                return EXIT, PROFIT_PROTECTION, (
+                    f"gave back {giveback:.2f} of a {peak:+.2f} peak "
+                    f"(trail {trail:.2f}) - closing at {pnl:+.2f}")
+            if pnl <= rules.protected_floor:
+                return EXIT, PROFIT_PROTECTION, (
+                    f"basket fell to {pnl:+.2f}, at or below the "
+                    f"{rules.protected_floor:+.2f} protected floor "
+                    f"(peak {peak:+.2f})")
+            return PROTECT, None, (
+                f"protecting {peak:+.2f}, closes at "
+                f"{self.protection_threshold:+.2f}")
+
+        # --- 3. a RECOVERED basket is taken early ----------------------------
+        # It has already demonstrated it can go against us by the depth it fell
+        # to. Asking it to reach the full target risks repeating that.
+        if self.recovery_state == RECOVERING and pnl >= rules.recovery_take > 0:
+            return EXIT, RECOVERY_PROFIT, (
+                f"recovered from {self.lowest_pnl:+.2f} to {pnl:+.2f} "
+                f"(+{self.recovery_amount:.2f}) - taking it rather than "
+                f"risking the round trip again")
+
+        # --- 4. the target was reached; defend the peak ----------------------
+        # This is the dead band that let cycle 90 ride +2.45 -> -0.10. A peak
+        # above the target is now defended even when it never reached the
+        # protection activation level.
+        if self.target_at is not None:
+            limit = rules.giveback_limit(peak)
+            giveback = peak - pnl
+            if pnl <= rules.protected_floor:
+                return EXIT, BASKET_PROFIT_TARGET, (
+                    f"basket reached the {rules.target:+.2f} target, peaked at "
+                    f"{peak:+.2f} and fell back to {pnl:+.2f}, at or below the "
+                    f"{rules.protected_floor:+.2f} protected floor")
+            if limit > 0 and giveback >= limit:
+                return EXIT, PROFIT_GIVEBACK, (
+                    f"gave back {giveback:.2f} of a {peak:+.2f} peak that never "
+                    f"reached the {rules.activation:+.2f} activation level "
+                    f"(limit {limit:.2f}) - closing at {pnl:+.2f}")
+            return PROTECT, None, (
+                f"target reached, defending {peak:+.2f} down to "
+                f"{self.protection_threshold:+.2f}")
+
+        return HOLD, None, ""
 
     def should_exit(self, rules, has_exposure=True):
         """
-        The one normal-strategy exit decision. Returns (reason, detail) or
-        (None, "").
+        (reason, detail) for the engine, which only cares about EXIT.
 
-        Hard risk is checked by the engine BEFORE this and overrides it.
+        A thin adapter over `decide` so there is still exactly one place the
+        decision is made.
         """
-        if not has_exposure:
-            return None, ""
-        pnl = self.floating_pnl
-
-        # 1. the plain target, when the runner is switched off
-        if not rules.runner_enabled:
-            if rules.target > 0 and pnl >= rules.target:
-                return BASKET_PROFIT_TARGET, (
-                    f"basket floating P/L {pnl:+.2f} reached the "
-                    f"{rules.target:+.2f} target (profit runner off)")
-            return None, ""
-
-        # 2. the runner is on: the basket is allowed past the target, and the
-        #    accumulated profit is trailed instead of taken immediately.
-        if self.protection_active:
-            trail = rules.trail_for(self.peak_pnl)
-            giveback = self.peak_pnl - pnl
-            if giveback >= trail:
-                return PROFIT_PROTECTION, (
-                    f"gave back {giveback:.2f} of a {self.peak_pnl:+.2f} peak "
-                    f"(trail {trail:.2f}) - closing at {pnl:+.2f}")
-            # The floor is the backstop for a peak so large that the trail
-            # alone would still let the basket bleed out.
-            if pnl <= rules.protected_floor:
-                return PROFIT_PROTECTION, (
-                    f"basket fell to {pnl:+.2f}, at or below the "
-                    f"{rules.protected_floor:+.2f} protected floor (peak "
-                    f"{self.peak_pnl:+.2f})")
-            return None, ""
-
-        # 3. the target was reached but the peak never got as far as the
-        #    activation level: protect what was banked rather than let it go.
-        if self.target_at is not None and pnl <= rules.protected_floor:
-            return BASKET_PROFIT_TARGET, (
-                f"basket reached the {rules.target:+.2f} target, peaked at "
-                f"{self.peak_pnl:+.2f} and fell back to {pnl:+.2f}, at or "
-                f"below the {rules.protected_floor:+.2f} protected floor")
+        action, reason, detail = self.decide(rules, has_exposure=has_exposure)
+        if action == EXIT:
+            return reason, detail
         return None, ""
 
     # ---------------------------------------------------------- derived data

@@ -12,8 +12,9 @@ from harness import Suite, use_stub_mt5
 use_stub_mt5()
 
 import config as cfg
-from basket import (BASKET_PROFIT_TARGET, PROFIT_PROTECTION, RISK_DRAWDOWN,
-                    RISK_TIMEOUT, CycleBasket, ProfitRules)
+from basket import (BASKET_PROFIT_TARGET, PROFIT_GIVEBACK, PROFIT_PROTECTION,
+                    RECOVERY_PROFIT, RISK_DRAWDOWN, RISK_TIMEOUT,
+                    CycleBasket, ProfitRules)
 from broker import BUY, BUY_STOP, SELL, SELL_STOP
 from fakes import Recorder, TickFeed, make_paper, trigger_buy, trigger_sell
 from ladder_engine import RollingLadderEngine, State, parse_comment
@@ -440,9 +441,11 @@ t.check("it closed at or above the floor, never below",
 t.check("the reason names the floor",
         closes and "floor" in closes[-1].reason, closes[-1].reason if closes else "")
 
-t.section("A BASKET THAT ONLY REACHED THE TARGET IS STILL PROTECTED")
-# +2.20 then straight back down: the peak never reached activation, so the
-# trail never armed - the floor still stops it becoming a loss.
+t.section("A PEAK BETWEEN TARGET AND ACTIVATION IS DEFENDED (THE DEAD BAND)")
+# +2.20 then straight back down. The peak never reached the activation level,
+# so the trail never arms. Before the giveback rule the ONLY backstop was the
+# floor, tested as `pnl <= floor` - which is how cycle 90 rode +2.45 down to
+# -0.10 while still reporting PROFIT_TARGET_REACHED.
 now = [13_000.0]
 eng, broker, feed, settings, rec = frozen(
     "shallow", {"profit_runner_enabled": True,
@@ -452,6 +455,7 @@ now[0] += 1
 eng.step()
 t.check("it ran past the target", eng.cycle_active and
         eng.sequence.state == "PROFIT_TARGET_REACHED", eng.sequence.state)
+peak = eng.sequence.peak_pnl
 for value in (1.80, 1.20, 0.90):
     if not eng.cycle_active:
         break
@@ -459,11 +463,17 @@ for value in (1.80, 1.20, 0.90):
     now[0] += 1
     eng.step()
 closes = [c for c in rec.cycles if c.kind_of == "complete"]
-t.check("the floor took it rather than letting it run to a loss",
+t.check("the basket was taken rather than left to run to a loss",
         not eng.cycle_active, f"active={eng.cycle_active}")
-t.check("attributed to the target it had already reached",
-        closes and closes[-1].kind == BASKET_PROFIT_TARGET,
+t.check("attributed to the give-back, not to the bare target",
+        closes and closes[-1].kind == PROFIT_GIVEBACK,
         str([c.kind for c in closes]))
+t.check("and it was taken while still meaningfully positive",
+        closes and closes[-1].context.get("floating_pnl_at_exit", 0) >= 1.0,
+        str(closes[-1].context.get("floating_pnl_at_exit") if closes else None))
+t.check("the reason names the peak it was defending",
+        closes and f"{peak:+.2f}" in closes[-1].reason,
+        closes[-1].reason if closes else "")
 
 t.section("THE CYCLE 25 SEQUENCE")
 # +2 +10 +30 +60 +95 +70 ... -9 : the basket must not be allowed to give the
