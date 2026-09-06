@@ -1926,6 +1926,17 @@ class RollingLadderEngine:
                                      if self.sequence else 0.0),
             "cycle_state": (self.sequence.state if self.sequence
                             else "BASKET_BUILDING"),
+            # what the basket has BEEN THROUGH, for the status screen
+            "recovery_state": (self.sequence.recovery_state if self.sequence
+                               else "NORMAL"),
+            "price_state": (self.sequence.price_state if self.sequence else ""),
+            "basket_lowest_pnl": (round(self.sequence.lowest_pnl, 2)
+                                  if self.sequence else 0.0),
+            "recovery_amount": (self.sequence.recovery_amount
+                                if self.sequence else 0.0),
+            "was_underwater": bool(self.sequence and self.sequence.was_underwater),
+            "exit_in_progress": self.exit_in_progress,
+            "exit_latency_ms": self.exit_timing.get("_last_total_ms", ""),
             # --- ladder lifecycle ---
             "ladder_active": self.ladder_active,
             "active_ladder_id": self.active_ladder_id,

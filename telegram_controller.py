@@ -296,6 +296,8 @@ class TelegramController:
             "",
             f"Cycle: #{s.get('cycle_id', 0)}",
             f"State: {cycle_word}",
+            *(["⚡ <b>EXITING</b> - closing the basket now"]
+              if s.get("exit_in_progress") else []),
             f"Age: {int(s.get('cycle_age_seconds', 0) // 60)} min",
             "",
             *(["⏳ <b>COOLDOWN AFTER EXIT</b>",
@@ -338,9 +340,13 @@ class TelegramController:
                if s.get("waiting_for_entry") and s.get("block_reason") else ""),
             "",
             "<b>BASKET</b>",
+            f"Recovery: {(s.get('recovery_state') or 'NORMAL').replace('_', ' ')}"
+            + ("   (was underwater)" if s.get("was_underwater") else ""),
+            f"Price: {(s.get('price_state') or 'n/a').replace('_', ' ')}",
             f"Current P/L: {_money(floating)}"
             + (f"   (target {_money(target)})" if target else ""),
             f"Peak P/L: {_money(s.get('basket_peak_pnl', 0))}",
+            f"Lowest P/L: {_money(s.get('basket_lowest_pnl', 0))}",
             f"Giveback: {_money(s.get('basket_giveback', 0))}",
             f"Protection: {'ACTIVE' if protection else 'not active'}"
             + (f" - closes at {_money(s.get('protection_threshold', 0))}"
