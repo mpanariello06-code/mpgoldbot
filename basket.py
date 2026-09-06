@@ -637,6 +637,26 @@ class CycleBasket:
             "basket_drawdown": round(self.drawdown, 2),
             "drawdown_from_peak": round(self.drawdown, 2),
             "peak_pnl": round(self.peak_pnl, 2),
+            "lowest_pnl": round(self.lowest_pnl, 2),
+            # --- recovery ---
+            "recovery_state": self.recovery_state,
+            "was_underwater": self.was_underwater,
+            "time_underwater": round(self.time_underwater, 1),
+            "time_since_peak": round(self.time_since_peak, 1),
+            "recovery_amount": self.recovery_amount,
+            "recovery_speed": self.recovery_speed,
+            "recovery_start_pnl": ("" if self.recovery_start_pnl is None
+                                   else round(self.recovery_start_pnl, 2)),
+            "time_of_max_drawdown": ("" if self.lowest_at is None
+                                     else round(self.lowest_at, 1)),
+            # --- price movement ---
+            "price_state": self.price_state,
+            "price_vs_anchor": self.price_vs_anchor,
+            "price_vs_average_entry": self.price_vs_average_entry,
+            "basket_average_entry": self.basket_average_entry,
+            "recent_price_change": self.recent_price_change,
+            "price_velocity": self.price_velocity,
+            "net_volume": self.net_volume,
             "max_floating_profit": round(self.max_floating_profit, 2),
             "max_floating_loss": round(self.max_floating_loss, 2),
             "max_drawdown": round(self.max_drawdown, 2),

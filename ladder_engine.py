@@ -219,6 +219,8 @@ class RollingLadderEngine:
         self.exit_in_progress = False
         # Timestamps for the exit, filled in as it happens (PHASE 17).
         self.exit_timing = {}
+        # How long the ladder took to go out (PHASE 18).
+        self.ladder_timing = {}
 
     # =================================================================== utils
     def _today(self):
@@ -475,6 +477,8 @@ class RollingLadderEngine:
         self._triggered_keys.clear()
         self._depth_capped_logged = False
         self._last_telemetry = 0.0
+        self.ladder_timing = {}
+        self.exit_timing = {}
         self.cycle_active = True
         self.reentry_until = 0.0
         self._cycle_announced = False
@@ -1325,11 +1329,17 @@ class RollingLadderEngine:
                     cycle_profit=total, daily_profit=self.daily_profit,
                     status="LOSS" if lost else "OK")
 
-        # PART 12: realized comes from the deals MT5 actually reports, never
-        # from the floating figure the exit was decided on.
+        # Realized comes from the deals MT5 actually reports, never from the
+        # floating figure the exit was decided on. The difference between the
+        # two IS the execution cost of the exit, and it is recorded as such.
         info["context"]["realized_pnl_after_close"] = round(total, 2)
         info["context"]["pnl_slippage"] = round(
             total - float(info["context"].get("floating_pnl_before_close", 0.0)), 2)
+        # the account is confirmed flat at this point, so stamp it BEFORE the
+        # latencies are derived - they are computed from these timestamps
+        timing.setdefault("fully_flat_at", time.time())
+        info["context"].update(self._exit_latency(info, timing))
+        info["context"].update(self.ladder_timing)
         duration = self.clock() - self.cycle.started_at
         closed_cycle = self.cycle
         self._closing_cycle = None
@@ -1343,7 +1353,6 @@ class RollingLadderEngine:
         # abandoned. The cycle does not go back to ACTIVE - it is over. What
         # stops another cycle starting from this point is the re-entry cooldown
         # and the M1 entry gate, not the latch.
-        timing["fully_flat_at"] = time.time()
         self.exit_in_progress = False
         self.cycle_active = False
         self.sequence = None
@@ -1363,6 +1372,57 @@ class RollingLadderEngine:
                    info["reason"], info["kind"], lost, duration,
                    self.max_cycle_id + 1, info.get("context") or {}, wait)
         return "pending"
+
+    @staticmethod
+    def _ms(a, b):
+        """Milliseconds from a to b, blank when either end was never reached."""
+        if not a or not b:
+            return ""
+        return round((b - a) * 1000.0, 2)
+
+    def _exit_latency(self, info, timing):
+        """
+        Where the time between 'this basket is done' and 'the account is flat'
+        actually went.
+
+        Every figure here is APPLICATION latency plus the broker's response
+        time, measured on this machine. It cannot separate the two - what a
+        round trip to MT5 costs is the broker's, not ours - so the numbers are
+        reported as what they are: wall clock across each stage.
+        """
+        crossed = timing.get("target_crossed_at")
+        detected = timing.get("target_detected_at")
+        entered = timing.get("exit_state_entered_at")
+        close_start = timing.get("close_request_started_at")
+        close_done = timing.get("close_request_completed_at")
+        cancel_start = timing.get("pending_cancel_started_at")
+        cancel_done = timing.get("pending_cancel_completed_at")
+        verify_start = timing.get("flat_verification_started_at")
+        flat = timing.get("fully_flat_at")
+        out = {
+            "target_crossed_at": round(crossed, 6) if crossed else "",
+            "target_detected_at": round(detected, 6) if detected else "",
+            "exit_state_entered_at": round(entered, 6) if entered else "",
+            "close_request_started_at": round(close_start, 6) if close_start else "",
+            "close_request_completed_at": round(close_done, 6) if close_done else "",
+            "pending_cancel_started_at": round(cancel_start, 6) if cancel_start else "",
+            "pending_cancel_completed_at": round(cancel_done, 6) if cancel_done else "",
+            "flat_verification_started_at": (round(verify_start, 6)
+                                             if verify_start else ""),
+            "fully_flat_at": round(flat, 6) if flat else "",
+            "detection_latency_ms": self._ms(crossed, detected),
+            "decision_to_close_request_ms": self._ms(entered, close_start),
+            "close_request_latency_ms": self._ms(close_start, close_done),
+            "pending_cancel_latency_ms": self._ms(cancel_start, cancel_done),
+            "flat_verification_latency_ms": self._ms(verify_start, flat),
+            "total_exit_latency_ms": self._ms(detected, flat),
+            "close_failures": info.get("close_failures", 0),
+            "cancel_failures": info.get("cancel_failures", 0),
+            "close_attempts": info.get("attempts", 0),
+            "positions_closed": info["context"].get("open_positions_at_exit", ""),
+            "pending_cancelled": info["context"].get("pending_orders_at_exit", ""),
+        }
+        return out
 
     def _reentry_cooldown(self, snap):
         """Mandatory settle time between one cycle closing and the next ladder."""
@@ -1601,6 +1661,8 @@ class RollingLadderEngine:
         # between orders so a commit lands at most one level late
         if self.exit_in_progress:
             return len(seen)
+        place_started = time.time()
+        first_order_at = None
         if first_deploy:
             self._event("LADDER_DEPLOY_START",
                         f"{self.broker.symbol} bid={tick.bid} ask={tick.ask} "
@@ -1635,6 +1697,8 @@ class RollingLadderEngine:
             if ok:
                 placed += 1
                 room_orders -= 1
+                if first_order_at is None:
+                    first_order_at = time.time()
                 seen.add(key)
                 self._event("ORDER_PLACED",
                             f"{level.side} {lot} @ {level.price} "
@@ -1699,6 +1763,22 @@ class RollingLadderEngine:
                             f"deployed, {placed} levels live",
                             cycle_id=self.cycle.cycle_id, levels_live=placed,
                             entry_price=self.cycle.anchor, status="OK")
+        if placed and first_order_at is not None:
+            done = time.time()
+            self.ladder_timing = {
+                "ladder_first_order_ms": round(
+                    (first_order_at - place_started) * 1000.0, 2),
+                "ladder_complete_ms": round((done - place_started) * 1000.0, 2),
+                "ladder_orders_placed": placed,
+            }
+            if first_deploy:
+                self._event("LADDER_TIMING",
+                            f"ladder #{self.cycle.cycle_id}: {placed} orders, "
+                            f"first at "
+                            f"{self.ladder_timing['ladder_first_order_ms']:.0f}ms, "
+                            f"complete at "
+                            f"{self.ladder_timing['ladder_complete_ms']:.0f}ms",
+                            cycle_id=self.cycle.cycle_id, status="OK")
         return len(seen)
 
     def _cancel(self, order, reason):
@@ -1743,7 +1823,10 @@ class RollingLadderEngine:
             "bid": tick.bid if tick else "",
             "ask": tick.ask if tick else "",
             "spread": tick.spread if tick else "",
-            "current_pnl": round(seq.floating_pnl, 2),
+            # the basket TOTAL, so current/peak/lowest are the same quantity
+            # and current_pnl can never exceed peak_pnl again
+            "current_pnl": round(seq.basket_pnl, 2),
+            "floating_pnl": round(seq.floating_pnl, 2),
             "peak_pnl": round(seq.peak_pnl, 2),
             "drawdown_from_peak": round(seq.drawdown, 2),
             "realized_pnl": self.get_cycle_realized_pnl(),
@@ -1766,6 +1849,19 @@ class RollingLadderEngine:
             "protection_trail": snap["profit_protection_trail"],
             "protection_threshold": round(seq.protection_threshold, 2),
             "cycle_state": seq.state,
+            "lowest_pnl": round(seq.lowest_pnl, 2),
+            "recovery_state": seq.recovery_state,
+            "time_underwater": round(seq.time_underwater, 1),
+            "time_since_peak": round(seq.time_since_peak, 1),
+            "recovery_amount": seq.recovery_amount,
+            "recovery_speed": seq.recovery_speed,
+            "price_state": seq.price_state,
+            "price_vs_anchor": seq.price_vs_anchor,
+            "price_vs_average_entry": seq.price_vs_average_entry,
+            "basket_average_entry": seq.basket_average_entry,
+            "recent_price_change": seq.recent_price_change,
+            "price_velocity": seq.price_velocity,
+            "exit_in_progress": self.exit_in_progress,
         })
 
     # ================================================================ reporting

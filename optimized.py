@@ -949,6 +949,21 @@ class LadderBot:
             protection_active=seq.get("protection_active", ""),
             cycle_state=seq.get("cycle_state", ""),
             exit_reason=kind,
+            # what the basket had been through when it was taken
+            lowest_pnl=seq.get("lowest_pnl", ""),
+            recovery_state=seq.get("recovery_state", ""),
+            was_underwater=seq.get("was_underwater", ""),
+            recovery_amount=seq.get("recovery_amount", ""),
+            time_underwater=seq.get("time_underwater", ""),
+            time_of_max_drawdown=seq.get("time_of_max_drawdown", ""),
+            price_state=seq.get("price_state", ""),
+            price_vs_anchor=seq.get("price_vs_anchor", ""),
+            price_vs_average_entry=seq.get("price_vs_average_entry", ""),
+            # exit + ladder latency: every remaining key in the close context
+            # is a timestamp or a derived milliseconds figure, so it is passed
+            # straight through rather than restated one name at a time
+            **{k: v for k, v in ctx.items()
+               if k in _LATENCY_KEYS},
             end_kind=kind,
             end_reason=reason,
             daily_profit=self.engine.daily_profit if self.engine else "",
@@ -988,6 +1003,24 @@ class LadderBot:
 # ===========================================================================
 # BACKGROUND MONITOR (account snapshots)
 # ===========================================================================
+# Keys the engine puts in the close context that map 1:1 onto cycle CSV
+# columns. Kept as an explicit set so an unexpected key cannot silently become
+# a column, and a renamed one fails loudly in the tests.
+_LATENCY_KEYS = frozenset({
+    "target_crossed_at", "target_detected_at", "exit_state_entered_at",
+    "close_request_started_at", "close_request_completed_at",
+    "pending_cancel_started_at", "pending_cancel_completed_at",
+    "flat_verification_started_at", "fully_flat_at",
+    "detection_latency_ms", "decision_to_close_request_ms",
+    "close_request_latency_ms", "pending_cancel_latency_ms",
+    "flat_verification_latency_ms", "total_exit_latency_ms",
+    "positions_closed", "pending_cancelled", "close_failures",
+    "cancel_failures", "close_attempts",
+    "basket_pnl_at_target_detection", "basket_pnl_at_close_request",
+    "ladder_first_order_ms", "ladder_complete_ms", "ladder_orders_placed",
+})
+
+
 class MonitorThread(threading.Thread):
     """Low-frequency account snapshots. Never touches the ladder loop."""
 

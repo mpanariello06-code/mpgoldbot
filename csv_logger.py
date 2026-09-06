@@ -92,6 +92,23 @@ CYCLE_HEADER = [
     "time_in_profit", "time_in_protection", "protection_active",
     "cycle_state", "exit_reason", "max_ladder_depth_reached", "total_triggers",
     "entry_bar_time", "entry_timeframe",
+    # --- what the basket had been through when it was taken (PHASE 10-14) ---
+    "lowest_pnl", "recovery_state", "was_underwater", "recovery_amount",
+    "time_underwater", "time_of_max_drawdown", "price_state",
+    "price_vs_anchor", "price_vs_average_entry",
+    # --- EXIT LATENCY (PHASE 17): where the time actually went -------------
+    "target_crossed_at", "target_detected_at", "exit_state_entered_at",
+    "close_request_started_at", "close_request_completed_at",
+    "pending_cancel_started_at", "pending_cancel_completed_at",
+    "flat_verification_started_at", "fully_flat_at",
+    "detection_latency_ms", "decision_to_close_request_ms",
+    "close_request_latency_ms", "pending_cancel_latency_ms",
+    "flat_verification_latency_ms", "total_exit_latency_ms",
+    "positions_closed", "pending_cancelled", "close_failures",
+    "cancel_failures", "close_attempts",
+    "basket_pnl_at_target_detection", "basket_pnl_at_close_request",
+    # --- LADDER PLACEMENT LATENCY (PHASE 18) -------------------------------
+    "ladder_first_order_ms", "ladder_complete_ms", "ladder_orders_placed",
     "end_kind", "end_reason", "daily_profit",
 ]
 
@@ -101,13 +118,21 @@ CYCLE_HEADER = [
 TELEMETRY_HEADER = [
     "timestamp", "symbol", "cycle_id", "elapsed_seconds",
     "bid", "ask", "spread",
-    "current_pnl", "peak_pnl", "drawdown_from_peak", "realized_pnl",
+    "current_pnl", "floating_pnl", "peak_pnl", "drawdown_from_peak",
+    "realized_pnl",
     "open_positions", "open_buys", "open_sells", "pending_orders",
     "net_volume", "ladder_depth", "triggers", "total_triggers",
     "buy_triggers", "sell_triggers",
     "direction_changes", "basket_profit_target", "protection_active",
     "protection_activation", "protection_trail", "protection_threshold",
     "m1_bar_time", "cycle_state",
+    # --- what the basket has been through, not just what it is worth now ---
+    "lowest_pnl", "recovery_state", "time_underwater", "time_since_peak",
+    "recovery_amount", "recovery_speed",
+    # --- where price is, relative to the things the basket cares about ---
+    "price_state", "price_vs_anchor", "price_vs_average_entry",
+    "basket_average_entry", "recent_price_change", "price_velocity",
+    "exit_in_progress",
 ]
 
 # One row per entry evaluation - accepted or rejected. This is what makes it
