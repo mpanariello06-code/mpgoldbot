@@ -253,6 +253,55 @@ At creation the accepted orders are counted per side. A short deployment is
 logged as `LADDER_CREATED … PARTIAL` plus an `ERROR` naming the shortfall, and
 the ladder runs as placed — **a second ladder is never created to compensate**.
 
+## Ladder geometry
+
+The intended shape is exact, measured from the reference price captured once
+when the cycle starts (`spec.normalize_price(tick.mid)`):
+
+```
+BUY  STOP:  P + 0.30, P + 0.60, P + 0.90, ...   (n = 1..LADDER_DEPTH)
+SELL STOP:  P - 0.30, P - 0.60, P - 0.90, ...
+```
+
+`0.30` is **XAUUSD price units**, not points or pips.
+
+The broker's minimum stop distance and `FIRST_LEVEL_OFFSET` are a *legality
+filter*, never a nudge: a level inside them is **skipped and logged**
+(`LEVEL_SKIPPED`, with the intended price, the gate price and the reason), and
+placed later if price moves away from it. Nothing is ever moved to a "nearby
+legal" price, because that is what silently distorts the spacing.
+
+> This was measured before it was fixed: with `FIRST_LEVEL_OFFSET` defaulting
+> to the spacing, the standoff was measured from the *market* and then rounded
+> onto the grid — `ceil((spread/2 + 0.30)/0.30) = 2` — so the first level went
+> out at **+0.60** at every spread tested. The gaps between levels were already
+> exact. `FIRST_LEVEL_OFFSET` now defaults to `0.0`.
+
+Every placement records `reference_price`, intended vs actual first buy/sell,
+`first_buy_distance`, `first_sell_distance`, `buy_spacing`, `sell_spacing`,
+`price_at_first_order`, `price_at_last_order` and `levels_skipped` — enough to
+attribute a leaning ladder to market movement, spread, broker constraints or
+our own arithmetic instead of guessing.
+
+## Exposure limits
+
+Depth alone cannot tell BUY 6 / SELL 6 from BUY 11 / SELL 1. Both are tracked:
+
+| grading | from |
+|---|---|
+| `LADDER_NORMAL` / `EXTENDED` / `DEEP` / `MAX_DEPTH` | ladder depth used against `MAX_LADDER_DEPTH`, at `LADDER_EXTENDED_FRACTION` and `LADDER_DEEP_FRACTION` |
+| `BALANCED` / `BUY_HEAVY` / `SELL_HEAVY` / `EXTREMELY_IMBALANCED` | `\|buy_volume − sell_volume\| / gross_volume` against `MAX_DIRECTION_IMBALANCE` |
+
+Imbalance is measured on **volume**, so 11 × 0.01 long against 1 × 0.11 short
+is correctly balanced. It is only graded once the basket has
+`IMBALANCE_MIN_POSITIONS` legs — one leg is trivially 100% one-sided.
+
+Reaching a limit **withholds new exposure**. It never closes the basket, never
+touches open positions, and never adds the other side to "balance" it — that
+would be martingale. `IMBALANCE_ACTION` defaults to `MONITOR` (record only)
+while there is not yet enough data to say which imbalance levels precede
+losses.
+
 ## How the ladder works
 
 * Levels sit on a **grid anchored when the cycle starts** (`anchor + n × spacing`),
@@ -359,8 +408,10 @@ above it and then does what it says. It reads four things:
 
 | input | what it answers |
 |---|---|
-| **basket profit** | current, peak, lowest — all measured on realized + floating, so peak ≥ current ≥ lowest always holds |
+| **basket profit** | current, peak, lowest — all measured on **floating** P/L, so `drawdown = peak − current` subtracts like from like and peak ≥ current ≥ lowest always holds. Realized is reported separately and never folded in: a basket must not defend a peak it has already banked |
 | **recovery state** | NORMAL / UNDERWATER / RECOVERING / PROFITABLE / PROFIT_PROTECTION / EXITING — what the basket has *been through*, not just what it is worth |
+| **recovery quality** | NO_RECOVERY / WEAK_RECOVERY / RECOVERING / STRONG_RECOVERY — *how well* it is climbing out, as a fraction of the hole it dug, with duration and speed |
+| **exposure** | ladder depth grading and volume-based direction imbalance |
 | **price movement** | a short window (`PRICE_MOVEMENT_WINDOW`): recent change, velocity, distance from the anchor and from the basket's average entry, read as FAVORABLE / ADVERSE / FLAT relative to which way the basket leans |
 | **drawdown behaviour** | give-back from peak, both absolute and as a fraction of that peak |
 

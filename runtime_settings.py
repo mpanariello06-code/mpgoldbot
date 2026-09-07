@@ -19,6 +19,7 @@ from pathlib import Path
 ROLL_MODES = ("extend", "static")
 DIRECTION_MODES = ("off", "both", "buy_bias", "sell_bias", "none")
 TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1")
+IMBALANCE_ACTIONS = ("MONITOR", "STOP_NEW_EXPOSURE")
 
 # Bumped when a change to the DEFAULTS has to reach existing installations.
 # 2 = basket architecture, no individual TP.
@@ -104,6 +105,13 @@ VALIDATORS = {
     "recovery_take_profit": (lambda v: _num(v, float, "Recovery take profit", 0.0, 100000.0), "Recovery Take", True),
     "profit_giveback_fraction": (lambda v: _num(v, float, "Give-back fraction", 0.0, 1.0), "Give-back Fraction", True),
     "price_movement_window": (lambda v: _num(v, float, "Movement window", 1.0, 3600.0), "Movement Window", False),
+    "ladder_extended_fraction": (lambda v: _num(v, float, "Extended at", 0.0, 1.0), "Extended At", True),
+    "ladder_deep_fraction": (lambda v: _num(v, float, "Deep at", 0.0, 1.0), "Deep At", True),
+    "max_direction_imbalance": (lambda v: _num(v, float, "Max imbalance", 0.0, 1.0), "Max Imbalance", True),
+    "imbalance_action":    (lambda v: _upper_choice(v, IMBALANCE_ACTIONS, "Imbalance action"), "Imbalance Action", True),
+    "imbalance_min_positions": (lambda v: _num(v, int, "Imbalance min positions", 1, 200), "Imbalance Min Legs", True),
+    "weak_recovery_fraction": (lambda v: _num(v, float, "Weak recovery at", 0.0, 1.0), "Weak Recovery At", True),
+    "strong_recovery_fraction": (lambda v: _num(v, float, "Strong recovery at", 0.0, 1.0), "Strong Recovery At", True),
     "telemetry_interval_seconds": (lambda v: _num(v, float, "Telemetry interval", 0.0, 3600.0), "Telemetry Interval", False),
     "cycle_close_positions": (lambda v: _flag(v, "Close positions on cycle end"), "Close On Cycle End", True),
     # --- risk ---

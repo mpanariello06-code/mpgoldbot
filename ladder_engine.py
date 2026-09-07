@@ -733,6 +733,14 @@ class RollingLadderEngine:
             recovery_take=float(snap["recovery_take_profit"]),
             giveback_fraction=float(snap["profit_giveback_fraction"]),
             movement_window=float(snap["price_movement_window"]),
+            max_ladder_depth=int(snap["max_ladder_depth"]),
+            extended_at=float(snap["ladder_extended_fraction"]),
+            deep_at=float(snap["ladder_deep_fraction"]),
+            max_imbalance=float(snap["max_direction_imbalance"]),
+            imbalance_action=str(snap["imbalance_action"]),
+            imbalance_min_positions=int(snap["imbalance_min_positions"]),
+            weak_recovery_at=float(snap["weak_recovery_fraction"]),
+            strong_recovery_at=float(snap["strong_recovery_fraction"]),
         )
 
     def mark_to_market(self, snap, tick, positions=None):
@@ -1656,18 +1664,25 @@ class RollingLadderEngine:
         # already sitting at the broker waiting to fill. At the cap they are
         # cancelled: no further exposure is added, and the basket already open
         # is still managed by the exit rules.
+        # The basket grades its own exposure (depth AND one-sidedness); this is
+        # the single place that decision is read. Reaching a cap withholds new
+        # exposure - it never closes the basket, which stays under the exit
+        # engine exactly as before.
         max_depth = int(snap["max_ladder_depth"])
         used = self.sequence.ladder_depth_used if self.sequence else 0
-        depth_capped = max_depth > 0 and used >= max_depth
+        depth_capped = bool(self.sequence and self.sequence.exposure_capped)
         if depth_capped and not self._depth_capped_logged:
             self._depth_capped_logged = True
             self._event("LADDER_DEPTH_CAP",
-                        f"depth {used}/{max_depth} reached - cancelling the "
+                        f"{self.sequence.exposure_cap_reason} - cancelling the "
                         f"remaining {len(orders)} pending levels; no further "
-                        f"exposure this cycle, the basket carries on",
+                        f"exposure this cycle, the basket carries on "
+                        f"[{self.sequence.ladder_state}/"
+                        f"{self.sequence.imbalance_state}]",
                         cycle_id=self.cycle.cycle_id, status="CAPPED")
         if depth_capped and orders:
-            self._cancel_all(orders, f"ladder depth cap {used}/{max_depth}")
+            self._cancel_all(orders,
+                             f"exposure cap: {self.sequence.exposure_cap_reason}")
             return 0
         room_orders = 0 if depth_capped else \
             int(snap["max_pending_orders"]) - len(seen)
@@ -1907,6 +1922,10 @@ class RollingLadderEngine:
         legs = self.cycle_positions(self.cycle.cycle_id, positions)
         ords = self.cycle_orders(self.cycle.cycle_id, orders)
         seq = self.sequence
+        # what the ONE exit authority says right now, recorded alongside the
+        # state it said it about - so a decision can be replayed from the row
+        decision, decision_reason, _ = seq.decide(self.profit_rules(snap),
+                                                  has_exposure=bool(legs))
         self._emit("telemetry", {
             "symbol": self.broker.symbol,
             "cycle_id": self.cycle.cycle_id,
@@ -1943,6 +1962,7 @@ class RollingLadderEngine:
             "lowest_pnl": round(seq.lowest_pnl, 2),
             "recovery_state": seq.recovery_state,
             "time_underwater": round(seq.time_underwater, 1),
+            "time_in_profit": round(seq.time_in_profit, 1),
             "time_since_peak": round(seq.time_since_peak, 1),
             "recovery_amount": seq.recovery_amount,
             "recovery_speed": seq.recovery_speed,
@@ -1952,6 +1972,28 @@ class RollingLadderEngine:
             "basket_average_entry": seq.basket_average_entry,
             "recent_price_change": seq.recent_price_change,
             "price_velocity": seq.price_velocity,
+            "favorable_price_movement": seq.favorable_ticks,
+            "adverse_price_movement": seq.adverse_ticks,
+            "pending_buys": len([o for o in ords if o.side == BUY_STOP]),
+            "pending_sells": len([o for o in ords if o.side == SELL_STOP]),
+            "gross_volume": seq.gross_volume,
+            "net_direction": seq.net_direction,
+            "direction_imbalance": seq.direction_imbalance,
+            "imbalance_state": seq.imbalance_state,
+            "max_ladder_depth": int(snap["max_ladder_depth"]),
+            "ladder_state": seq.ladder_state,
+            "exposure_capped": seq.exposure_capped,
+            "recovery_quality": seq.recovery_quality,
+            "recovery_start_pnl": ("" if seq.recovery_start_pnl is None
+                                   else round(seq.recovery_start_pnl, 2)),
+            "recovery_duration": seq.recovery_duration,
+            "ladder_depth_at_recovery_start": seq.ladder_depth_at_recovery_start,
+            "basket_state": seq.state,
+            "exit_decision": decision,
+            "exit_reason": decision_reason or "",
+            "reference_price": self.cycle.anchor,
+            "first_buy_distance": self.ladder_timing.get("first_buy_distance", ""),
+            "first_sell_distance": self.ladder_timing.get("first_sell_distance", ""),
             "exit_in_progress": self.exit_in_progress,
         })
 
@@ -2025,6 +2067,19 @@ class RollingLadderEngine:
                                   if self.sequence else 0.0),
             "recovery_amount": (self.sequence.recovery_amount
                                 if self.sequence else 0.0),
+            "recovery_quality": (self.sequence.recovery_quality
+                                 if self.sequence else "NO_RECOVERY"),
+            "ladder_state": (self.sequence.ladder_state if self.sequence
+                             else "LADDER_NORMAL"),
+            "imbalance_state": (self.sequence.imbalance_state if self.sequence
+                                else "BALANCED"),
+            "direction_imbalance": (self.sequence.direction_imbalance
+                                    if self.sequence else 0.0),
+            "net_direction": (self.sequence.net_direction if self.sequence else ""),
+            "exposure_capped": bool(self.sequence and
+                                    self.sequence.exposure_capped),
+            "exposure_cap_reason": (self.sequence.exposure_cap_reason
+                                    if self.sequence else ""),
             "was_underwater": bool(self.sequence and self.sequence.was_underwater),
             "exit_in_progress": self.exit_in_progress,
             "exit_latency_ms": self.exit_timing.get("_last_total_ms", ""),

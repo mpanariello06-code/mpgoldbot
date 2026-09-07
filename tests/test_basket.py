@@ -363,19 +363,42 @@ t.check("and the peak was not inflated by the close",
 t.check("so protection is still not armed by money that never existed",
         not b.protection_active, f"peak {b.peak_pnl}")
 b.mark(0.0, rules, 2.0)                       # the next mark: flat book
-t.check("the next mark agrees", abs(b.basket_pnl - 1.90) < 1e-9, f"{b.basket_pnl}")
-t.check("give-back is not invented either", abs(b.drawdown) < 1e-9,
-        f"{b.drawdown}")
+t.check("the running total still adds up", abs(b.basket_pnl - 1.90) < 1e-9,
+        f"{b.basket_pnl}")
 
-# a genuine peak is still tracked across a partial close
+t.section("FLOATING AND REALIZED ARE NEVER MIXED")
+# The ACTIVE basket is managed on FLOATING P/L: current, peak and lowest are
+# all the same quantity, so drawdown_from_peak = peak - current subtracts like
+# from like. Realized is reported alongside and never folded in - a basket must
+# not defend a peak it has already banked and no longer holds.
 b2 = CycleBasket(2, 4010.0, 0.30, started_at=0.0)
 b2.mark(5.00, rules, 1.0)
+t.check("peak is the floating peak", abs(b2.peak_pnl - 5.00) < 1e-9,
+        f"{b2.peak_pnl}")
 b2.record_close("BUY", 1, 4010.0, 4012.0, 2.00)   # one leg banked
 b2.mark(3.00, rules, 2.0)                          # the rest still float
-t.check("a partial close keeps the real peak",
+t.check("realized is banked separately", abs(b2.realized_pnl - 2.00) < 1e-9,
+        f"{b2.realized_pnl}")
+t.check("current is what is still OPEN, not the banked total",
+        abs(b2.floating_pnl - 3.00) < 1e-9, f"{b2.floating_pnl}")
+t.check("the peak is not raised by banking a leg",
         abs(b2.peak_pnl - 5.00) < 1e-9, f"{b2.peak_pnl}")
-t.check("the total is realized + what is still floating",
+t.check("drawdown subtracts floating from floating",
+        abs(b2.drawdown - 2.00) < 1e-9, f"{b2.drawdown}")
+t.check("peak >= current >= lowest, all on the same quantity",
+        b2.peak_pnl >= b2.floating_pnl >= b2.lowest_pnl,
+        f"{b2.peak_pnl} / {b2.floating_pnl} / {b2.lowest_pnl}")
+t.check("and the cycle total is still available separately",
         abs(b2.basket_pnl - 5.00) < 1e-9, f"{b2.basket_pnl}")
+
+# the original double-count regression, restated on floating
+b3 = CycleBasket(3, 4010.0, 0.30, started_at=0.0)
+b3.mark(-5.00, rules, 1.0)
+b3.record_close("BUY", 1, 4010.0, 4005.0, -5.00)   # banked at a LOSS
+b3.mark(6.00, rules, 2.0)
+t.check("a loss banked mid-cycle cannot push current above peak",
+        b3.peak_pnl >= b3.floating_pnl,
+        f"peak {b3.peak_pnl} vs current {b3.floating_pnl}")
 
 t.section("6. THE TRAIL CLOSES THE BASKET")
 now = [11_000.0]

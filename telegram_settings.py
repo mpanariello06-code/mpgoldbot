@@ -63,6 +63,9 @@ class SettingsPanel:
         "max_open_positions": "open", "max_pending_orders": "pending",
         "max_spread": "spread", "max_slippage": "risk",
         "max_ladder_depth": "maxdepth",
+        "max_direction_imbalance": "exposure",
+        "imbalance_action": "exposure",
+        "imbalance_min_positions": "exposure",
         "max_daily_drawdown": "daily", "max_cycle_drawdown": "cycleloss",
         "max_consecutive_losing_cycles": "streak",
         "cooldown_after_loss_minutes": "cooldown",
@@ -95,6 +98,9 @@ class SettingsPanel:
         "first_level_offset": "Send the distance from price to the first level "
                               "(price units). The broker minimum always wins.",
         "max_ladder_depth": "Send the maximum ladder depth used per cycle.",
+        "max_direction_imbalance": "Send the maximum direction imbalance as a "
+                                   "fraction (0 = balanced, 1 = entirely "
+                                   "one-sided). e.g. 0.80",
         "telegram_status_interval_minutes": "Send how often the periodic status "
                                             "should be posted, in minutes.",
         "telegram_error_throttle_seconds": "Send how long an identical error is "
@@ -528,6 +534,31 @@ class SettingsPanel:
             [_btn(BACK, "settings_ladder")],
         )
 
+    def _menu_exposure(self):
+        s = self.settings.snapshot()
+        text = "\n".join([
+            "⚖️ <b>EXPOSURE LIMITS</b>", "",
+            f"Max ladder depth: {s['max_ladder_depth']}",
+            f"Max imbalance: {s['max_direction_imbalance']:.0%}",
+            f"When exceeded: {s['imbalance_action'].replace('_', ' ')}",
+            f"Graded from: {s['imbalance_min_positions']} legs", "",
+            "BUY 6 / SELL 6 and BUY 11 / SELL 1 are the same ladder depth and",
+            "completely different risks. Imbalance is measured on VOLUME.",
+            "",
+            "MONITOR records it only. STOP NEW EXPOSURE also stops adding",
+            "levels. Neither closes the basket, and neither ever adds the",
+            "other side to 'balance' it - that would be martingale.",
+        ])
+        return text, _rows(
+            [_btn(f"{self._mark(s['imbalance_action'] == 'MONITOR')}MONITOR",
+                  "confirm:imbalance_action:MONITOR"),
+             _btn(f"{self._mark(s['imbalance_action'] == 'STOP_NEW_EXPOSURE')}"
+                  f"STOP NEW", "confirm:imbalance_action:STOP_NEW_EXPOSURE")],
+            [_btn("📐 MAX DEPTH", "settings_maxdepth"),
+             _btn("✏️ MAX IMBALANCE", "custom:max_direction_imbalance")],
+            [_btn(BACK, "settings_risk")],
+        )
+
     def _menu_maxdepth(self):
         return self._simple_menu(
             "max_ladder_depth", "📐 <b>MAX LADDER DEPTH</b>", (6, 12, 20, 40),
@@ -543,6 +574,8 @@ class SettingsPanel:
             f"Max open positions: {s['max_open_positions']}",
             f"Max pending orders: {s['max_pending_orders']}",
             f"Max ladder depth: {s['max_ladder_depth']}",
+            f"Max imbalance: {s['max_direction_imbalance']:.0%} "
+            f"({s['imbalance_action'].replace('_', ' ')})",
             f"Max spread: {self._d('max_spread')}",
             f"Max slippage: {s['max_slippage']} points",
             f"Daily drawdown limit: {self._d('max_daily_drawdown')}",
@@ -567,6 +600,7 @@ class SettingsPanel:
              _btn("🔁 RE-ENTRY", "settings_reentry")],
             [_btn("🕒 ORDER AGE", "settings_age"),
              _btn("🕯 ENTRY TIMEFRAME", "settings_entry")],
+            [_btn("⚖️ EXPOSURE LIMITS", "settings_exposure")],
             [_btn(BACK, "settings")],
         )
 

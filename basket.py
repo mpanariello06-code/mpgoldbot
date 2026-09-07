@@ -36,6 +36,13 @@ PROFIT_PROTECTION = "PROFIT_PROTECTION"
 # itself is the reason to take it, because giving it back is how a recovered
 # basket becomes a loss again.
 RECOVERY_PROFIT = "RECOVERY_PROFIT"
+# A basket that fought its way back and is climbing strongly: protect the
+# recovery rather than let it round-trip.
+STRONG_RECOVERY_PROTECTION = "STRONG_RECOVERY_PROTECTION"
+# Exposure-driven, not P/L-driven: the ladder is at its cap, or one-sided
+# enough that the next adverse leg is disproportionate.
+DEEP_LADDER_RISK = "DEEP_LADDER_RISK"
+DIRECTION_IMBALANCE_RISK = "DIRECTION_IMBALANCE_RISK"
 # Profit given back from a peak that never reached the protection activation.
 PROFIT_GIVEBACK = "PROFIT_GIVEBACK"
 # Hard risk protection - these override the strategy.
@@ -46,8 +53,9 @@ EMERGENCY_EXIT = "EMERGENCY_EXIT"
 MANUAL_EXIT = "MANUAL_EXIT"
 
 EXIT_REASONS = (BASKET_PROFIT_TARGET, PROFIT_PROTECTION, RECOVERY_PROFIT,
-                PROFIT_GIVEBACK, RISK_DRAWDOWN, RISK_TIMEOUT, RISK_SPREAD,
-                EMERGENCY_EXIT, MANUAL_EXIT)
+                PROFIT_GIVEBACK, STRONG_RECOVERY_PROTECTION, DEEP_LADDER_RISK,
+                DIRECTION_IMBALANCE_RISK, RISK_DRAWDOWN, RISK_TIMEOUT,
+                RISK_SPREAD, EMERGENCY_EXIT, MANUAL_EXIT)
 
 RISK_REASONS = (RISK_DRAWDOWN, RISK_TIMEOUT, RISK_SPREAD, EMERGENCY_EXIT,
                 MANUAL_EXIT)
@@ -79,6 +87,40 @@ FAVORABLE = "FAVORABLE"        # recent movement is helping the basket
 ADVERSE = "ADVERSE"            # recent movement is hurting it
 FLAT_MOVE = "FLAT"             # no meaningful movement either way
 PRICE_STATES = (FAVORABLE, ADVERSE, FLAT_MOVE)
+
+# --------------------------------------------------------------- ladder depth
+# How much of MAX_LADDER_DEPTH a cycle has consumed. Reaching the cap stops new
+# exposure; it does NOT close the basket, which stays under the exit engine.
+LADDER_NORMAL = "LADDER_NORMAL"
+LADDER_EXTENDED = "LADDER_EXTENDED"
+LADDER_DEEP = "LADDER_DEEP"
+LADDER_MAX_DEPTH = "LADDER_MAX_DEPTH"
+LADDER_STATES = (LADDER_NORMAL, LADDER_EXTENDED, LADDER_DEEP, LADDER_MAX_DEPTH)
+
+# ----------------------------------------------------------- exposure balance
+# BUY 6 / SELL 6 and BUY 11 / SELL 1 are the same ladder depth and completely
+# different risks. Measured on VOLUME, not order counts, so uneven lot sizes
+# cannot hide an imbalance.
+BALANCED = "BALANCED"
+BUY_HEAVY = "BUY_HEAVY"
+SELL_HEAVY = "SELL_HEAVY"
+EXTREMELY_IMBALANCED = "EXTREMELY_IMBALANCED"
+IMBALANCE_STATES = (BALANCED, BUY_HEAVY, SELL_HEAVY, EXTREMELY_IMBALANCED)
+
+# What to do when MAX_DIRECTION_IMBALANCE is exceeded.
+IMBALANCE_MONITOR = "MONITOR"                    # record it only
+IMBALANCE_STOP_NEW = "STOP_NEW_EXPOSURE"         # also stop adding levels
+IMBALANCE_ACTIONS = (IMBALANCE_MONITOR, IMBALANCE_STOP_NEW)
+
+# ----------------------------------------------------------- recovery quality
+# Not every uptick off the bottom is a recovery. These grade HOW WELL a basket
+# that was genuinely underwater is climbing back.
+NO_RECOVERY = "NO_RECOVERY"
+WEAK_RECOVERY = "WEAK_RECOVERY"
+RECOVERING_QUALITY = "RECOVERING"
+STRONG_RECOVERY = "STRONG_RECOVERY"
+RECOVERY_QUALITIES = (NO_RECOVERY, WEAK_RECOVERY, RECOVERING_QUALITY,
+                      STRONG_RECOVERY)
 
 # ------------------------------------------------------------- exit decisions
 HOLD = "HOLD"
@@ -113,6 +155,26 @@ class ProfitRules:
     giveback_fraction: float = 0.40  # PROFIT_GIVEBACK_FRACTION
     # Seconds of price history the movement window looks at.
     movement_window: float = 20.0   # PRICE_MOVEMENT_WINDOW_SECONDS
+    # --- exposure limits ---
+    max_ladder_depth: int = 22          # MAX_LADDER_DEPTH
+    # Fractions of max_ladder_depth at which the ladder is called EXTENDED and
+    # DEEP. Grading only - neither closes anything by itself.
+    extended_at: float = 0.50           # LADDER_EXTENDED_FRACTION
+    deep_at: float = 0.75               # LADDER_DEEP_FRACTION
+    # |buy_vol - sell_vol| / gross_vol above which the basket is one-sided
+    # enough to stop adding to it. 1.0 = entirely one-sided.
+    max_imbalance: float = 0.80         # MAX_DIRECTION_IMBALANCE
+    imbalance_action: str = "MONITOR"   # IMBALANCE_ACTION
+    # A basket with one leg is trivially 100% one-sided and means nothing. The
+    # imbalance grading only applies once there is enough exposure for the
+    # ratio to say something.
+    imbalance_min_positions: int = 4    # IMBALANCE_MIN_POSITIONS
+    # --- recovery quality ---
+    # Fraction of the hole climbed back that counts as a weak / strong
+    # recovery. `recovery_fraction` above remains the floor for calling it a
+    # recovery at all.
+    weak_recovery_at: float = 0.25      # WEAK_RECOVERY_FRACTION
+    strong_recovery_at: float = 0.75    # STRONG_RECOVERY_FRACTION
 
     @property
     def protected_floor(self):
@@ -232,7 +294,34 @@ class CycleBasket:
         self.recent_price_change = 0.0
         self.price_velocity = 0.0        # price units per second
         self.basket_average_entry = 0.0
+
+        # --- exposure (PHASE 2/3) ---
         self.net_volume = 0.0
+        self.gross_volume = 0.0
+        self.buy_volume = 0.0
+        self.sell_volume = 0.0
+        self.open_buys = 0
+        self.open_sells = 0
+        self.position_count = 0
+        self.pending_buys = 0
+        self.pending_sells = 0
+        self.direction_imbalance = 0.0
+        self.imbalance_state = BALANCED
+        self.max_direction_imbalance = 0.0
+        self.ladder_state = LADDER_NORMAL
+        self.exposure_capped = False       # new exposure is being withheld
+        self.exposure_cap_reason = ""
+
+        # --- recovery quality (PHASE 4) ---
+        self.recovery_quality = NO_RECOVERY
+        self.recovery_duration = 0.0
+        self.ladder_depth_at_recovery_start = 0
+        self.recovery_count = 0
+        self.weak_recovery_count = 0
+        self.strong_recovery_count = 0
+        self._recovery_open = False        # inside a recovery episode
+        self.favorable_ticks = 0
+        self.adverse_ticks = 0
 
         # --- profit management ---
         self.state = BASKET_BUILDING
@@ -301,14 +390,20 @@ class CycleBasket:
 
     def _update_extremes(self, now=None):
         """
-        Peak and lowest, both measured on the BASKET TOTAL.
+        Peak and lowest, both measured on the basket's FLOATING P/L.
 
-        Everything here is a function of `basket_pnl` (realized + floating), so
-        peak >= current >= lowest holds by construction. The floating-only
-        extremes are kept alongside for the record, clearly named, and are
-        never compared against the peak.
+        For an ACTIVE basket the managed quantity is what is still open, so
+        current, peak and lowest are all floating and
+        drawdown_from_peak = peak - current is a like-for-like subtraction.
+        Realized P/L is deliberately excluded and reported separately: mixing
+        banked profit into a floating figure is how a bot ends up defending a
+        peak it no longer holds.
+
+        Under the basket architecture nothing closes mid-cycle, so realized is
+        0.00 for the life of a normal cycle and the two agree anyway; they only
+        diverge when a leg is closed early (a stop-out, or a manual close).
         """
-        total = self.basket_pnl
+        total = self.floating_pnl
         if total > self.peak_pnl:
             self.peak_pnl = total
             self.peak_at = (now - self.started_at) if now is not None else None
@@ -344,26 +439,103 @@ class CycleBasket:
         span = max(1e-6, now - first_ts)
         self.price_velocity = round(self.recent_price_change / span, 6)
 
-        volume = 0.0
-        weighted = 0.0
-        net = 0.0
-        for p in positions:
-            volume += p.volume
-            weighted += p.price_open * p.volume
-            net += (p.volume if p.side == BUY else -p.volume)
-        self.basket_average_entry = round(weighted / volume, 5) if volume else 0.0
-        self.net_volume = round(net, 4)
-
         # "Favorable" means the recent move helps THIS basket, which depends on
-        # which way the basket is leaning. A net-long basket likes price up.
+        # which way the basket is leaning - so the exposure has to be current
+        # before the movement can be classified.
+        self.update_exposure(positions)
         move = self.recent_price_change
+        net = self.net_volume
         if abs(move) < self.spacing * 0.1 or not net:
             self.price_state = FLAT_MOVE
         elif (move > 0) == (net > 0):
             self.price_state = FAVORABLE
+            self.favorable_ticks += 1
         else:
             self.price_state = ADVERSE
+            self.adverse_ticks += 1
         return self.price_state
+
+    # -------------------------------------------------------------- exposure
+    def update_exposure(self, positions=(), pending_buys=0, pending_sells=0):
+        """
+        What the basket is actually carrying, measured in VOLUME.
+
+        Counting orders would call BUY 11 x 0.01 and SELL 1 x 0.11 balanced;
+        they are not. Everything downstream - the imbalance state, the price
+        reading, the exit engine - uses these numbers.
+        """
+        buy_vol = sum(p.volume for p in positions if p.side == BUY)
+        sell_vol = sum(p.volume for p in positions if p.side == SELL)
+        weighted = sum(p.price_open * p.volume for p in positions)
+        gross = buy_vol + sell_vol
+
+        self.buy_volume = round(buy_vol, 4)
+        self.sell_volume = round(sell_vol, 4)
+        self.gross_volume = round(gross, 4)
+        self.net_volume = round(buy_vol - sell_vol, 4)
+        self.open_buys = sum(1 for p in positions if p.side == BUY)
+        self.open_sells = sum(1 for p in positions if p.side == SELL)
+        self.position_count = len(positions)
+        self.pending_buys = pending_buys
+        self.pending_sells = pending_sells
+        self.basket_average_entry = round(weighted / gross, 5) if gross else 0.0
+        # 0.0 = perfectly balanced, 1.0 = entirely one-sided
+        self.direction_imbalance = round(abs(buy_vol - sell_vol) / gross, 4) \
+            if gross > 0 else 0.0
+        self.max_direction_imbalance = max(self.max_direction_imbalance,
+                                           self.direction_imbalance)
+        return self.direction_imbalance
+
+    @property
+    def net_direction(self):
+        if self.net_volume > 0:
+            return BUY
+        if self.net_volume < 0:
+            return SELL
+        return ""
+
+    def grade_exposure(self, rules):
+        """
+        Ladder depth and one-sidedness, graded. Returns (ladder_state,
+        imbalance_state).
+
+        Grading only: nothing here closes a basket. It decides whether MORE
+        exposure may be added, and it feeds the exit engine.
+        """
+        used = self.ladder_depth_used
+        cap = max(0, int(rules.max_ladder_depth))
+        if cap and used >= cap:
+            self.ladder_state = LADDER_MAX_DEPTH
+        elif cap and used >= cap * rules.deep_at:
+            self.ladder_state = LADDER_DEEP
+        elif cap and used >= cap * rules.extended_at:
+            self.ladder_state = LADDER_EXTENDED
+        else:
+            self.ladder_state = LADDER_NORMAL
+
+        imbalance = self.direction_imbalance
+        graded = self.position_count >= max(1, int(rules.imbalance_min_positions))
+        if self.gross_volume <= 0 or not graded:
+            # not enough legs for the ratio to mean anything yet
+            self.imbalance_state = BALANCED
+        elif imbalance >= max(rules.max_imbalance, 1e-9):
+            self.imbalance_state = EXTREMELY_IMBALANCED
+        elif imbalance >= rules.max_imbalance * 0.5:
+            self.imbalance_state = BUY_HEAVY if self.net_volume > 0 else SELL_HEAVY
+        else:
+            self.imbalance_state = BALANCED
+
+        # why new exposure is being withheld, if it is
+        reasons = []
+        if self.ladder_state == LADDER_MAX_DEPTH:
+            reasons.append(f"ladder depth {used}/{cap}")
+        if self.imbalance_state == EXTREMELY_IMBALANCED and \
+                rules.imbalance_action == IMBALANCE_STOP_NEW:
+            reasons.append(f"direction imbalance {imbalance:.2f} "
+                           f">= {rules.max_imbalance:.2f}")
+        self.exposure_capped = bool(reasons)
+        self.exposure_cap_reason = "; ".join(reasons)
+        return self.ladder_state, self.imbalance_state
 
     @property
     def price_vs_anchor(self):
@@ -384,11 +556,19 @@ class CycleBasket:
         that fell into a hole and climbed out. The second has already shown the
         market can take it back, so it is treated more defensively.
         """
-        pnl = self.basket_pnl
+        pnl = self.floating_pnl
         if pnl <= -abs(rules.underwater_at):
-            self.was_underwater = True
-            if self.recovery_start_at is None:
+            # The episode starts the moment the basket is meaningfully under
+            # water, so recovery is measured from the hole it actually dug -
+            # not from wherever we happened to notice it climbing.
+            if not self._recovery_open:
+                self._recovery_open = True
                 self.recovery_start_pnl = self.lowest_pnl
+                self._recovery_start_wall = now
+                self.ladder_depth_at_recovery_start = self.ladder_depth_used
+                self.recovery_count += 1
+            self.was_underwater = True
+            self.recovery_start_pnl = min(self.recovery_start_pnl, self.lowest_pnl)
 
         depth = abs(min(0.0, self.lowest_pnl))
         recovered = pnl - self.lowest_pnl
@@ -397,6 +577,28 @@ class CycleBasket:
                       recovered >= depth * max(0.0, rules.recovery_fraction))
         if meaningful and self.recovery_start_at is None:
             self.recovery_start_at = now - self.started_at
+
+        # --- how WELL it is climbing back ---------------------------------
+        start_wall = getattr(self, "_recovery_start_wall", None)
+        self.recovery_duration = (round(max(0.0, now - start_wall), 1)
+                                  if start_wall is not None else 0.0)
+        fraction = (recovered / depth) if depth > 0 else 0.0
+        if not self.was_underwater or depth <= 0 or recovered <= 0:
+            quality = NO_RECOVERY
+        elif fraction >= rules.strong_recovery_at:
+            quality = STRONG_RECOVERY
+        elif fraction >= max(rules.recovery_fraction, rules.weak_recovery_at):
+            quality = RECOVERING_QUALITY
+        elif fraction >= rules.weak_recovery_at:
+            quality = WEAK_RECOVERY
+        else:
+            quality = NO_RECOVERY
+        if quality != self.recovery_quality:
+            if quality == STRONG_RECOVERY:
+                self.strong_recovery_count += 1
+            elif quality == WEAK_RECOVERY:
+                self.weak_recovery_count += 1
+        self.recovery_quality = quality
 
         if self.state == EXITING_STATE:
             self.recovery_state = EXITING_RECOVERY
@@ -415,7 +617,7 @@ class CycleBasket:
     @property
     def recovery_amount(self):
         """How much has been clawed back from the worst point."""
-        return round(self.basket_pnl - self.lowest_pnl, 2)
+        return round(self.floating_pnl - self.lowest_pnl, 2)
 
     @property
     def recovery_speed(self):
@@ -440,9 +642,9 @@ class CycleBasket:
 
         elapsed = 0.0 if self._last_mark is None else max(0.0, now - self._last_mark)
         self._last_mark = now
-        if self.basket_pnl > 0:
+        if self.floating_pnl > 0:
             self.time_in_profit += elapsed
-        if self.basket_pnl < 0:
+        if self.floating_pnl < 0:
             self.time_underwater += elapsed
         if self.protection_active:
             self.time_in_protection += elapsed
@@ -450,7 +652,7 @@ class CycleBasket:
         self.time_since_peak = 0.0 if peak_wall is None else max(0.0, now - peak_wall)
 
         if self.target_at is None and rules.target > 0 and \
-                self.basket_pnl >= rules.target:
+                self.floating_pnl >= rules.target:
             self.target_at = now - self.started_at
 
         # Activation is sticky: once a cycle has been worth protecting it stays
@@ -480,6 +682,7 @@ class CycleBasket:
             self.state = BASKET_BUILDING
             self.protection_threshold = 0.0
         self._update_recovery(rules, now)
+        self.grade_exposure(rules)
         return self.state
 
     def decide(self, rules, has_exposure=True):
@@ -496,7 +699,7 @@ class CycleBasket:
         """
         if not has_exposure:
             return HOLD, None, ""
-        pnl = self.basket_pnl
+        pnl = self.floating_pnl
         peak = self.peak_pnl
 
         # --- 1. the baseline target, when the runner is off ------------------
@@ -523,6 +726,33 @@ class CycleBasket:
             return PROTECT, None, (
                 f"protecting {peak:+.2f}, closes at "
                 f"{self.protection_threshold:+.2f}")
+
+        # --- 2b. a STRONG recovery that is now green is protected ------------
+        # It fought back from a real hole. Handing that back is how a recovered
+        # basket becomes a loss again, so it is defended rather than left to
+        # find out whether the move continues.
+        if self.recovery_quality == STRONG_RECOVERY and pnl > 0 and \
+                self.price_state == ADVERSE:
+            return EXIT, STRONG_RECOVERY_PROTECTION, (
+                f"recovered {self.recovery_amount:+.2f} from "
+                f"{self.lowest_pnl:+.2f} and price has turned against the "
+                f"basket at {pnl:+.2f} - protecting the recovery")
+
+        # --- 2c. exposure risk, independent of P/L ---------------------------
+        # A capped or one-sided basket cannot be made safer by adding to it
+        # (that would be martingale), so the only lever left is to take it when
+        # it is green and the move has turned.
+        if pnl > 0 and self.price_state == ADVERSE:
+            if self.ladder_state == LADDER_MAX_DEPTH:
+                return EXIT, DEEP_LADDER_RISK, (
+                    f"ladder at maximum depth ({self.ladder_depth_used}) with "
+                    f"{pnl:+.2f} on the table and price turning - taking it "
+                    f"rather than carrying capped exposure further")
+            if self.imbalance_state == EXTREMELY_IMBALANCED:
+                return EXIT, DIRECTION_IMBALANCE_RISK, (
+                    f"basket is {self.direction_imbalance:.0%} one-sided "
+                    f"({self.net_direction or 'flat'}) at {pnl:+.2f} with price "
+                    f"turning - the next adverse leg is disproportionate")
 
         # --- 3. a RECOVERED basket is taken early ----------------------------
         # It has already demonstrated it can go against us by the depth it fell
@@ -601,8 +831,13 @@ class CycleBasket:
 
     @property
     def drawdown(self):
-        """Give-back from the basket's own peak. Never negative."""
-        return max(0.0, self.peak_pnl - self.basket_pnl)
+        """
+        Give-back from the basket's own peak. Never negative.
+
+        Floating against floating: peak_pnl is the highest FLOATING P/L this
+        cycle reached, so this subtracts like from like.
+        """
+        return max(0.0, self.peak_pnl - self.floating_pnl)
 
     # the spec's name for the same number, used by the telemetry log
     drawdown_from_peak = drawdown
@@ -610,7 +845,7 @@ class CycleBasket:
     @property
     def profit_giveback(self):
         """How much of the best excursion was handed back by the close."""
-        return round(max(0.0, self.peak_pnl - self.basket_pnl), 2)
+        return round(max(0.0, self.peak_pnl - self.floating_pnl), 2)
 
     @property
     def age_seconds(self):
@@ -657,6 +892,27 @@ class CycleBasket:
             "recent_price_change": self.recent_price_change,
             "price_velocity": self.price_velocity,
             "net_volume": self.net_volume,
+            # --- exposure ---
+            "gross_volume": self.gross_volume,
+            "buy_volume": self.buy_volume,
+            "sell_volume": self.sell_volume,
+            "net_direction": self.net_direction,
+            "direction_imbalance": self.direction_imbalance,
+            "imbalance_state": self.imbalance_state,
+            "max_direction_imbalance": round(self.max_direction_imbalance, 4),
+            "ladder_state": self.ladder_state,
+            "exposure_capped": self.exposure_capped,
+            "exposure_cap_reason": self.exposure_cap_reason,
+            "position_count": self.position_count,
+            # --- recovery quality ---
+            "recovery_quality": self.recovery_quality,
+            "recovery_duration": self.recovery_duration,
+            "ladder_depth_at_recovery_start": self.ladder_depth_at_recovery_start,
+            "recovery_count": self.recovery_count,
+            "weak_recovery_count": self.weak_recovery_count,
+            "strong_recovery_count": self.strong_recovery_count,
+            "favorable_price_movement": self.favorable_ticks,
+            "adverse_price_movement": self.adverse_ticks,
             "max_floating_profit": round(self.max_floating_profit, 2),
             "max_floating_loss": round(self.max_floating_loss, 2),
             "max_drawdown": round(self.max_drawdown, 2),

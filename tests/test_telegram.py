@@ -98,6 +98,10 @@ class FakeEngine:
             "previous_side": "BUY", "direction_changes": 1,
             "ladder_depth_used": 5, "basket_drawdown": 0.42,
             "max_ladder_depth": 22, "depth_capped": False,
+            "ladder_state": "LADDER_NORMAL", "imbalance_state": "BALANCED",
+            "direction_imbalance": 0.0, "net_direction": "BUY",
+            "gross_volume": 0.05, "exposure_capped": False,
+            "recovery_quality": "NO_RECOVERY",
             "entry_timeframe": "M1", "last_entry_bar": 1700000040,
             "waiting_for_entry": False,
             "state": "LADDER_ACTIVE",
@@ -302,7 +306,8 @@ async def run():
              "settings_pending",
              "settings_spread", "settings_daily", "settings_cycleloss",
              "settings_streak", "settings_cooldown", "settings_age",
-             "settings_reentry", "settings_entry", "settings_direction"]
+             "settings_reentry", "settings_entry", "settings_exposure",
+             "settings_direction"]
     seen = set()
     for m in menus:
         text, markup = panel.render(m, 111)

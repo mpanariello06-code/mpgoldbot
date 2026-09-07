@@ -107,8 +107,22 @@ CYCLE_HEADER = [
     "positions_closed", "pending_cancelled", "close_failures",
     "cancel_failures", "close_attempts",
     "basket_pnl_at_target_detection", "basket_pnl_at_close_request",
-    # --- LADDER PLACEMENT LATENCY (PHASE 18) -------------------------------
+    # --- LADDER PLACEMENT LATENCY + GEOMETRY -------------------------------
     "ladder_first_order_ms", "ladder_complete_ms", "ladder_orders_placed",
+    "placement_start_timestamp", "placement_end_timestamp",
+    "placement_duration_ms", "reference_price",
+    "intended_first_buy", "actual_first_buy",
+    "intended_first_sell", "actual_first_sell",
+    "first_buy_distance", "first_sell_distance",
+    "buy_spacing", "sell_spacing", "average_buy_spacing", "average_sell_spacing",
+    "price_at_first_order", "price_at_last_order", "levels_skipped",
+    # --- exposure and recovery, as the cycle ended -------------------------
+    "max_ladder_depth", "ladder_state", "maximum_direction_imbalance",
+    "direction_imbalance", "imbalance_state", "net_direction",
+    "gross_volume", "net_volume",
+    "recovery_quality", "recovery_count", "weak_recovery_count",
+    "strong_recovery_count", "recovery_duration", "recovery_speed",
+    "ladder_depth_at_recovery_start", "exit_state",
     "end_kind", "end_reason", "daily_profit",
 ]
 
@@ -125,13 +139,24 @@ TELEMETRY_HEADER = [
     "buy_triggers", "sell_triggers",
     "direction_changes", "basket_profit_target", "protection_active",
     "protection_activation", "protection_trail", "protection_threshold",
-    "m1_bar_time", "cycle_state",
+    "m1_bar_time", "cycle_state", "time_in_profit",
     # --- what the basket has been through, not just what it is worth now ---
     "lowest_pnl", "recovery_state", "time_underwater", "time_since_peak",
     "recovery_amount", "recovery_speed",
     # --- where price is, relative to the things the basket cares about ---
     "price_state", "price_vs_anchor", "price_vs_average_entry",
     "basket_average_entry", "recent_price_change", "price_velocity",
+    "favorable_price_movement", "adverse_price_movement",
+    # --- exposure: depth alone cannot tell BUY 6/SELL 6 from BUY 11/SELL 1 ---
+    "pending_buys", "pending_sells", "gross_volume", "net_direction",
+    "direction_imbalance", "imbalance_state", "max_ladder_depth",
+    "ladder_state", "exposure_capped",
+    # --- how well a basket that was underwater is climbing back -----------
+    "recovery_quality", "recovery_start_pnl", "recovery_duration",
+    "ladder_depth_at_recovery_start",
+    # --- what the exit engine decided on this pass ------------------------
+    "basket_state", "exit_decision", "exit_reason",
+    "reference_price", "first_buy_distance", "first_sell_distance",
     "exit_in_progress",
 ]
 

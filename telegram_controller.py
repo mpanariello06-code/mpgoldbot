@@ -325,6 +325,12 @@ class TelegramController:
             f"Historical BUY triggers: {s.get('historical_buy_triggers', 0)}",
             f"Historical SELL triggers: {s.get('historical_sell_triggers', 0)}",
             f"Direction changes: {s.get('direction_changes', 0)}",
+            f"Exposure: {(s.get('imbalance_state') or 'BALANCED').replace('_',' ')}"
+            + (f"  ({s.get('direction_imbalance', 0):.0%} "
+               f"{s.get('net_direction') or 'flat'})"
+               if s.get("gross_volume") or s.get("direction_imbalance") else ""),
+            f"Ladder: {(s.get('ladder_state') or 'LADDER_NORMAL').replace('LADDER_','').replace('_',' ')}"
+            + ("   ⛔ new exposure stopped" if s.get("exposure_capped") else ""),
             f"Ladder depth used: {s.get('ladder_depth_used', 0)}"
             + (f" / {s.get('max_ladder_depth')} max"
                if s.get('max_ladder_depth') else "")
@@ -341,6 +347,9 @@ class TelegramController:
             "",
             "<b>BASKET</b>",
             f"Recovery: {(s.get('recovery_state') or 'NORMAL').replace('_', ' ')}"
+            + (f" / {(s.get('recovery_quality') or '').replace('_', ' ')}"
+               if s.get("recovery_quality") not in (None, "", "NO_RECOVERY")
+               else "")
             + ("   (was underwater)" if s.get("was_underwater") else ""),
             f"Price: {(s.get('price_state') or 'n/a').replace('_', ' ')}",
             f"Current P/L: {_money(floating)}"

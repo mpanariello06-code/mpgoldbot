@@ -959,6 +959,29 @@ class LadderBot:
             price_state=seq.get("price_state", ""),
             price_vs_anchor=seq.get("price_vs_anchor", ""),
             price_vs_average_entry=seq.get("price_vs_average_entry", ""),
+            # exposure as the cycle ended
+            max_ladder_depth=self.settings.get("max_ladder_depth"),
+            ladder_state=seq.get("ladder_state", ""),
+            maximum_direction_imbalance=seq.get("max_direction_imbalance", ""),
+            direction_imbalance=seq.get("direction_imbalance", ""),
+            imbalance_state=seq.get("imbalance_state", ""),
+            net_direction=seq.get("net_direction", ""),
+            gross_volume=seq.get("gross_volume", ""),
+            net_volume=seq.get("net_volume", ""),
+            # recovery quality
+            recovery_quality=seq.get("recovery_quality", ""),
+            recovery_count=seq.get("recovery_count", ""),
+            weak_recovery_count=seq.get("weak_recovery_count", ""),
+            strong_recovery_count=seq.get("strong_recovery_count", ""),
+            recovery_duration=seq.get("recovery_duration", ""),
+            recovery_speed=seq.get("recovery_speed", ""),
+            ladder_depth_at_recovery_start=seq.get(
+                "ladder_depth_at_recovery_start", ""),
+            exit_state=seq.get("cycle_state", ""),
+            # Phase 8 asks for these under "average_*" names; they are the same
+            # measured mean gap between adjacent levels
+            average_buy_spacing=ctx.get("buy_spacing", ""),
+            average_sell_spacing=ctx.get("sell_spacing", ""),
             # exit + ladder latency: every remaining key in the close context
             # is a timestamp or a derived milliseconds figure, so it is passed
             # straight through rather than restated one name at a time
@@ -1018,6 +1041,13 @@ _LATENCY_KEYS = frozenset({
     "cancel_failures", "close_attempts",
     "basket_pnl_at_target_detection", "basket_pnl_at_close_request",
     "ladder_first_order_ms", "ladder_complete_ms", "ladder_orders_placed",
+    "placement_start_timestamp", "placement_end_timestamp",
+    "placement_duration_ms", "reference_price",
+    "intended_first_buy", "actual_first_buy",
+    "intended_first_sell", "actual_first_sell",
+    "first_buy_distance", "first_sell_distance",
+    "buy_spacing", "sell_spacing", "price_at_first_order",
+    "price_at_last_order", "levels_skipped",
 })
 
 

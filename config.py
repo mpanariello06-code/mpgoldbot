@@ -203,6 +203,29 @@ PROFIT_GIVEBACK_FRACTION = _get_float("PROFIT_GIVEBACK_FRACTION", 0.40)
 # Seconds of price history behind the favorable/adverse movement reading.
 PRICE_MOVEMENT_WINDOW = _get_float("PRICE_MOVEMENT_WINDOW", 20.0)
 
+# --- exposure limits -------------------------------------------------------
+# Fractions of MAX_LADDER_DEPTH at which the ladder is graded EXTENDED / DEEP.
+# Grading only: neither closes a basket, they feed the exit engine.
+LADDER_EXTENDED_FRACTION = _get_float("LADDER_EXTENDED_FRACTION", 0.50)
+LADDER_DEEP_FRACTION = _get_float("LADDER_DEEP_FRACTION", 0.75)
+# |buy_volume - sell_volume| / gross_volume above which a basket counts as
+# one-sided. 1.0 = entirely one-sided. Volume, never order counts.
+MAX_DIRECTION_IMBALANCE = _get_float("MAX_DIRECTION_IMBALANCE", 0.80)
+# MONITOR = record it only. STOP_NEW_EXPOSURE = also stop adding levels.
+# Never "add the other side to balance it" - that is martingale.
+# MONITOR by default: while we are collecting data, an imbalance should be
+# RECORDED, not acted on. Switch to STOP_NEW_EXPOSURE once the telemetry says
+# which imbalance levels actually precede losses.
+IMBALANCE_ACTION = _get_str("IMBALANCE_ACTION", "MONITOR").upper()
+# Legs required before the imbalance ratio is graded at all - one leg is
+# trivially 100% one-sided and says nothing.
+IMBALANCE_MIN_POSITIONS = _get_int("IMBALANCE_MIN_POSITIONS", 4)
+
+# --- recovery quality ------------------------------------------------------
+# Fractions of the hole climbed back that grade the recovery.
+WEAK_RECOVERY_FRACTION = _get_float("WEAK_RECOVERY_FRACTION", 0.25)
+STRONG_RECOVERY_FRACTION = _get_float("STRONG_RECOVERY_FRACTION", 0.75)
+
 CYCLE_CLOSE_POSITIONS = _get_bool("CYCLE_CLOSE_POSITIONS", True)
 
 # ---------------------------------------------------------------------------
@@ -349,6 +372,13 @@ def runtime_defaults():
         "recovery_take_profit": RECOVERY_TAKE_PROFIT,
         "profit_giveback_fraction": PROFIT_GIVEBACK_FRACTION,
         "price_movement_window": PRICE_MOVEMENT_WINDOW,
+        "ladder_extended_fraction": LADDER_EXTENDED_FRACTION,
+        "ladder_deep_fraction": LADDER_DEEP_FRACTION,
+        "max_direction_imbalance": MAX_DIRECTION_IMBALANCE,
+        "imbalance_action": IMBALANCE_ACTION,
+        "imbalance_min_positions": IMBALANCE_MIN_POSITIONS,
+        "weak_recovery_fraction": WEAK_RECOVERY_FRACTION,
+        "strong_recovery_fraction": STRONG_RECOVERY_FRACTION,
         "telemetry_interval_seconds": TELEMETRY_INTERVAL_SECONDS,
         "stop_loss_distance": STOP_LOSS_DISTANCE,
         "pip_points": PIP_POINTS,
@@ -460,6 +490,21 @@ def validate():
             f"{LADDER_DEPTH}+{LADDER_DEPTH} ladder per cycle")
     if POLL_SECONDS <= 0:
         errors.append("POLL_SECONDS must be greater than 0")
+    if IMBALANCE_ACTION not in ("MONITOR", "STOP_NEW_EXPOSURE"):
+        errors.append(
+            f"IMBALANCE_ACTION must be MONITOR or STOP_NEW_EXPOSURE, "
+            f"got {IMBALANCE_ACTION!r}")
+    if not 0.0 <= MAX_DIRECTION_IMBALANCE <= 1.0:
+        errors.append("MAX_DIRECTION_IMBALANCE must be between 0 and 1")
+    if LADDER_DEEP_FRACTION < LADDER_EXTENDED_FRACTION:
+        warnings.append(
+            f"LADDER_DEEP_FRACTION ({LADDER_DEEP_FRACTION}) is below "
+            f"LADDER_EXTENDED_FRACTION ({LADDER_EXTENDED_FRACTION}) - the "
+            f"ladder would be graded DEEP before EXTENDED")
+    if STRONG_RECOVERY_FRACTION < WEAK_RECOVERY_FRACTION:
+        warnings.append(
+            f"STRONG_RECOVERY_FRACTION ({STRONG_RECOVERY_FRACTION}) is below "
+            f"WEAK_RECOVERY_FRACTION ({WEAK_RECOVERY_FRACTION})")
     if EXIT_POLL_SECONDS <= 0:
         errors.append("EXIT_POLL_SECONDS must be greater than 0")
     if EXIT_POLL_SECONDS > POLL_SECONDS:
