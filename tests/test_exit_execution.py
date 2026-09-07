@@ -59,12 +59,31 @@ def live(name, overrides=None, price=4010.00):
 
 
 def fill(broker, count, side=BUY_STOP):
-    """Trigger `count` of the cycle's pending orders, as the broker would."""
+    """
+    Trigger the `count` levels NEAREST the market on one side, as price
+    reaching them would. Buys are consumed from the bottom up, sells from the
+    top down.
+    """
     orders = sorted([o for o in broker.orders() if o.side == side],
-                    key=lambda o: o.price)
+                    key=lambda o: o.price, reverse=(side == SELL_STOP))
     for o in orders[:count]:
         mt5.trigger_order(o.ticket)
     return len(orders[:count])
+
+
+def price_for_pnl(broker, target):
+    """
+    The bid at which the open basket is worth exactly `target`.
+
+    Derived from the fills that actually happened rather than hard-coded, so
+    the fixture cannot silently encode one particular ladder geometry.
+    """
+    pos = broker.positions()
+    contract = 100.0                      # stub XAUUSD contract size
+    signed = sum((1 if p.side == "BUY" else -1) * p.volume for p in pos)
+    base = sum((1 if p.side == "BUY" else -1) * p.price_open * p.volume
+               for p in pos)
+    return round((target / contract + base) / signed, 2)
 
 
 # ===========================================================================
@@ -74,12 +93,12 @@ eng.step()
 t.check("the ladder went out", len(broker.orders()) == 22,
         f"{len(broker.orders())} orders")
 fill(broker, 6)
-mt5.set_price(4011.70)
+mt5.set_price(price_for_pnl(broker, 1.86))
 eng.step()
 t.check("6 legs open, still under target",
         len(broker.positions()) == 6 and eng.cycle_active,
         f"{eng.get_cycle_floating_pnl():+.2f}")
-mt5.set_price(4011.80)
+mt5.set_price(price_for_pnl(broker, 2.40))
 reason = eng.check_exit_now()
 t.check("1. the fast monitor took it at the target",
         reason == BASKET_PROFIT_TARGET, str(reason))
@@ -143,7 +162,7 @@ t.section("SCENARIO E: POSITIONS CLOSE BEFORE PENDINGS ARE CANCELLED")
 eng, broker, settings, rec = live("scenE")
 eng.step()
 fill(broker, 6)
-mt5.set_price(4011.80)
+mt5.set_price(price_for_pnl(broker, 2.40))
 order = []
 real_send = mt5.order_send
 
@@ -174,7 +193,7 @@ t.section("SCENARIO F: TELEGRAM CANNOT BLOCK AN EXIT")
 eng, broker, settings, rec = live("scenF")
 eng.step()
 fill(broker, 6)
-mt5.set_price(4011.80)
+mt5.set_price(price_for_pnl(broker, 2.40))
 # a notifier that takes a full second, wired exactly where the real one is
 slow_calls = []
 
@@ -205,7 +224,7 @@ t.section("THE EXIT LATCH IS ATOMIC AND ONE-WAY")
 eng, broker, settings, rec = live("latch")
 eng.step()
 fill(broker, 6)
-mt5.set_price(4011.80)
+mt5.set_price(price_for_pnl(broker, 2.40))
 tick = broker.tick()
 positions = broker.positions()
 first = eng.commit_exit("BASKET_PROFIT_TARGET", "test", tick, positions, (), 2.5)
@@ -231,7 +250,7 @@ t.section("A CLOSE THAT FAILS IS RETRIED, NOT SKIPPED")
 eng, broker, settings, rec = live("closefail")
 eng.step()
 fill(broker, 4)
-mt5.set_price(4011.90)
+mt5.set_price(price_for_pnl(broker, 2.40))
 refuse = {"on": True}
 real_send = mt5.order_send
 
@@ -269,7 +288,7 @@ t.section("A CANCEL THAT FAILS LEAVES THE CYCLE UNFINISHED")
 eng, broker, settings, rec = live("cancelfail")
 eng.step()
 fill(broker, 3)
-mt5.set_price(4011.95)
+mt5.set_price(price_for_pnl(broker, 2.40))
 block = {"on": True}
 real_send = mt5.order_send
 
@@ -302,7 +321,7 @@ t.section("AN ALREADY-FLAT ACCOUNT FINISHES CLEANLY")
 eng, broker, settings, rec = live("alreadyflat")
 eng.step()
 fill(broker, 2)
-mt5.set_price(4011.90)
+mt5.set_price(price_for_pnl(broker, 2.40))
 tick, positions = broker.tick(), broker.positions()
 eng.commit_exit("MANUAL_EXIT", "flat test", tick, positions, (), 2.5)
 for p in list(mt5.STATE["positions"]):        # broker closed them behind us
@@ -318,7 +337,7 @@ t.section("EXIT LATENCY IS MEASURED, NOT ASSUMED")
 eng, broker, settings, rec = live("latency")
 eng.step()
 fill(broker, 6)
-mt5.set_price(4011.80)
+mt5.set_price(price_for_pnl(broker, 2.40))
 eng.check_exit_now()
 for _ in range(3):
     eng.step()
@@ -380,7 +399,7 @@ t.section("THE EXIT MONITOR RUNS OFF THE LADDER LOOP")
 eng, broker, settings, rec = live("threaded")
 eng.step()
 fill(broker, 6)
-mt5.set_price(4011.80)
+mt5.set_price(price_for_pnl(broker, 2.40))
 seen = {}
 
 

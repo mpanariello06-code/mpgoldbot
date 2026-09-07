@@ -66,10 +66,19 @@ t.check("buy levels are exactly one spacing apart",
 t.check("sell levels are exactly one spacing apart",
         all(abs(round(sell_prices[i + 1] - sell_prices[i], 2) - 0.30) < 1e-9
             for i in range(4)), str(sell_prices))
-t.check("nearest buy level is at least one spacing above the ask",
-        min(buy_prices) >= feed().ask + 0.30, f"{min(buy_prices)} vs {feed().ask}")
-t.check("nearest sell level is at least one spacing below the bid",
-        max(sell_prices) <= feed().bid - 0.30, f"{max(sell_prices)} vs {feed().bid}")
+# The INTENDED geometry: the first level either side sits exactly one spacing
+# from the reference price. It is measured from the anchor, never from the
+# current bid/ask - measuring from price is what used to round the first level
+# out to +0.60.
+t.check("first buy level is exactly one spacing above the reference",
+        abs(min(buy_prices) - (engine.cycle.anchor + 0.30)) < 1e-9,
+        f"{min(buy_prices)} vs anchor {engine.cycle.anchor} + 0.30")
+t.check("first sell level is exactly one spacing below the reference",
+        abs(max(sell_prices) - (engine.cycle.anchor - 0.30)) < 1e-9,
+        f"{max(sell_prices)} vs anchor {engine.cycle.anchor} - 0.30")
+t.check("and both are still legal stop orders",
+        min(buy_prices) > feed().ask and max(sell_prices) < feed().bid,
+        f"{min(buy_prices)} / {max(sell_prices)} vs {feed().ask}/{feed().bid}")
 t.check("every level sits on the cycle grid",
         all(abs((p - engine.cycle.anchor) / 0.30 -
                 round((p - engine.cycle.anchor) / 0.30)) < 1e-6

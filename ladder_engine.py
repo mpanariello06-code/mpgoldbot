@@ -115,6 +115,14 @@ def level_comment(cycle_id, side, index):
     return f"RL{int(cycle_id)}{'B' if side in (BUY, BUY_STOP) else 'S'}{int(index)}"
 
 
+def _mean_gap(prices):
+    """Average distance between adjacent levels - the spacing actually built."""
+    if len(prices) < 2:
+        return ""
+    gaps = [abs(prices[i + 1] - prices[i]) for i in range(len(prices) - 1)]
+    return round(sum(gaps) / len(gaps), 5)
+
+
 def parse_comment(comment):
     """(cycle_id, side, index) from a level comment, or None."""
     m = COMMENT_RE.match((comment or "").strip())
@@ -535,6 +543,13 @@ class RollingLadderEngine:
         if spacing <= 0 or depth <= 0 or not anchor:
             return []
 
+        # The ladder's INTENDED geometry is exact: anchor +/- n * spacing for
+        # n = 1..depth. `min_stop` is the broker's hard rule about how close a
+        # stop order may sit to the market, and `first_level_offset` is an
+        # optional extra standoff. Neither of them may MOVE a level - together
+        # they only decide whether an intended level is legal to place right
+        # now. Rounding the grid outward by the offset is exactly how the first
+        # level ended up at +0.60 instead of +0.30.
         min_stop = spec.min_stop_distance + spec.point
         offset = max(float(snap["first_level_offset"]), min_stop)
         # a level this far from price has been left behind: let the ladder
@@ -575,9 +590,10 @@ class RollingLadderEngine:
             if indexes:
                 nxt = indexes[-1] + direction
             else:
-                start = (tick.ask + offset) if direction > 0 else (tick.bid - offset)
-                nxt = int(math.ceil((start - anchor) / spacing - 1e-9)) if direction > 0 \
-                    else int(math.floor((start - anchor) / spacing + 1e-9))
+                # A fresh ladder starts at the FIRST intended level - index +/-1,
+                # one exact spacing from the reference price - not at whatever
+                # index the current spread and offset happen to round up to.
+                nxt = direction
 
             guard = 0
             while len(indexes) < depth and guard < depth * 8:
@@ -590,12 +606,12 @@ class RollingLadderEngine:
 
         if snap["roll_mode"] == "static":
             # the cycle's grid is fixed: pin the window once and let price
-            # consume it
+            # consume it. It is pinned to the INTENDED first level either side
+            # of the reference price, so the ladder is exactly
+            # anchor +0.30 .. +depth*0.30 and anchor -0.30 .. -depth*0.30.
             if self.cycle.base_buy_index is None:
-                self.cycle.base_buy_index = int(math.ceil(
-                    (tick.ask + offset - anchor) / spacing - 1e-9))
-                self.cycle.base_sell_index = int(math.floor(
-                    (tick.bid - offset - anchor) / spacing + 1e-9))
+                self.cycle.base_buy_index = 1
+                self.cycle.base_sell_index = -1
             buy_indexes = [self.cycle.base_buy_index + i for i in range(depth)]
             sell_indexes = [self.cycle.base_sell_index - i for i in range(depth)]
         else:
@@ -1663,6 +1679,22 @@ class RollingLadderEngine:
             return len(seen)
         place_started = time.time()
         first_order_at = None
+        # PHASE 1 measurement: what we MEANT to place vs what actually went on,
+        # so a leaning ladder can be attributed to market movement, spread,
+        # broker constraints or our own arithmetic - rather than guessed at.
+        intended = {BUY_STOP: None, SELL_STOP: None}
+        actual = {BUY_STOP: None, SELL_STOP: None}
+        for side, direction in ((BUY_STOP, 1), (SELL_STOP, -1)):
+            intended[side] = spec_price = self.spec.normalize_price(
+                self.cycle.anchor + direction * float(snap["ladder_spacing"]))
+        placement = {
+            "reference_price": self.cycle.anchor,
+            "price_at_first_order": None,
+            "price_at_last_order": None,
+            "intended_first_buy": intended[BUY_STOP],
+            "intended_first_sell": intended[SELL_STOP],
+            "skipped_levels": [],
+        }
         if first_deploy:
             self._event("LADDER_DEPLOY_START",
                         f"{self.broker.symbol} bid={tick.bid} ask={tick.ask} "
@@ -1682,7 +1714,25 @@ class RollingLadderEngine:
                 # an exit committed on the fast thread mid-placement: stop
                 # here rather than adding a level the close would leave behind
                 break
-            if key in seen or not level.placeable:
+            if key in seen:
+                continue
+            if not level.placeable:
+                # An INTENDED level the broker will not accept right now. It is
+                # never nudged to a legal price - that would silently distort
+                # the 0.30 geometry - it is skipped, recorded, and placed later
+                # if price moves away from it.
+                standoff = max(float(snap["first_level_offset"]),
+                               self.spec.min_stop_distance + self.spec.point)
+                gate = (tick.ask + standoff) if level.side == BUY_STOP \
+                    else (tick.bid - standoff)
+                placement["skipped_levels"].append({
+                    "side": level.side, "index": level.index,
+                    "intended_price": level.price,
+                    "gate_price": round(gate, self.spec.digits),
+                    "reason": (f"inside the minimum stop distance "
+                               f"({self.spec.min_stop_distance:g}) plus offset "
+                               f"({standoff:g})"),
+                })
                 continue
             level_key = (BUY if level.side == BUY_STOP else SELL, level.index)
             if level_key in self._levels_open:
@@ -1699,6 +1749,14 @@ class RollingLadderEngine:
                 room_orders -= 1
                 if first_order_at is None:
                     first_order_at = time.time()
+                    placement["price_at_first_order"] = tick.mid
+                placement["price_at_last_order"] = tick.mid
+                # the level nearest the reference on each side, as ACTUALLY
+                # accepted by the broker
+                cur = actual[level.side]
+                if cur is None or abs(level.price - self.cycle.anchor) < \
+                        abs(cur - self.cycle.anchor):
+                    actual[level.side] = level.price
                 seen.add(key)
                 self._event("ORDER_PLACED",
                             f"{level.side} {lot} @ {level.price} "
@@ -1765,12 +1823,45 @@ class RollingLadderEngine:
                             entry_price=self.cycle.anchor, status="OK")
         if placed and first_order_at is not None:
             done = time.time()
+            ref = self.cycle.anchor
+            first_buy = actual[BUY_STOP]
+            first_sell = actual[SELL_STOP]
+            buy_prices = sorted(l.price for l in desired_by_key.values()
+                                if l.side == BUY_STOP)
+            sell_prices = sorted((l.price for l in desired_by_key.values()
+                                  if l.side == SELL_STOP), reverse=True)
             self.ladder_timing = {
                 "ladder_first_order_ms": round(
                     (first_order_at - place_started) * 1000.0, 2),
                 "ladder_complete_ms": round((done - place_started) * 1000.0, 2),
                 "ladder_orders_placed": placed,
+                "placement_start_timestamp": round(place_started, 6),
+                "placement_end_timestamp": round(done, 6),
+                "placement_duration_ms": round((done - place_started) * 1000.0, 2),
+                "reference_price": ref,
+                "intended_first_buy": placement["intended_first_buy"],
+                "actual_first_buy": first_buy if first_buy is not None else "",
+                "intended_first_sell": placement["intended_first_sell"],
+                "actual_first_sell": first_sell if first_sell is not None else "",
+                "first_buy_distance": (round(first_buy - ref, 5)
+                                       if first_buy is not None else ""),
+                "first_sell_distance": (round(ref - first_sell, 5)
+                                        if first_sell is not None else ""),
+                "buy_spacing": _mean_gap(buy_prices),
+                "sell_spacing": _mean_gap(sell_prices),
+                "price_at_first_order": placement["price_at_first_order"],
+                "price_at_last_order": placement["price_at_last_order"],
+                "levels_skipped": len(placement["skipped_levels"]),
             }
+            for skip in placement["skipped_levels"]:
+                self._event("LEVEL_SKIPPED",
+                            f"{skip['side']} level {skip['index']:+d} intended "
+                            f"@ {skip['intended_price']} not placed: "
+                            f"{skip['reason']} (gate {skip['gate_price']})",
+                            cycle_id=self.cycle.cycle_id,
+                            direction=skip["side"], level=skip["index"],
+                            entry_price=skip["intended_price"],
+                            status="SKIPPED")
             if first_deploy:
                 self._event("LADDER_TIMING",
                             f"ladder #{self.cycle.cycle_id}: {placed} orders, "

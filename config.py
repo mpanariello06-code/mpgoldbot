@@ -134,7 +134,12 @@ LADDER_SPACING = _get_float("LADDER_SPACING", 0.30)     # price units
 LADDER_DEPTH = _get_int("LADDER_DEPTH", 11)            # levels per side
 # Nearest level distance from price; the broker's minimum stop distance always
 # wins when it is larger.
-FIRST_LEVEL_OFFSET = _get_float("FIRST_LEVEL_OFFSET", LADDER_SPACING)
+# Extra standoff between the market and a NEW level, on top of the broker's own
+# minimum stop distance. 0 = the intended geometry stands: the first level sits
+# exactly one LADDER_SPACING from the reference price. Raising this does not
+# move the grid - it only stops the nearest levels being placed until price has
+# moved away from them.
+FIRST_LEVEL_OFFSET = _get_float("FIRST_LEVEL_OFFSET", 0.0)
 # extend = the ladder rolls with price (levels re-created ahead of the market)
 # static = the grid is fixed for the cycle and consumed as price crosses it
 # static: the ladder is pinned when the cycle starts and price consumes it.
