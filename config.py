@@ -204,10 +204,30 @@ PROFIT_GIVEBACK_FRACTION = _get_float("PROFIT_GIVEBACK_FRACTION", 0.40)
 PRICE_MOVEMENT_WINDOW = _get_float("PRICE_MOVEMENT_WINDOW", 20.0)
 
 # --- exposure limits -------------------------------------------------------
-# Fractions of MAX_LADDER_DEPTH at which the ladder is graded EXTENDED / DEEP.
-# Grading only: neither closes a basket, they feed the exit engine.
-LADDER_EXTENDED_FRACTION = _get_float("LADDER_EXTENDED_FRACTION", 0.50)
-LADDER_DEEP_FRACTION = _get_float("LADDER_DEEP_FRACTION", 0.75)
+# ABSOLUTE ladder depths at which each zone begins. Absolute rather than
+# fractions of MAX_LADDER_DEPTH: "12 levels deep" is a fact about the exposure
+# and should not change meaning because someone raised the ceiling.
+#
+# A deep ladder is NOT automatically a bad ladder - deep baskets do recover.
+# The zone decides how much MORE exposure may be added; basket health decides
+# whether to exit. INITIAL TEST DEFAULTS, fitted to nothing.
+LADDER_EXTENDED_DEPTH = _get_int("LADDER_EXTENDED_DEPTH", 9)
+LADDER_DEEP_DEPTH = _get_int("LADDER_DEEP_DEPTH", 12)
+LADDER_CRITICAL_DEPTH = _get_int("LADDER_CRITICAL_DEPTH", 16)
+
+# Deep-ladder health. Off = the zones are recorded but never gate expansion.
+DEEP_LADDER_RISK_ENABLED = _get_bool("DEEP_LADDER_RISK_ENABLED", True)
+# Drawdown from peak (account currency) that counts as a large hole for a deep
+# basket. INITIAL TEST DEFAULT.
+DEEP_LADDER_MAX_DRAWDOWN = _get_float("DEEP_LADDER_MAX_DRAWDOWN", 10.00)
+# Imbalance above which a deep basket is dangerously one-sided.
+DEEP_LADDER_MAX_IMBALANCE = _get_float("DEEP_LADDER_MAX_IMBALANCE", 0.60)
+# Seconds a deep basket may sit underwater without a meaningful recovery before
+# that counts against it.
+DEEP_LADDER_RECOVERY_TIMEOUT = _get_float("DEEP_LADDER_RECOVERY_TIMEOUT", 900.0)
+# Adverse movement (price units, over PRICE_MOVEMENT_WINDOW) that counts as
+# "still going the wrong way" rather than noise.
+DEEP_LADDER_ADVERSE_MOVEMENT = _get_float("DEEP_LADDER_ADVERSE_MOVEMENT", 0.60)
 # |buy_volume - sell_volume| / gross_volume above which a basket counts as
 # one-sided. 1.0 = entirely one-sided. Volume, never order counts.
 MAX_DIRECTION_IMBALANCE = _get_float("MAX_DIRECTION_IMBALANCE", 0.80)
@@ -372,8 +392,14 @@ def runtime_defaults():
         "recovery_take_profit": RECOVERY_TAKE_PROFIT,
         "profit_giveback_fraction": PROFIT_GIVEBACK_FRACTION,
         "price_movement_window": PRICE_MOVEMENT_WINDOW,
-        "ladder_extended_fraction": LADDER_EXTENDED_FRACTION,
-        "ladder_deep_fraction": LADDER_DEEP_FRACTION,
+        "ladder_extended_depth": LADDER_EXTENDED_DEPTH,
+        "ladder_deep_depth": LADDER_DEEP_DEPTH,
+        "ladder_critical_depth": LADDER_CRITICAL_DEPTH,
+        "deep_ladder_risk_enabled": DEEP_LADDER_RISK_ENABLED,
+        "deep_ladder_max_drawdown": DEEP_LADDER_MAX_DRAWDOWN,
+        "deep_ladder_max_imbalance": DEEP_LADDER_MAX_IMBALANCE,
+        "deep_ladder_recovery_timeout": DEEP_LADDER_RECOVERY_TIMEOUT,
+        "deep_ladder_adverse_movement": DEEP_LADDER_ADVERSE_MOVEMENT,
         "max_direction_imbalance": MAX_DIRECTION_IMBALANCE,
         "imbalance_action": IMBALANCE_ACTION,
         "imbalance_min_positions": IMBALANCE_MIN_POSITIONS,
@@ -496,11 +522,18 @@ def validate():
             f"got {IMBALANCE_ACTION!r}")
     if not 0.0 <= MAX_DIRECTION_IMBALANCE <= 1.0:
         errors.append("MAX_DIRECTION_IMBALANCE must be between 0 and 1")
-    if LADDER_DEEP_FRACTION < LADDER_EXTENDED_FRACTION:
+    zones = (("LADDER_EXTENDED_DEPTH", LADDER_EXTENDED_DEPTH),
+             ("LADDER_DEEP_DEPTH", LADDER_DEEP_DEPTH),
+             ("LADDER_CRITICAL_DEPTH", LADDER_CRITICAL_DEPTH))
+    for (lo_name, lo), (hi_name, hi) in zip(zones, zones[1:]):
+        if hi <= lo:
+            errors.append(f"{hi_name} ({hi}) must be greater than "
+                          f"{lo_name} ({lo})")
+    if MAX_LADDER_DEPTH and LADDER_CRITICAL_DEPTH > MAX_LADDER_DEPTH:
         warnings.append(
-            f"LADDER_DEEP_FRACTION ({LADDER_DEEP_FRACTION}) is below "
-            f"LADDER_EXTENDED_FRACTION ({LADDER_EXTENDED_FRACTION}) - the "
-            f"ladder would be graded DEEP before EXTENDED")
+            f"LADDER_CRITICAL_DEPTH ({LADDER_CRITICAL_DEPTH}) is above "
+            f"MAX_LADDER_DEPTH ({MAX_LADDER_DEPTH}) - the critical zone can "
+            f"never be reached")
     if STRONG_RECOVERY_FRACTION < WEAK_RECOVERY_FRACTION:
         warnings.append(
             f"STRONG_RECOVERY_FRACTION ({STRONG_RECOVERY_FRACTION}) is below "

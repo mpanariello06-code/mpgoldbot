@@ -117,7 +117,9 @@ CYCLE_HEADER = [
     "buy_spacing", "sell_spacing", "average_buy_spacing", "average_sell_spacing",
     "price_at_first_order", "price_at_last_order", "levels_skipped",
     # --- exposure and recovery, as the cycle ended -------------------------
-    "max_ladder_depth", "ladder_state", "maximum_direction_imbalance",
+    "max_ladder_depth", "ladder_state", "depth_zone", "deep_ladder_state",
+    "risk_score", "risk_state", "expansion_allowed", "expansion_block_reason",
+    "maximum_direction_imbalance",
     "direction_imbalance", "imbalance_state", "net_direction",
     "gross_volume", "net_volume",
     "recovery_quality", "recovery_count", "weak_recovery_count",
@@ -151,6 +153,10 @@ TELEMETRY_HEADER = [
     "pending_buys", "pending_sells", "gross_volume", "net_direction",
     "direction_imbalance", "imbalance_state", "max_ladder_depth",
     "ladder_state", "exposure_capped",
+    # --- deep-ladder health: depth controls exposure, health controls exit ---
+    "depth_zone", "deep_ladder_state", "risk_score", "risk_state",
+    "expansion_allowed", "expansion_block_reason",
+    "buy_volume", "sell_volume", "max_floating_loss",
     # --- how well a basket that was underwater is climbing back -----------
     "recovery_quality", "recovery_start_pnl", "recovery_duration",
     "ladder_depth_at_recovery_start",

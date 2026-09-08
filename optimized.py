@@ -962,6 +962,12 @@ class LadderBot:
             # exposure as the cycle ended
             max_ladder_depth=self.settings.get("max_ladder_depth"),
             ladder_state=seq.get("ladder_state", ""),
+            depth_zone=seq.get("depth_zone", ""),
+            deep_ladder_state=seq.get("deep_ladder_state", ""),
+            risk_score=seq.get("risk_score", ""),
+            risk_state=seq.get("risk_state", ""),
+            expansion_allowed=seq.get("expansion_allowed", ""),
+            expansion_block_reason=seq.get("expansion_block_reason", ""),
             maximum_direction_imbalance=seq.get("max_direction_imbalance", ""),
             direction_imbalance=seq.get("direction_imbalance", ""),
             imbalance_state=seq.get("imbalance_state", ""),

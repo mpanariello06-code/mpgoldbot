@@ -289,7 +289,7 @@ Depth alone cannot tell BUY 6 / SELL 6 from BUY 11 / SELL 1. Both are tracked:
 
 | grading | from |
 |---|---|
-| `LADDER_NORMAL` / `EXTENDED` / `DEEP` / `MAX_DEPTH` | ladder depth used against `MAX_LADDER_DEPTH`, at `LADDER_EXTENDED_FRACTION` and `LADDER_DEEP_FRACTION` |
+| `LADDER_NORMAL` / `EXTENDED` / `DEEP` / `CRITICAL` / `MAX_DEPTH` | absolute depth against `LADDER_EXTENDED_DEPTH` (9), `LADDER_DEEP_DEPTH` (12), `LADDER_CRITICAL_DEPTH` (16), then the `MAX_LADDER_DEPTH` ceiling |
 | `BALANCED` / `BUY_HEAVY` / `SELL_HEAVY` / `EXTREMELY_IMBALANCED` | `\|buy_volume − sell_volume\| / gross_volume` against `MAX_DIRECTION_IMBALANCE` |
 
 Imbalance is measured on **volume**, so 11 × 0.01 long against 1 × 0.11 short
@@ -301,6 +301,55 @@ touches open positions, and never adds the other side to "balance" it — that
 would be martingale. `IMBALANCE_ACTION` defaults to `MONITOR` (record only)
 while there is not yet enough data to say which imbalance levels precede
 losses.
+
+## Deep ladders
+
+**The bot does not fear a large ladder. It fears an unhealthy large ladder.**
+Depth controls how much *more* exposure may be added; **health** controls
+whether to exit. Depth on its own never closes a basket — deep baskets do
+recover, and force-closing one at depth destroys exactly those winners.
+
+The health reading, from the basket's own behaviour rather than its depth:
+
+| state | meaning |
+|---|---|
+| `DEEP_HEALTHY` | deep but green, or barely underwater |
+| `DEEP_RECOVERING` | deep, underwater, climbing back convincingly |
+| `DEEP_WEAK` | deep, underwater, climbing back poorly |
+| `DEEP_ADVERSE` | deep and still going the wrong way |
+| `DEEP_CRITICAL` | deep **and** severely underwater **and** not recovering **and** still adverse — all four |
+
+Expansion by zone:
+
+```
+NORMAL / EXTENDED   expand freely
+DEEP                expand only while the basket reads healthy or recovering
+CRITICAL            expand only on a STRONG recovery
+MAX_LADDER_DEPTH    hard ceiling, never expand
+```
+
+Blocking expansion **never closes the basket**: every open position stays and
+the exit engine goes on managing it. Only `DEEP_CRITICAL` produces an exit
+(`CRITICAL_LADDER_RISK`), and a deep basket that is green and turning is taken
+as `DEEP_LADDER_RISK` — profit on the table, not an exposure panic.
+
+A `risk_score` (0–1) sums five weighted terms — depth, drawdown, imbalance,
+price movement, recovery quality — into `LOW` / `MEDIUM` / `HIGH` / `CRITICAL`,
+so a reading can be audited rather than taken on trust.
+
+Worked examples, all verified in `tests/test_deep_ladder.py`:
+
+| situation | zone | health | expansion | decision |
+|---|---|---|---|---|
+| depth 7, profitable | NORMAL | HEALTHY | allowed | continue |
+| depth 11, underwater, recovering strongly | EXTENDED | HEALTHY | allowed | HOLD |
+| depth 13, big drawdown, one-sided, adverse | DEEP | ADVERSE | **paused** | HOLD — basket still managed |
+| depth 16, severe, no recovery, adverse | CRITICAL | CRITICAL | paused | **EXIT** `CRITICAL_LADDER_RISK` |
+| depth 14, strong recovery, favourable | DEEP | RECOVERING | allowed | HOLD |
+
+> Every threshold here is an **initial test default**, explainable and fitted
+> to nothing. This is an independent approximation of publicly described
+> concepts, not a reproduction of any proprietary system.
 
 ## How the ladder works
 
@@ -547,7 +596,7 @@ automatically.
 **`MAX_LADDER_DEPTH` caps how much exposure one cycle may take on.** The ladder
 is placed once and never replenished, so "place no more levels" is not enough —
 the untouched pendings are already at the broker waiting to fill. When the cap
-is reached (`LADDER_DEPTH_CAP`, logged once) the **remaining pendings are
+is reached (`LADDER_EXPANSION_PAUSED`, logged once) the **remaining pendings are
 cancelled**: no further exposure is added this cycle. The basket already open
 is not closed by the cap — it keeps being managed by the exit rules, and the
 cycle ends normally.
@@ -559,7 +608,8 @@ cycle ends normally.
 * `data/rolling_ladder_events.csv` — one row per ladder event
   (`LADDER_CREATED`, `ORDER_PLACED`, `ORDER_CANCELLED`, `ORDER_TRIGGERED`,
   `SL_HIT`, `POSITION_CLOSED`, `LEVEL_ROLLED`, `CYCLE_STARTED`, `CYCLE_COMPLETED`,
-  `CYCLE_LOSS`, `LADDER_DEPLOY_START`, `LADDER_DEPTH_CAP`, `ORDER_REJECTED`,
+  `CYCLE_LOSS`, `LADDER_DEPLOY_START`, `LADDER_EXPANSION_PAUSED`,
+  `LADDER_EXPANSION_RESUMED`, `LEVEL_SKIPPED`, `ORDER_REJECTED`,
   the ladder lifecycle (`LADDER_CREATED`, `POSITION_OPENED`, `LADDER_CLOSED`,
   `COOLDOWN_STARTED`, `COOLDOWN_FINISHED`, `LADDER_REJECTED_ALREADY_ACTIVE`),
   the exit trail (`EXIT_TRIGGERED`, `EXIT_ORDERS_FOUND`, `EXIT_CANCEL_SENT`,

@@ -21,6 +21,7 @@ SUITES = [
     "test_entry_gate.py",
     "test_exit_execution.py",
     "test_ladder_geometry.py",
+    "test_deep_ladder.py",
     "test_continuous.py",
     "test_notifications.py",
     "test_replay.py",
@@ -63,8 +64,13 @@ def main():
             print((proc.stderr or "")[-1500:])
 
     print("-" * 60)
-    print(f"TOTAL: {total} passed, {failed} failed across {len(SUITES)} suites")
-    return 1 if failed or any(r[3] for r in results) else 0
+    crashed = [r[0] for r in results if r[3]]
+    # A suite that dies mid-run reports no summary line, so its remaining
+    # checks are simply absent. Saying "0 failed" for it would read as a pass.
+    print(f"TOTAL: {total} passed, {failed} failed across {len(SUITES)} suites"
+          + (f"  <-- {len(crashed)} CRASHED: {', '.join(crashed)}"
+             if crashed else ""))
+    return 1 if failed or crashed else 0
 
 
 if __name__ == "__main__":

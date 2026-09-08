@@ -105,8 +105,14 @@ VALIDATORS = {
     "recovery_take_profit": (lambda v: _num(v, float, "Recovery take profit", 0.0, 100000.0), "Recovery Take", True),
     "profit_giveback_fraction": (lambda v: _num(v, float, "Give-back fraction", 0.0, 1.0), "Give-back Fraction", True),
     "price_movement_window": (lambda v: _num(v, float, "Movement window", 1.0, 3600.0), "Movement Window", False),
-    "ladder_extended_fraction": (lambda v: _num(v, float, "Extended at", 0.0, 1.0), "Extended At", True),
-    "ladder_deep_fraction": (lambda v: _num(v, float, "Deep at", 0.0, 1.0), "Deep At", True),
+    "ladder_extended_depth": (lambda v: _num(v, int, "Extended depth", 1, 500), "Extended Depth", True),
+    "ladder_deep_depth":   (lambda v: _num(v, int, "Deep depth", 1, 500), "Deep Depth", True),
+    "ladder_critical_depth": (lambda v: _num(v, int, "Critical depth", 1, 500), "Critical Depth", True),
+    "deep_ladder_risk_enabled": (lambda v: _flag(v, "Deep ladder risk"), "Deep Ladder Risk", True),
+    "deep_ladder_max_drawdown": (lambda v: _num(v, float, "Deep max drawdown", 0.0, 100000.0), "Deep Max Drawdown", True),
+    "deep_ladder_max_imbalance": (lambda v: _num(v, float, "Deep max imbalance", 0.0, 1.0), "Deep Max Imbalance", True),
+    "deep_ladder_recovery_timeout": (lambda v: _num(v, float, "Deep recovery timeout", 0.0, 86400.0), "Deep Recovery Timeout", True),
+    "deep_ladder_adverse_movement": (lambda v: _num(v, float, "Deep adverse move", 0.0, 1000.0), "Deep Adverse Move", True),
     "max_direction_imbalance": (lambda v: _num(v, float, "Max imbalance", 0.0, 1.0), "Max Imbalance", True),
     "imbalance_action":    (lambda v: _upper_choice(v, IMBALANCE_ACTIONS, "Imbalance action"), "Imbalance Action", True),
     "imbalance_min_positions": (lambda v: _num(v, int, "Imbalance min positions", 1, 200), "Imbalance Min Legs", True),
@@ -147,7 +153,8 @@ VALIDATORS = {
 
 PRICE_KEYS = ("ladder_spacing", "first_level_offset",
               "stop_loss_distance", "max_spread")
-MONEY_KEYS = ("max_daily_drawdown", "max_cycle_drawdown",
+MONEY_KEYS = ("deep_ladder_max_drawdown",
+              "max_daily_drawdown", "max_cycle_drawdown",
               "basket_profit_target", "profit_protection_activation",
               "profit_protection_trail", "min_protected_profit",
               "underwater_threshold", "recovery_take_profit")

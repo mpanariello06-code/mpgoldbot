@@ -325,12 +325,17 @@ class TelegramController:
             f"Historical BUY triggers: {s.get('historical_buy_triggers', 0)}",
             f"Historical SELL triggers: {s.get('historical_sell_triggers', 0)}",
             f"Direction changes: {s.get('direction_changes', 0)}",
-            f"Exposure: {(s.get('imbalance_state') or 'BALANCED').replace('_',' ')}"
-            + (f"  ({s.get('direction_imbalance', 0):.0%} "
-               f"{s.get('net_direction') or 'flat'})"
-               if s.get("gross_volume") or s.get("direction_imbalance") else ""),
-            f"Ladder: {(s.get('ladder_state') or 'LADDER_NORMAL').replace('LADDER_','').replace('_',' ')}"
-            + ("   ⛔ new exposure stopped" if s.get("exposure_capped") else ""),
+            f"Buy volume: {s.get('buy_volume', 0):.2f}   "
+            f"Sell volume: {s.get('sell_volume', 0):.2f}",
+            f"Imbalance: {s.get('direction_imbalance', 0):.2f}"
+            f"  ({(s.get('imbalance_state') or 'BALANCED').replace('_',' ')})",
+            f"Zone: {(s.get('depth_zone') or 'LADDER_NORMAL').replace('LADDER_','')}"
+            f"   Health: {(s.get('deep_ladder_state') or 'DEEP_HEALTHY').replace('DEEP_','')}",
+            f"Risk: {s.get('risk_state', 'LOW')} ({s.get('risk_score', 0):.2f})",
+            f"Expansion: {'ALLOWED' if s.get('expansion_allowed', True) else 'PAUSED'}"
+            + (f"\n  ↳ {s.get('expansion_block_reason')}"
+               if not s.get("expansion_allowed") and
+               s.get("expansion_block_reason") else ""),
             f"Ladder depth used: {s.get('ladder_depth_used', 0)}"
             + (f" / {s.get('max_ladder_depth')} max"
                if s.get('max_ladder_depth') else "")

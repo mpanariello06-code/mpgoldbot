@@ -341,9 +341,9 @@ t.check("the remaining pendings are cancelled at the cap",
         not broker.orders(), f"{len(broker.orders())} orders")
 t.check("the open basket is NOT closed by the cap",
         bool(broker.positions()), f"{len(broker.positions())} positions")
-t.check("the cap is logged once",
-        len([e for e in rec.events if e[0] == "LADDER_DEPTH_CAP"]) == 1,
-        str([e[0] for e in rec.events if e[0] == "LADDER_DEPTH_CAP"]))
+t.check("expansion is paused, and logged once",
+        len([e for e in rec.events if e[0] == "LADDER_EXPANSION_PAUSED"]) == 1,
+        str([e[0] for e in rec.events if e[0] == "LADDER_EXPANSION_PAUSED"]))
 t.check("no risk block is raised for depth", "depth" not in engine.block_reason.lower(),
         engine.block_reason)
 for _ in range(5):

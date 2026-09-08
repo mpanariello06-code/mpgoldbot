@@ -162,7 +162,8 @@ t.check("6. placement duration is a real measurement",
         timing["placement_duration_ms"] > 0, str(timing["placement_duration_ms"]))
 
 t.section("7-8. MAX LADDER DEPTH STOPS EXPOSURE, NOT THE BASKET")
-rules = ProfitRules(max_ladder_depth=12, extended_at=0.5, deep_at=0.75,
+rules = ProfitRules(max_ladder_depth=12, extended_depth=6, deep_depth=9,
+                    critical_depth=11,
                     max_imbalance=0.80, imbalance_action="MONITOR")
 for used, want in ((0, LADDER_NORMAL), (5, LADDER_NORMAL),
                    (6, LADDER_EXTENDED), (9, LADDER_DEEP),
@@ -197,9 +198,9 @@ t.check("8. the cycle is still active and managed",
 t.check("8. and the exit engine still gets a decision",
         eng.sequence.decide(eng.profit_rules(settings.snapshot()),
                             has_exposure=True)[0] in ("HOLD", "PROTECT", "EXIT"))
-t.check("8. the cap is logged once",
-        len([e for e in rec.events if e[0] == "LADDER_DEPTH_CAP"]) == 1,
-        str([e[0] for e in rec.events if e[0] == "LADDER_DEPTH_CAP"]))
+t.check("8. expansion is paused, and logged once",
+        len([e for e in rec.events if e[0] == "LADDER_EXPANSION_PAUSED"]) == 1,
+        str([e[0] for e in rec.events if e[0] == "LADDER_EXPANSION_PAUSED"]))
 
 t.section("9. IMBALANCE IS MEASURED ON VOLUME, NOT ORDER COUNT")
 rules = ProfitRules(max_imbalance=0.80, imbalance_action="MONITOR",

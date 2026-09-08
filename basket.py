@@ -43,6 +43,9 @@ STRONG_RECOVERY_PROTECTION = "STRONG_RECOVERY_PROTECTION"
 # enough that the next adverse leg is disproportionate.
 DEEP_LADDER_RISK = "DEEP_LADDER_RISK"
 DIRECTION_IMBALANCE_RISK = "DIRECTION_IMBALANCE_RISK"
+# The emergency case: deep, severely underwater, no recovery, still going the
+# wrong way. Depth alone never gets here - all four have to be true.
+CRITICAL_LADDER_RISK = "CRITICAL_LADDER_RISK"
 # Profit given back from a peak that never reached the protection activation.
 PROFIT_GIVEBACK = "PROFIT_GIVEBACK"
 # Hard risk protection - these override the strategy.
@@ -54,8 +57,8 @@ MANUAL_EXIT = "MANUAL_EXIT"
 
 EXIT_REASONS = (BASKET_PROFIT_TARGET, PROFIT_PROTECTION, RECOVERY_PROFIT,
                 PROFIT_GIVEBACK, STRONG_RECOVERY_PROTECTION, DEEP_LADDER_RISK,
-                DIRECTION_IMBALANCE_RISK, RISK_DRAWDOWN, RISK_TIMEOUT,
-                RISK_SPREAD, EMERGENCY_EXIT, MANUAL_EXIT)
+                CRITICAL_LADDER_RISK, DIRECTION_IMBALANCE_RISK, RISK_DRAWDOWN,
+                RISK_TIMEOUT, RISK_SPREAD, EMERGENCY_EXIT, MANUAL_EXIT)
 
 RISK_REASONS = (RISK_DRAWDOWN, RISK_TIMEOUT, RISK_SPREAD, EMERGENCY_EXIT,
                 MANUAL_EXIT)
@@ -94,8 +97,30 @@ PRICE_STATES = (FAVORABLE, ADVERSE, FLAT_MOVE)
 LADDER_NORMAL = "LADDER_NORMAL"
 LADDER_EXTENDED = "LADDER_EXTENDED"
 LADDER_DEEP = "LADDER_DEEP"
+LADDER_CRITICAL = "LADDER_CRITICAL"
+# retained: the hard ceiling MAX_LADDER_DEPTH, distinct from the zones above
 LADDER_MAX_DEPTH = "LADDER_MAX_DEPTH"
-LADDER_STATES = (LADDER_NORMAL, LADDER_EXTENDED, LADDER_DEEP, LADDER_MAX_DEPTH)
+LADDER_STATES = (LADDER_NORMAL, LADDER_EXTENDED, LADDER_DEEP, LADDER_CRITICAL,
+                 LADDER_MAX_DEPTH)
+
+# ------------------------------------------------------- deep-ladder health
+# A deep ladder is not automatically a bad ladder. These say WHICH KIND of deep
+# a basket is, from its own behaviour rather than from its depth: depth decides
+# how much more exposure may be added, health decides whether to exit.
+DEEP_HEALTHY = "DEEP_HEALTHY"          # deep, but green or barely underwater
+DEEP_RECOVERING = "DEEP_RECOVERING"    # deep, underwater, climbing back well
+DEEP_WEAK = "DEEP_WEAK"                # deep, underwater, climbing back poorly
+DEEP_ADVERSE = "DEEP_ADVERSE"          # deep and still going the wrong way
+DEEP_CRITICAL = "DEEP_CRITICAL"        # deep, severe, no recovery, adverse
+DEEP_LADDER_STATES = (DEEP_HEALTHY, DEEP_RECOVERING, DEEP_WEAK, DEEP_ADVERSE,
+                      DEEP_CRITICAL)
+
+# ---------------------------------------------------------------- risk state
+RISK_LOW = "LOW"
+RISK_MEDIUM = "MEDIUM"
+RISK_HIGH = "HIGH"
+RISK_CRITICAL = "CRITICAL"
+RISK_STATES = (RISK_LOW, RISK_MEDIUM, RISK_HIGH, RISK_CRITICAL)
 
 # ----------------------------------------------------------- exposure balance
 # BUY 6 / SELL 6 and BUY 11 / SELL 1 are the same ladder depth and completely
@@ -156,11 +181,28 @@ class ProfitRules:
     # Seconds of price history the movement window looks at.
     movement_window: float = 20.0   # PRICE_MOVEMENT_WINDOW_SECONDS
     # --- exposure limits ---
-    max_ladder_depth: int = 22          # MAX_LADDER_DEPTH
-    # Fractions of max_ladder_depth at which the ladder is called EXTENDED and
-    # DEEP. Grading only - neither closes anything by itself.
-    extended_at: float = 0.50           # LADDER_EXTENDED_FRACTION
-    deep_at: float = 0.75               # LADDER_DEEP_FRACTION
+    max_ladder_depth: int = 22          # MAX_LADDER_DEPTH (hard ceiling)
+    # ABSOLUTE depths at which the ladder enters each zone. Absolute, not
+    # fractions of the ceiling: "12 levels deep" is a fact about the exposure,
+    # and it should not change meaning because someone raised the ceiling.
+    #
+    # INITIAL TEST DEFAULTS - chosen to be explainable, fitted to nothing.
+    extended_depth: int = 9             # LADDER_EXTENDED_DEPTH
+    deep_depth: int = 12                # LADDER_DEEP_DEPTH
+    critical_depth: int = 16            # LADDER_CRITICAL_DEPTH
+    # --- deep-ladder health (INITIAL TEST DEFAULTS) ---
+    deep_risk_enabled: bool = True      # DEEP_LADDER_RISK_ENABLED
+    # Drawdown from peak, in account currency, that counts as a large hole for
+    # a deep basket.
+    deep_max_drawdown: float = 10.00    # DEEP_LADDER_MAX_DRAWDOWN
+    # Imbalance above which a deep basket is treated as dangerously one-sided.
+    deep_max_imbalance: float = 0.60    # DEEP_LADDER_MAX_IMBALANCE
+    # How long a deep basket may stay underwater without a meaningful recovery
+    # before that itself counts against it, in seconds.
+    deep_recovery_timeout: float = 900.0   # DEEP_LADDER_RECOVERY_TIMEOUT
+    # Adverse price movement, in price units over the movement window, that
+    # counts as "still going the wrong way" rather than noise.
+    deep_adverse_move: float = 0.60     # DEEP_LADDER_ADVERSE_MOVEMENT_THRESHOLD
     # |buy_vol - sell_vol| / gross_vol above which the basket is one-sided
     # enough to stop adding to it. 1.0 = entirely one-sided.
     max_imbalance: float = 0.80         # MAX_DIRECTION_IMBALANCE
@@ -309,6 +351,12 @@ class CycleBasket:
         self.imbalance_state = BALANCED
         self.max_direction_imbalance = 0.0
         self.ladder_state = LADDER_NORMAL
+        self.depth_zone = LADDER_NORMAL
+        self.deep_ladder_state = DEEP_HEALTHY
+        self.risk_score = 0.0
+        self.risk_state = RISK_LOW
+        self.expansion_allowed = True
+        self.expansion_block_reason = ""
         self.exposure_capped = False       # new exposure is being withheld
         self.exposure_cap_reason = ""
 
@@ -504,14 +552,20 @@ class CycleBasket:
         """
         used = self.ladder_depth_used
         cap = max(0, int(rules.max_ladder_depth))
+        # Absolute zones. The hard ceiling is checked first because it is a
+        # risk control, not a zone - it is the one place depth alone still
+        # stops expansion outright.
         if cap and used >= cap:
             self.ladder_state = LADDER_MAX_DEPTH
-        elif cap and used >= cap * rules.deep_at:
+        elif rules.critical_depth and used >= rules.critical_depth:
+            self.ladder_state = LADDER_CRITICAL
+        elif rules.deep_depth and used >= rules.deep_depth:
             self.ladder_state = LADDER_DEEP
-        elif cap and used >= cap * rules.extended_at:
+        elif rules.extended_depth and used >= rules.extended_depth:
             self.ladder_state = LADDER_EXTENDED
         else:
             self.ladder_state = LADDER_NORMAL
+        self.depth_zone = self.ladder_state
 
         imbalance = self.direction_imbalance
         graded = self.position_count >= max(1, int(rules.imbalance_min_positions))
@@ -525,17 +579,135 @@ class CycleBasket:
         else:
             self.imbalance_state = BALANCED
 
-        # why new exposure is being withheld, if it is
+        self._grade_deep_health(rules)
+        self._decide_expansion(rules)
+        return self.ladder_state, self.imbalance_state
+
+    # ------------------------------------------------- deep-ladder health
+    def _grade_deep_health(self, rules):
+        """
+        WHICH KIND of deep this basket is, and how risky that is.
+
+        A deep ladder is not automatically a bad ladder - we have watched deep
+        baskets recover. So depth alone decides nothing here; it only decides
+        that these questions are worth asking. The answers come from the
+        basket's own behaviour: how far under it is, how one-sided, whether it
+        is climbing back, and whether price is still going the wrong way.
+        """
+        deep = self.ladder_state in (LADDER_DEEP, LADDER_CRITICAL,
+                                     LADDER_MAX_DEPTH)
+        pnl = self.floating_pnl
+        drawdown = self.drawdown
+        adverse = (self.price_state == ADVERSE and
+                   abs(self.recent_price_change) >= rules.deep_adverse_move)
+        stale = (self.time_underwater >= rules.deep_recovery_timeout and
+                 self.recovery_quality in (NO_RECOVERY, WEAK_RECOVERY))
+        one_sided = self.direction_imbalance >= rules.deep_max_imbalance
+        big_hole = drawdown >= rules.deep_max_drawdown
+
+        # --- the health reading -------------------------------------------
+        if not deep:
+            state = DEEP_HEALTHY
+        elif pnl >= 0 or self.recovery_quality == STRONG_RECOVERY:
+            # green, or fighting its way back convincingly
+            state = DEEP_RECOVERING if pnl < 0 else DEEP_HEALTHY
+        elif self.recovery_quality == RECOVERING_QUALITY and not adverse:
+            state = DEEP_RECOVERING
+        elif (self.ladder_state in (LADDER_CRITICAL, LADDER_MAX_DEPTH) and
+              big_hole and adverse and
+              self.recovery_quality in (NO_RECOVERY, WEAK_RECOVERY)):
+            # every one of these has to be true - this is the emergency case
+            state = DEEP_CRITICAL
+        elif adverse or stale:
+            state = DEEP_ADVERSE
+        else:
+            state = DEEP_WEAK
+        self.deep_ladder_state = state
+
+        # --- a score, so the reading is auditable rather than a vibe -------
+        # Each term is 0..1 and contributes its own weight. They are summed,
+        # not multiplied, so no single term can silently dominate, and the
+        # weights are visible here rather than scattered through branches.
+        depth_term = 0.0
+        if rules.critical_depth > 0:
+            depth_term = min(1.0, self.ladder_depth_used / rules.critical_depth)
+        dd_term = (min(1.0, drawdown / rules.deep_max_drawdown)
+                   if rules.deep_max_drawdown > 0 else 0.0)
+        imb_term = (min(1.0, self.direction_imbalance / rules.deep_max_imbalance)
+                    if rules.deep_max_imbalance > 0 else 0.0)
+        move_term = 1.0 if adverse else (0.5 if self.price_state == FLAT_MOVE
+                                         else 0.0)
+        recovery_term = {STRONG_RECOVERY: 0.0, RECOVERING_QUALITY: 0.25,
+                         WEAK_RECOVERY: 0.75, NO_RECOVERY: 1.0}.get(
+                             self.recovery_quality, 1.0)
+        if pnl >= 0:
+            recovery_term = 0.0        # nothing to recover from
+        self.risk_score = round(
+            0.30 * depth_term + 0.25 * dd_term + 0.15 * imb_term +
+            0.15 * move_term + 0.15 * recovery_term, 4)
+
+        if self.deep_ladder_state == DEEP_CRITICAL:
+            self.risk_state = RISK_CRITICAL
+        elif self.risk_score >= 0.70:
+            self.risk_state = RISK_HIGH
+        elif self.risk_score >= 0.45:
+            self.risk_state = RISK_MEDIUM
+        else:
+            self.risk_state = RISK_LOW
+        return self.deep_ladder_state
+
+    # ------------------------------------------------- expansion control
+    def _decide_expansion(self, rules):
+        """
+        May the ladder add MORE exposure right now?
+
+        This is the only place that question is answered. It never closes
+        anything: a basket whose expansion is blocked keeps every position it
+        has and stays under the exit engine exactly as before.
+
+        The zones:
+            NORMAL / EXTENDED  - expand freely
+            DEEP               - expand only while the basket looks healthy
+            CRITICAL           - expand only on a clear recovery
+            MAX_LADDER_DEPTH   - the hard ceiling, never expand
+        """
         reasons = []
-        if self.ladder_state == LADDER_MAX_DEPTH:
-            reasons.append(f"ladder depth {used}/{cap}")
+        zone = self.ladder_state
+        healthy = self.deep_ladder_state in (DEEP_HEALTHY, DEEP_RECOVERING)
+
+        if zone == LADDER_MAX_DEPTH:
+            reasons.append(
+                f"ladder depth {self.ladder_depth_used}/"
+                f"{rules.max_ladder_depth} (hard ceiling)")
+        elif zone == LADDER_CRITICAL and rules.deep_risk_enabled:
+            # At critical depth the bar is a genuine recovery, not merely the
+            # absence of bad news.
+            if self.recovery_quality != STRONG_RECOVERY and \
+                    self.floating_pnl < 0:
+                reasons.append(
+                    f"depth {self.ladder_depth_used} is CRITICAL and the "
+                    f"basket is not recovering strongly "
+                    f"({self.recovery_quality})")
+        elif zone == LADDER_DEEP and rules.deep_risk_enabled:
+            if not healthy:
+                reasons.append(
+                    f"depth {self.ladder_depth_used} is DEEP and the basket "
+                    f"is {self.deep_ladder_state} "
+                    f"(drawdown {self.drawdown:.2f}, imbalance "
+                    f"{self.direction_imbalance:.2f}, {self.price_state})")
+
+        # imbalance is its own control and applies at any depth
         if self.imbalance_state == EXTREMELY_IMBALANCED and \
                 rules.imbalance_action == IMBALANCE_STOP_NEW:
-            reasons.append(f"direction imbalance {imbalance:.2f} "
+            reasons.append(f"direction imbalance {self.direction_imbalance:.2f} "
                            f">= {rules.max_imbalance:.2f}")
+
+        self.expansion_block_reason = "; ".join(reasons)
+        self.expansion_allowed = not reasons
+        # kept as the existing name the engine already reads
         self.exposure_capped = bool(reasons)
-        self.exposure_cap_reason = "; ".join(reasons)
-        return self.ladder_state, self.imbalance_state
+        self.exposure_cap_reason = self.expansion_block_reason
+        return self.expansion_allowed
 
     @property
     def price_vs_anchor(self):
@@ -738,21 +910,40 @@ class CycleBasket:
                 f"{self.lowest_pnl:+.2f} and price has turned against the "
                 f"basket at {pnl:+.2f} - protecting the recovery")
 
-        # --- 2c. exposure risk, independent of P/L ---------------------------
-        # A capped or one-sided basket cannot be made safer by adding to it
-        # (that would be martingale), so the only lever left is to take it when
-        # it is green and the move has turned.
-        if pnl > 0 and self.price_state == ADVERSE:
-            if self.ladder_state == LADDER_MAX_DEPTH:
+        # --- 2c. the deep ladder ---------------------------------------------
+        # DEPTH NEVER CLOSES A BASKET. A deep ladder is not a bad ladder - deep
+        # baskets recover, and force-closing one because it is deep destroys
+        # exactly the winners we have watched come back. Depth decides how much
+        # MORE exposure may be added (that is _decide_expansion); HEALTH decides
+        # whether to exit, and that is what these branches read.
+        if rules.deep_risk_enabled:
+            # The emergency: deep AND severely underwater AND not recovering
+            # AND still going the wrong way. All four, or this does not fire.
+            if self.deep_ladder_state == DEEP_CRITICAL:
+                return EXIT, CRITICAL_LADDER_RISK, (
+                    f"depth {self.ladder_depth_used} at {pnl:+.2f}, "
+                    f"{self.drawdown:.2f} off a {peak:+.2f} peak, "
+                    f"{self.recovery_quality} and price still adverse "
+                    f"(risk {self.risk_score:.2f}) - recovery has stopped "
+                    f"looking likely")
+            # A deep basket that is GREEN and turning is taken rather than
+            # carried further: its exposure cannot be reduced by adding to it.
+            if pnl > 0 and self.price_state == ADVERSE and \
+                    self.deep_ladder_state in (DEEP_WEAK, DEEP_ADVERSE):
                 return EXIT, DEEP_LADDER_RISK, (
-                    f"ladder at maximum depth ({self.ladder_depth_used}) with "
-                    f"{pnl:+.2f} on the table and price turning - taking it "
-                    f"rather than carrying capped exposure further")
-            if self.imbalance_state == EXTREMELY_IMBALANCED:
-                return EXIT, DIRECTION_IMBALANCE_RISK, (
-                    f"basket is {self.direction_imbalance:.0%} one-sided "
-                    f"({self.net_direction or 'flat'}) at {pnl:+.2f} with price "
-                    f"turning - the next adverse leg is disproportionate")
+                    f"depth {self.ladder_depth_used} is {self.ladder_state} "
+                    f"and {self.deep_ladder_state} with {pnl:+.2f} on the "
+                    f"table and price turning - taking it rather than "
+                    f"carrying deep exposure further")
+
+        # A dangerously one-sided basket that is green and turning, at any
+        # depth. Adding the other side to balance it would be martingale.
+        if pnl > 0 and self.price_state == ADVERSE and \
+                self.imbalance_state == EXTREMELY_IMBALANCED:
+            return EXIT, DIRECTION_IMBALANCE_RISK, (
+                f"basket is {self.direction_imbalance:.0%} one-sided "
+                f"({self.net_direction or 'flat'}) at {pnl:+.2f} with price "
+                f"turning - the next adverse leg is disproportionate")
 
         # --- 3. a RECOVERED basket is taken early ----------------------------
         # It has already demonstrated it can go against us by the depth it fell
@@ -901,6 +1092,12 @@ class CycleBasket:
             "imbalance_state": self.imbalance_state,
             "max_direction_imbalance": round(self.max_direction_imbalance, 4),
             "ladder_state": self.ladder_state,
+            "depth_zone": self.depth_zone,
+            "deep_ladder_state": self.deep_ladder_state,
+            "risk_score": self.risk_score,
+            "risk_state": self.risk_state,
+            "expansion_allowed": self.expansion_allowed,
+            "expansion_block_reason": self.expansion_block_reason,
             "exposure_capped": self.exposure_capped,
             "exposure_cap_reason": self.exposure_cap_reason,
             "position_count": self.position_count,

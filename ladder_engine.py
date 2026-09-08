@@ -734,8 +734,14 @@ class RollingLadderEngine:
             giveback_fraction=float(snap["profit_giveback_fraction"]),
             movement_window=float(snap["price_movement_window"]),
             max_ladder_depth=int(snap["max_ladder_depth"]),
-            extended_at=float(snap["ladder_extended_fraction"]),
-            deep_at=float(snap["ladder_deep_fraction"]),
+            extended_depth=int(snap["ladder_extended_depth"]),
+            deep_depth=int(snap["ladder_deep_depth"]),
+            critical_depth=int(snap["ladder_critical_depth"]),
+            deep_risk_enabled=bool(snap["deep_ladder_risk_enabled"]),
+            deep_max_drawdown=float(snap["deep_ladder_max_drawdown"]),
+            deep_max_imbalance=float(snap["deep_ladder_max_imbalance"]),
+            deep_recovery_timeout=float(snap["deep_ladder_recovery_timeout"]),
+            deep_adverse_move=float(snap["deep_ladder_adverse_movement"]),
             max_imbalance=float(snap["max_direction_imbalance"]),
             imbalance_action=str(snap["imbalance_action"]),
             imbalance_min_positions=int(snap["imbalance_min_positions"]),
@@ -1670,19 +1676,34 @@ class RollingLadderEngine:
         # engine exactly as before.
         max_depth = int(snap["max_ladder_depth"])
         used = self.sequence.ladder_depth_used if self.sequence else 0
-        depth_capped = bool(self.sequence and self.sequence.exposure_capped)
+        # ONE question, answered in ONE place (CycleBasket._decide_expansion):
+        # may this ladder add more exposure right now? Blocking expansion never
+        # closes the basket - every open position stays, and the exit engine
+        # goes on managing it exactly as before.
+        depth_capped = bool(self.sequence and not self.sequence.expansion_allowed)
         if depth_capped and not self._depth_capped_logged:
             self._depth_capped_logged = True
-            self._event("LADDER_DEPTH_CAP",
-                        f"{self.sequence.exposure_cap_reason} - cancelling the "
-                        f"remaining {len(orders)} pending levels; no further "
-                        f"exposure this cycle, the basket carries on "
+            self._event("LADDER_EXPANSION_PAUSED",
+                        f"{self.sequence.expansion_block_reason} - cancelling "
+                        f"the remaining {len(orders)} pending levels. The "
+                        f"OPEN basket is untouched and still managed "
                         f"[{self.sequence.ladder_state}/"
-                        f"{self.sequence.imbalance_state}]",
-                        cycle_id=self.cycle.cycle_id, status="CAPPED")
+                        f"{self.sequence.deep_ladder_state}/"
+                        f"risk {self.sequence.risk_state}]",
+                        cycle_id=self.cycle.cycle_id, status="PAUSED")
+        elif not depth_capped and self._depth_capped_logged:
+            # health recovered: expansion is allowed again, and that is worth
+            # one line in the log rather than silently resuming
+            self._depth_capped_logged = False
+            self._event("LADDER_EXPANSION_RESUMED",
+                        f"expansion allowed again "
+                        f"[{self.sequence.ladder_state}/"
+                        f"{self.sequence.deep_ladder_state}/"
+                        f"risk {self.sequence.risk_state}]",
+                        cycle_id=self.cycle.cycle_id, status="OK")
         if depth_capped and orders:
-            self._cancel_all(orders,
-                             f"exposure cap: {self.sequence.exposure_cap_reason}")
+            self._cancel_all(
+                orders, f"expansion paused: {self.sequence.expansion_block_reason}")
             return 0
         room_orders = 0 if depth_capped else \
             int(snap["max_pending_orders"]) - len(seen)
@@ -1982,6 +2003,15 @@ class RollingLadderEngine:
             "imbalance_state": seq.imbalance_state,
             "max_ladder_depth": int(snap["max_ladder_depth"]),
             "ladder_state": seq.ladder_state,
+            "depth_zone": seq.depth_zone,
+            "deep_ladder_state": seq.deep_ladder_state,
+            "risk_score": seq.risk_score,
+            "risk_state": seq.risk_state,
+            "expansion_allowed": seq.expansion_allowed,
+            "expansion_block_reason": seq.expansion_block_reason,
+            "buy_volume": seq.buy_volume,
+            "sell_volume": seq.sell_volume,
+            "max_floating_loss": round(seq.max_floating_loss, 2),
             "exposure_capped": seq.exposure_capped,
             "recovery_quality": seq.recovery_quality,
             "recovery_start_pnl": ("" if seq.recovery_start_pnl is None
@@ -2071,6 +2101,18 @@ class RollingLadderEngine:
                                  if self.sequence else "NO_RECOVERY"),
             "ladder_state": (self.sequence.ladder_state if self.sequence
                              else "LADDER_NORMAL"),
+            "depth_zone": (self.sequence.depth_zone if self.sequence
+                           else "LADDER_NORMAL"),
+            "deep_ladder_state": (self.sequence.deep_ladder_state
+                                  if self.sequence else "DEEP_HEALTHY"),
+            "risk_score": (self.sequence.risk_score if self.sequence else 0.0),
+            "risk_state": (self.sequence.risk_state if self.sequence else "LOW"),
+            "expansion_allowed": (self.sequence.expansion_allowed
+                                  if self.sequence else True),
+            "expansion_block_reason": (self.sequence.expansion_block_reason
+                                       if self.sequence else ""),
+            "buy_volume": (self.sequence.buy_volume if self.sequence else 0.0),
+            "sell_volume": (self.sequence.sell_volume if self.sequence else 0.0),
             "imbalance_state": (self.sequence.imbalance_state if self.sequence
                                 else "BALANCED"),
             "direction_imbalance": (self.sequence.direction_imbalance

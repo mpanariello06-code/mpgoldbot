@@ -98,7 +98,12 @@ class FakeEngine:
             "previous_side": "BUY", "direction_changes": 1,
             "ladder_depth_used": 5, "basket_drawdown": 0.42,
             "max_ladder_depth": 22, "depth_capped": False,
-            "ladder_state": "LADDER_NORMAL", "imbalance_state": "BALANCED",
+            "ladder_state": "LADDER_DEEP", "imbalance_state": "BUY_HEAVY",
+            "depth_zone": "LADDER_DEEP", "deep_ladder_state": "DEEP_WEAK",
+            "risk_score": 0.62, "risk_state": "HIGH",
+            "expansion_allowed": False,
+            "expansion_block_reason": "depth 13 is DEEP and the basket is DEEP_WEAK",
+            "buy_volume": 0.06, "sell_volume": 0.03,
             "direction_imbalance": 0.0, "net_direction": "BUY",
             "gross_volume": 0.05, "exposure_capped": False,
             "recovery_quality": "NO_RECOVERY",
@@ -226,6 +231,9 @@ async def run():
                   "Open SELL: 5", "THIS CYCLE SO FAR",
                   "Historical BUY triggers: 2", "Historical SELL triggers: 5",
                   "Direction changes: 1", "Ladder depth used: 5",
+                  "Buy volume: 0.06", "Sell volume: 0.03", "Imbalance: 0.00",
+                  "Zone: DEEP", "Health: WEAK", "Risk: HIGH (0.62)",
+                  "Expansion: PAUSED",
                   "ENTRY", "Timeframe: M1", "Last candle evaluated:",
                   "Waiting for entry: no", "Ladder depth used: 5 / 22 max",
                   "BASKET", "Current P/L", "Peak P/L: $10.21",
@@ -240,12 +248,24 @@ async def run():
     t.check("current orders are not confused with historical triggers",
             text.index("Pending BUY: 5") < text.index("Historical BUY triggers: 2"))
     t.check("cycle age is shown", "Age: 10 min" in text)
-    t.check("no scoring or scenario language is left on the screen",
+    # The deleted scenario engine had a scored "imbalance" of its own. Direction
+    # imbalance is a different, legitimate measurement (buy volume vs sell
+    # volume), so the guard names the scenario vocabulary rather than banning a
+    # word we now use for something real.
+    t.check("no scenario-engine language is left on the screen",
             not any(w in text.lower() for w in
                     ("exit score", "reversal", "exhaustion", "momentum",
-                     "scenario", "imbalance")),
+                     "scenario", "directional ratio")),
+            text.replace("\n", " | ")[:240])
+    t.check("and no scoring language dressed up as a scenario score",
+            "exit score" not in text.lower() and "score:" not in text.lower(),
             text.replace("\n", " | ")[:240])
     t.check("status never leaks the token", "TESTTOKEN" not in text)
+
+    t.check("a paused expansion says why", 
+            "depth 13 is DEEP" in text, text.replace("\n", " | ")[:200])
+    t.check("depth is reported as a zone, not just a number",
+            "Zone: DEEP" in text and "Health: WEAK" in text)
 
     t.section("STATUS REPORTS THE ENTRY GATE")
     engine.state_overrides = {"waiting_for_entry": True, "cycle_active": False,
