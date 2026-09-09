@@ -20,6 +20,8 @@ ROLL_MODES = ("extend", "static")
 DIRECTION_MODES = ("off", "both", "buy_bias", "sell_bias", "none")
 TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1")
 IMBALANCE_ACTIONS = ("MONITOR", "STOP_NEW_EXPOSURE")
+ENTRY_MODES = ("FULL_LADDER", "SINGLE_PAIR")
+ENTRY_MODE_LABELS = {"FULL_LADDER": "FULL LADDER", "SINGLE_PAIR": "SINGLE PAIR"}
 
 # Bumped when a change to the DEFAULTS has to reach existing installations.
 # 2 = basket architecture, no individual TP.
@@ -87,6 +89,7 @@ VALIDATORS = {
     "ladder_depth":        (lambda v: _num(v, int, "Ladder depth", 1, 50), "Depth", True),
     "first_level_offset":  (lambda v: _num(v, float, "First level offset", 0.0, 1000.0), "First Level Offset", False),
     "roll_mode":           (lambda v: _choice(v, ROLL_MODES, "Roll mode"), "Roll Mode", True),
+    "entry_mode":          (lambda v: _upper_choice(v, ENTRY_MODES, "Entry mode"), "Entry Mode", True),
     "rearm_levels":        (lambda v: _flag(v, "Re-arm levels"), "Re-arm Levels", False),
     # --- take profit ---
     "stop_loss_distance":  (lambda v: _num(v, float, "Stop loss distance", 0.0, 10000.0), "Stop Loss", True),

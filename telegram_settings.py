@@ -27,6 +27,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from runtime_settings import (
     DIRECTION_LABELS,
+    ENTRY_MODE_LABELS,
     ROLL_MODE_LABELS,
     RuntimeSettings,
     SettingError,
@@ -58,6 +59,7 @@ class SettingsPanel:
         "lot_size": "lot", "max_lot_size": "maxlot",
         "ladder_spacing": "spacing", "ladder_depth": "depth",
         "first_level_offset": "offset", "roll_mode": "roll",
+        "entry_mode": "entrymode",
         "rearm_levels": "roll", "m5_candle_reset": "roll",
         "cycle_close_positions": "cycle",
         "max_open_positions": "open", "max_pending_orders": "pending",
@@ -295,6 +297,7 @@ class SettingsPanel:
             f"🪜 Depth: {s['ladder_depth']} levels per side",
             f"🪜 First level: {self._d('first_level_offset')}",
             f"🪜 Roll mode: {ROLL_MODE_LABELS[s['roll_mode']]}",
+            f"🎚 Entry mode: {ENTRY_MODE_LABELS[s['entry_mode']]}",
             "",
             f"💰 Lot: {s['lot_size']} (max {s['max_lot_size']})",
             f"🔁 Close on cycle end: {'ON' if s['cycle_close_positions'] else 'OFF'}",
@@ -442,7 +445,8 @@ class SettingsPanel:
             [_btn("📏 SPACING", "settings_spacing"), _btn("🔢 DEPTH", "settings_depth")],
             [_btn("🔁 PROFIT CYCLE", "settings_cycle"),
              _btn("↔️ FIRST LEVEL", "settings_offset")],
-            [_btn("🔄 ROLL MODE", "settings_roll")],
+            [_btn("🔄 ROLL MODE", "settings_roll"),
+             _btn("🎚 ENTRY MODE", "settings_entrymode")],
             [_btn(BACK, "settings")],
         )
 
@@ -487,6 +491,28 @@ class SettingsPanel:
                     f"apply:first_level_offset:{v:g}") for v in opts]
         return text, _rows(row, [_btn("✏️ CUSTOM", "custom:first_level_offset")],
                            [_btn(BACK, "settings_ladder")])
+
+    def _menu_entrymode(self):
+        s = self.settings.snapshot()
+        mode = s["entry_mode"]
+        text = "\n".join([
+            "🎚 <b>ENTRY MODE</b>", "",
+            f"Current: {ENTRY_MODE_LABELS.get(mode, mode)}", "",
+            "FULL LADDER places every level at once - "
+            f"{s['ladder_depth']} per side, {s['ladder_depth'] * 2} orders.",
+            "",
+            "SINGLE PAIR places ONE buy stop and ONE sell stop. When a level",
+            "triggers, the next level on that side goes out immediately, so",
+            "there is never more than one pending order per side.",
+            "",
+            "Both use the same reference price, the same spacing, the same",
+            "exit engine, the same risk controls and the same lot size. The",
+            "only difference is how many levels are pending at once.",
+        ])
+        row = [_btn(f"{self._mark(mode == m)}{ENTRY_MODE_LABELS[m]}",
+                    f"confirm:entry_mode:{m}")
+               for m in ("FULL_LADDER", "SINGLE_PAIR")]
+        return text, _rows(row, [_btn(BACK, "settings_ladder")])
 
     def _menu_roll(self):
         s = self.settings.snapshot()

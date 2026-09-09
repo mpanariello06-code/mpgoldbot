@@ -104,6 +104,7 @@ class FakeEngine:
             "expansion_allowed": False,
             "expansion_block_reason": "depth 13 is DEEP and the basket is DEEP_WEAK",
             "buy_volume": 0.06, "sell_volume": 0.03,
+            "entry_mode": "SINGLE_PAIR", "replacements": 7,
             "direction_imbalance": 0.0, "net_direction": "BUY",
             "gross_volume": 0.05, "exposure_capped": False,
             "recovery_quality": "NO_RECOVERY",
@@ -231,6 +232,7 @@ async def run():
                   "Open SELL: 5", "THIS CYCLE SO FAR",
                   "Historical BUY triggers: 2", "Historical SELL triggers: 5",
                   "Direction changes: 1", "Ladder depth used: 5",
+                  "Entry mode: SINGLE PAIR", "(7 replacements)",
                   "Buy volume: 0.06", "Sell volume: 0.03", "Imbalance: 0.00",
                   "Zone: DEEP", "Health: WEAK", "Risk: HIGH (0.62)",
                   "Expansion: PAUSED",
@@ -327,6 +329,7 @@ async def run():
              "settings_spread", "settings_daily", "settings_cycleloss",
              "settings_streak", "settings_cooldown", "settings_age",
              "settings_reentry", "settings_entry", "settings_exposure",
+             "settings_entrymode",
              "settings_direction"]
     seen = set()
     for m in menus:
@@ -393,6 +396,8 @@ async def run():
                           ("confirm:ladder_depth:8", "ladder_depth", 8),
                           ("confirm:max_open_positions:2", "max_open_positions", 2),
                           ("confirm:entry_timeframe:M5", "entry_timeframe", "M5"),
+                          ("confirm:entry_mode:SINGLE_PAIR", "entry_mode",
+                           "SINGLE_PAIR"),
                           ("confirm:direction_filter:buy_bias", "direction_filter",
                            "buy_bias")]:
         before = S.get(key)

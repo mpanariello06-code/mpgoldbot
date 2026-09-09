@@ -147,6 +147,17 @@ FIRST_LEVEL_OFFSET = _get_float("FIRST_LEVEL_OFFSET", 0.0)
 # extend: the window rolls forward and consumed levels are replaced, so a live
 # ladder keeps placing new orders. That is not one fixed ladder per cycle.
 ROLL_MODE = _get_str("ROLL_MODE", "static").lower()
+
+# How a cycle's ladder is laid out.
+#   FULL_LADDER - the shipped behaviour: LADDER_DEPTH levels per side placed
+#                 once when the cycle starts.
+#   SINGLE_PAIR - ONE BUY STOP and ONE SELL STOP only. When a level triggers,
+#                 the NEXT level on that side is placed immediately, so there
+#                 is never more than one pending order per side.
+# Both use the same reference price, the same 0.30 geometry, the same exit
+# engine, the same risk controls and the same lot sizing. The only difference
+# is how many levels are pending at once.
+ENTRY_MODE = _get_str("ENTRY_MODE", "FULL_LADDER").upper()
 # Re-arm a level whose position closed. Off: a consumed level stays consumed
 # for the life of the ladder.
 REARM_LEVELS = _get_bool("REARM_LEVELS", False)
@@ -380,6 +391,7 @@ def runtime_defaults():
         "ladder_depth": LADDER_DEPTH,
         "first_level_offset": FIRST_LEVEL_OFFSET,
         "roll_mode": ROLL_MODE,
+        "entry_mode": ENTRY_MODE,
         "rearm_levels": REARM_LEVELS,
         # take profit
         "basket_profit_target": BASKET_PROFIT_TARGET,
@@ -516,6 +528,9 @@ def validate():
             f"{LADDER_DEPTH}+{LADDER_DEPTH} ladder per cycle")
     if POLL_SECONDS <= 0:
         errors.append("POLL_SECONDS must be greater than 0")
+    if ENTRY_MODE not in ("FULL_LADDER", "SINGLE_PAIR"):
+        errors.append(f"ENTRY_MODE must be FULL_LADDER or SINGLE_PAIR, "
+                      f"got {ENTRY_MODE!r}")
     if IMBALANCE_ACTION not in ("MONITOR", "STOP_NEW_EXPOSURE"):
         errors.append(
             f"IMBALANCE_ACTION must be MONITOR or STOP_NEW_EXPOSURE, "

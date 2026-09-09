@@ -968,6 +968,12 @@ class LadderBot:
             risk_state=seq.get("risk_state", ""),
             expansion_allowed=seq.get("expansion_allowed", ""),
             expansion_block_reason=seq.get("expansion_block_reason", ""),
+            entry_mode=self.settings.get("entry_mode"),
+            replacements=(self.engine.replacements if self.engine else ""),
+            initial_pending_buy_count=(self.engine.initial_pending_buys
+                                       if self.engine else ""),
+            initial_pending_sell_count=(self.engine.initial_pending_sells
+                                        if self.engine else ""),
             maximum_direction_imbalance=seq.get("max_direction_imbalance", ""),
             direction_imbalance=seq.get("direction_imbalance", ""),
             imbalance_state=seq.get("imbalance_state", ""),

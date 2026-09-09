@@ -305,6 +305,9 @@ class TelegramController:
                f"{s.get('reentry_wait_seconds', 0):.0f}s.", ""]
               if s.get("in_reentry_cooldown") else []),
             f"<b>LADDER #{s.get('cycle_id', 0)}</b>",
+            f"Entry mode: {(s.get('entry_mode') or 'FULL_LADDER').replace('_', ' ')}"
+            + (f"   ({s.get('replacements', 0)} replacements)"
+               if s.get("entry_mode") == "SINGLE_PAIR" else ""),
             f"Status: {s.get('ladder_status', 'CLOSED')}"
             + (f"   (cooldown {s.get('cooldown_left', 0):.1f}s)"
                if s.get("ladder_status") == "COOLDOWN" else ""),

@@ -283,6 +283,49 @@ Every placement records `reference_price`, intended vs actual first buy/sell,
 attribute a leaning ladder to market movement, spread, broker constraints or
 our own arithmetic instead of guessing.
 
+## Entry mode
+
+`ENTRY_MODE` chooses how many levels are pending at once. Everything else —
+reference price, 0.30 geometry, exit engine, risk controls, lot size — is
+shared.
+
+| | `FULL_LADDER` (default) | `SINGLE_PAIR` |
+|---|---|---|
+| initial orders | `LADDER_DEPTH` per side (11 + 11 = 22) | **1 BUY + 1 SELL** |
+| on a trigger | nothing; the ladder was placed once | the next level on **that side** goes out immediately |
+| pending per side | up to `LADDER_DEPTH` | never more than 1 |
+
+```
+reference R = 4422.00
+     BUY STOP 4422.30      SELL STOP 4421.70
+BUY triggers  ->  BUY STOP 4422.60   (SELL untouched)
+BUY triggers  ->  BUY STOP 4422.90   (SELL untouched)
+SELL triggers ->  SELL STOP 4421.40  (BUY untouched)
+```
+
+Every level is `R ± N × 0.30` from the **one immutable cycle reference** —
+never from the current price. If price gaps *past* the next level the side
+**waits** (`REPLACEMENT_DEFERRED`) rather than chasing the market to a legal
+price, and goes out when price returns.
+
+**Replacement runs on the exit-monitor thread**, straight after the exit
+decision says "no exit", reusing the `positions` read that decision already
+made. It costs **zero extra MT5 calls when idle** and two on a trigger
+(`orders_get` for the dedupe, then `order_send`). Measured: **1.68 ms**
+trigger → replacement request, 3.32 ms → confirmed.
+
+It waits for nothing: not an M1 candle, not the ladder pass, not Telegram, not
+CSV. M1 gating still applies **only** to starting a new cycle.
+
+The exit and the deep-ladder risk engine both outrank it. A replacement is not
+placed while `EXITING`, and not placed when `expansion_allowed` is false —
+that is the *same* permission the full ladder reads, so `SINGLE_PAIR` gets no
+risk rules of its own. A withheld level is remembered and goes out if the risk
+engine allows expansion again.
+
+Ladder depth is the furthest level actually **triggered**, identical to
+`FULL_LADDER`. Placing a replacement never touches the trigger counters.
+
 ## Exposure limits
 
 Depth alone cannot tell BUY 6 / SELL 6 from BUY 11 / SELL 1. Both are tracked:

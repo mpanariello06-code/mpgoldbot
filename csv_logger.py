@@ -119,6 +119,8 @@ CYCLE_HEADER = [
     # --- exposure and recovery, as the cycle ended -------------------------
     "max_ladder_depth", "ladder_state", "depth_zone", "deep_ladder_state",
     "risk_score", "risk_state", "expansion_allowed", "expansion_block_reason",
+    "entry_mode", "replacements", "initial_pending_buy_count",
+    "initial_pending_sell_count",
     "maximum_direction_imbalance",
     "direction_imbalance", "imbalance_state", "net_direction",
     "gross_volume", "net_volume",
@@ -157,6 +159,13 @@ TELEMETRY_HEADER = [
     "depth_zone", "deep_ladder_state", "risk_score", "risk_state",
     "expansion_allowed", "expansion_block_reason",
     "buy_volume", "sell_volume", "max_floating_loss",
+    # --- SINGLE_PAIR: one pending per side, replaced as levels trigger ------
+    "entry_mode", "initial_pending_buy_count", "initial_pending_sell_count",
+    "current_pending_buy_count", "current_pending_sell_count", "replacements",
+    "trigger_detected_at", "replacement_calculation_at",
+    "replacement_request_sent_at", "replacement_confirmed_at",
+    "trigger_to_replacement_request_ms",
+    "trigger_to_replacement_confirmed_ms",
     # --- how well a basket that was underwater is climbing back -----------
     "recovery_quality", "recovery_start_pnl", "recovery_duration",
     "ladder_depth_at_recovery_start",

@@ -229,6 +229,12 @@ class RollingLadderEngine:
         self.exit_timing = {}
         # How long the ladder took to go out (PHASE 18).
         self.ladder_timing = {}
+        # SINGLE_PAIR: how fast the last triggered level was replaced.
+        self.replacement_timing = {}
+        self.replacements = 0
+        self.initial_pending_buys = 0
+        self.initial_pending_sells = 0
+        self._replacement_deferred = False
 
     # =================================================================== utils
     def _today(self):
@@ -487,6 +493,11 @@ class RollingLadderEngine:
         self._last_telemetry = 0.0
         self.ladder_timing = {}
         self.exit_timing = {}
+        self.replacement_timing = {}
+        self.replacements = 0
+        self.initial_pending_buys = 0
+        self.initial_pending_sells = 0
+        self._replacement_deferred = False
         self.cycle_active = True
         self.reentry_until = 0.0
         self._cycle_announced = False
@@ -604,7 +615,19 @@ class RollingLadderEngine:
                 nxt += direction
             return indexes
 
-        if snap["roll_mode"] == "static":
+        if snap.get("entry_mode") == "SINGLE_PAIR":
+            # ONE pending per side. The next level on a side is the one after
+            # the furthest level that side has already consumed, so the
+            # sequence is +1, +2, +3 ... measured from the SAME immutable
+            # cycle reference as FULL_LADDER - never from the current price.
+            #
+            # Everything downstream is shared with FULL_LADDER: _reconcile
+            # places what is missing and cancels what should not be there, the
+            # expansion gate and the exit latch are checked there, and the lot
+            # size comes from the same setting.
+            buy_indexes = [self._next_single_index(BUY)]
+            sell_indexes = [self._next_single_index(SELL)]
+        elif snap["roll_mode"] == "static":
             # the cycle's grid is fixed: pin the window once and let price
             # consume it. It is pinned to the INTENDED first level either side
             # of the reference price, so the ladder is exactly
@@ -646,6 +669,20 @@ class RollingLadderEngine:
     # order and position the ladder creates carries `RL<cycle><B|S><index>` in
     # its comment, and the broker adapters already filter by magic and symbol,
     # so a basket is identified by (symbol, magic, cycle_id).
+    def _next_single_index(self, side):
+        """
+        The next SINGLE_PAIR level index for one side.
+
+        Counts from the levels this cycle has already CONSUMED, not from the
+        market and not from the pending orders: a level that triggered is
+        history, and history is what decides where the next one goes. Buys run
+        +1, +2, +3...; sells mirror them at -1, -2, -3...
+        """
+        step = 1 if side == BUY else -1
+        used = [abs(index) for done_side, index in self._levels_done
+                if done_side == side]
+        return step * ((max(used) if used else 0) + 1)
+
     def _mine(self, item, cycle_id):
         """
         Does this order/position belong to the given cycle?
@@ -1094,6 +1131,12 @@ class RollingLadderEngine:
         floating = self.mark_to_market(snap, tick, positions)
         reason_code, detail = self._exit_reason(snap, floating, positions)
         if reason_code is None:
+            # No exit. In SINGLE_PAIR the same positions read that just decided
+            # that also tells us whether a level triggered, so the replacement
+            # costs no extra market data - only the order_send itself. This is
+            # deliberately AFTER the exit decision: the exit always wins.
+            if snap.get("entry_mode") == "SINGLE_PAIR":
+                self._roll_single_pair(snap, tick, positions)
             return None
 
         detected_at = time.time()
@@ -1107,6 +1150,151 @@ class RollingLadderEngine:
             self._advance_close(snap, positions, None, tick=tick,
                                 spec=self.spec)
         return reason_code
+
+    def _roll_single_pair(self, snap, tick, positions):
+        """
+        Replace a level that has just triggered, immediately.
+
+        Runs on the exit-monitor thread, straight after the exit decision has
+        said "no exit". Nothing here waits for a candle, the ladder pass,
+        Telegram, CSV or the deal history - a triggered level is detected from
+        the positions the exit check already read, and the one replacement
+        order goes out.
+
+        Every guard the ordinary placement path applies is applied here too,
+        in the order the exit owns the account:
+          1. an exit in flight -> place nothing
+          2. no active cycle    -> place nothing
+          3. expansion withheld -> place nothing (deep-ladder risk, imbalance)
+        """
+        if self.exit_in_progress or self._closing_cycle is not None or \
+                not self.cycle_active or self.paused:
+            return 0
+        legs = self.cycle_positions(self.cycle.cycle_id, positions)
+
+        # Which levels have become positions since we last looked? The full
+        # trigger accounting - counters, events, hooks - stays on the ordinary
+        # pass; this only needs to know WHERE the ladder now is.
+        detected_at = None
+        for pos in legs:
+            parsed = parse_comment(pos.comment)
+            if not parsed:
+                continue
+            key = (parsed[1], parsed[2])
+            if key in self._levels_done:
+                continue
+            self._levels_done.add(key)
+            self._levels_open.add(key)
+            # Record the trigger in the sequence NOW, not on the next ordinary
+            # pass. Ladder depth drives the deep-ladder expansion permission
+            # checked below, and a stale depth would let SINGLE_PAIR roll past
+            # a cap the full ladder would have respected. _record_trigger
+            # de-duplicates on _triggered_keys, so the ordinary pass still
+            # counts this level exactly once.
+            self._record_trigger(key[0], key[1], pos.price_open,
+                                 pos.time_open or self.clock())
+            detected_at = detected_at or time.time()
+        # A level deferred because price gapped past it has no new trigger to
+        # wake it, so the retry is remembered explicitly. Without this the side
+        # would stall on the fast path until the next ordinary ladder pass.
+        if detected_at is None and not self._replacement_deferred:
+            return 0
+        detected_at = detected_at or time.time()
+
+        # The deep-ladder / imbalance permission is the SAME one the ordinary
+        # path reads. SINGLE_PAIR does not get its own risk rules. Re-grade
+        # first so the decision sees the level that just triggered.
+        if self.sequence is not None:
+            self.sequence.update_exposure(legs)
+            self.sequence.grade_exposure(self.profit_rules(snap))
+        if self.sequence is not None and not self.sequence.expansion_allowed:
+            if not self._replacement_deferred:
+                self._event("REPLACEMENT_WITHHELD",
+                            f"level triggered but expansion is paused: "
+                            f"{self.sequence.expansion_block_reason}",
+                            cycle_id=self.cycle.cycle_id, status="PAUSED")
+            # Remember it, so the level goes out if the risk engine allows
+            # expansion again - without waiting for another trigger.
+            self._replacement_deferred = True
+            return 0
+
+        placed = 0
+        deferred = False
+        calc_at = time.time()
+        # One read of the order book, used both to compute the desired levels
+        # and to skip anything already live. Without this second check the
+        # untriggered side would be re-placed on every pass, because its next
+        # index never changes - which is exactly "more than one pending per
+        # side", the thing SINGLE_PAIR exists to avoid.
+        live_orders = self.broker.orders()
+        live_keys = set()
+        for order in self.cycle_orders(self.cycle.cycle_id, live_orders):
+            parsed = parse_comment(order.comment)
+            if parsed:
+                live_keys.add((parsed[1], parsed[2]))
+        for level in self.desired_levels(tick, snap, live_orders):
+            key_side = BUY if level.side == BUY_STOP else SELL
+            if not level.placeable:
+                # Price has gapped PAST this level, so it cannot be placed as a
+                # stop order right now. The level is not moved to a legal price
+                # and the side is not advanced to catch up: every level is
+                # measured from the cycle reference, and chasing price would
+                # break that. The side simply waits, and says so.
+                if (key_side, level.index) not in self._levels_done and \
+                        not self._replacement_deferred:
+                    self._event("REPLACEMENT_DEFERRED",
+                                f"{level.side} level {level.index:+d} @ "
+                                f"{level.price} is behind the market "
+                                f"(bid {tick.bid} ask {tick.ask}) - waiting "
+                                f"rather than chasing price",
+                                cycle_id=self.cycle.cycle_id,
+                                direction=level.side, level=level.index,
+                                entry_price=level.price, status="DEFERRED")
+                deferred = True
+                continue
+            key = (key_side, level.index)
+            if key in self._levels_done or key in self._levels_open or \
+                    key in live_keys:
+                continue
+            # re-check the latch immediately before the request: the exit
+            # monitor and the ladder pass are separate threads
+            if self.exit_in_progress:
+                break
+            sent_at = time.time()
+            lot = self.spec.normalize_volume(
+                min(float(snap["lot_size"]), float(snap["max_lot_size"])))
+            ok, ticket, msg = self.broker.place_stop_order(
+                side=level.side, price=level.price, volume=lot,
+                tp=level.tp, sl=level.sl, comment=level.comment)
+            confirmed_at = time.time()
+            if not ok:
+                self._event("ERROR",
+                            f"replacement {level.side} @ {level.price} "
+                            f"rejected: {msg}", cycle_id=self.cycle.cycle_id,
+                            direction=level.side, level=level.index,
+                            status="ERROR")
+                continue
+            placed += 1
+            self.replacement_timing = {
+                "trigger_detected_at": round(detected_at, 6),
+                "replacement_calculation_at": round(calc_at, 6),
+                "replacement_request_sent_at": round(sent_at, 6),
+                "replacement_confirmed_at": round(confirmed_at, 6),
+                "trigger_to_replacement_request_ms": round(
+                    (sent_at - detected_at) * 1000.0, 3),
+                "trigger_to_replacement_confirmed_ms": round(
+                    (confirmed_at - detected_at) * 1000.0, 3),
+            }
+            self.replacements += 1
+            self._event("LEVEL_REPLACED",
+                        f"{level.side} @ {level.price} (level "
+                        f"{level.index:+d}) replaced the triggered level in "
+                        f"{self.replacement_timing['trigger_to_replacement_request_ms']:.1f}ms",
+                        cycle_id=self.cycle.cycle_id, direction=level.side,
+                        level=level.index, entry_price=level.price,
+                        lot_size=lot, order_ticket=ticket)
+        self._replacement_deferred = deferred
+        return placed
 
     def commit_exit(self, reason_code, detail, tick, positions, orders,
                     floating, detected_at=None):
@@ -1866,6 +2054,11 @@ class RollingLadderEngine:
                                 if l.side == BUY_STOP)
             sell_prices = sorted((l.price for l in desired_by_key.values()
                                   if l.side == SELL_STOP), reverse=True)
+            if not self.initial_pending_buys and not self.initial_pending_sells:
+                self.initial_pending_buys = len(
+                    [k for k in seen if k[0] == BUY_STOP])
+                self.initial_pending_sells = len(
+                    [k for k in seen if k[0] == SELL_STOP])
             self.ladder_timing = {
                 "ladder_first_order_ms": round(
                     (first_order_at - place_started) * 1000.0, 2),
@@ -2018,6 +2211,15 @@ class RollingLadderEngine:
                                    else round(seq.recovery_start_pnl, 2)),
             "recovery_duration": seq.recovery_duration,
             "ladder_depth_at_recovery_start": seq.ladder_depth_at_recovery_start,
+            "entry_mode": snap.get("entry_mode", "FULL_LADDER"),
+            "initial_pending_buy_count": self.initial_pending_buys,
+            "initial_pending_sell_count": self.initial_pending_sells,
+            "current_pending_buy_count": len([o for o in ords
+                                              if o.side == BUY_STOP]),
+            "current_pending_sell_count": len([o for o in ords
+                                               if o.side == SELL_STOP]),
+            "replacements": self.replacements,
+            **{k: v for k, v in self.replacement_timing.items()},
             "basket_state": seq.state,
             "exit_decision": decision,
             "exit_reason": decision_reason or "",
@@ -2111,6 +2313,10 @@ class RollingLadderEngine:
                                   if self.sequence else True),
             "expansion_block_reason": (self.sequence.expansion_block_reason
                                        if self.sequence else ""),
+            "entry_mode": snap.get("entry_mode", "FULL_LADDER"),
+            "replacements": self.replacements,
+            "last_replacement_ms": self.replacement_timing.get(
+                "trigger_to_replacement_request_ms", ""),
             "buy_volume": (self.sequence.buy_volume if self.sequence else 0.0),
             "sell_volume": (self.sequence.sell_volume if self.sequence else 0.0),
             "imbalance_state": (self.sequence.imbalance_state if self.sequence
