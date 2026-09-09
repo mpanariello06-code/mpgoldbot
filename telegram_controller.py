@@ -27,6 +27,7 @@ from telegram.ext import (
 )
 
 import config as cfg
+from runtime_settings import ENTRY_MODE_LABELS
 from telegram_settings import SettingsPanel
 
 UNAUTHORIZED = "Unauthorized."
@@ -49,6 +50,12 @@ def _hms(seconds):
     """A ladder's age, as hh:mm:ss."""
     seconds = max(0, int(seconds or 0))
     return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def _entry_mode_label(mode):
+    """FULL_LADDER -> 'FULL LADDER'. One label, used everywhere."""
+    return ENTRY_MODE_LABELS.get(mode or "FULL_LADDER",
+                                 str(mode or "FULL_LADDER").replace("_", " "))
 
 
 def _money(value):
@@ -196,10 +203,44 @@ class TelegramController:
             except Exception as exc:
                 self._log_error(f"notify failed: {exc}")
 
-    async def _send(self, chat_id, text):
+    async def _send(self, chat_id, text, markup=None):
         await self._app.bot.send_message(
-            chat_id=chat_id, text=text, parse_mode=ParseMode.HTML
+            chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+            reply_markup=markup,
         )
+
+    def send_menu(self, banner=""):
+        """
+        Push the control panel to the authorized chat, unprompted.
+
+        This is what makes the menu appear when the bot launches instead of
+        waiting for someone to type /start. It goes out on the Telegram
+        thread's own event loop, fire-and-forget, exactly like notify(): the
+        caller never waits for the Telegram API, and a failure here is logged
+        and dropped rather than propagated into startup.
+        """
+        loop, app = self._loop, self._app
+        if not (loop and app and loop.is_running()):
+            self._log_error("startup menu not sent: Telegram is not connected")
+            return False
+        targets = [self.primary_chat] if self.primary_chat else self.authorized
+        if not targets:
+            self._log_error(
+                "startup menu not sent: no AUTHORIZED_CHAT_IDS configured")
+            return False
+
+        async def _push():
+            text = await self._panel_text(banner=banner)
+            for chat_id in targets:
+                await self._send(chat_id, text, self.keyboard())
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(_push(), loop)
+            future.add_done_callback(self._swallow)
+            return True
+        except Exception as exc:
+            self._log_error(f"startup menu failed: {exc}")
+            return False
 
     def _swallow(self, future):
         try:
@@ -253,6 +294,10 @@ class TelegramController:
             [
                 InlineKeyboardButton("📊 STATUS", callback_data="status"),
                 InlineKeyboardButton("💰 ACCOUNT", callback_data="account"),
+            ],
+            [
+                InlineKeyboardButton("⚙️ ENTRY MODE",
+                                     callback_data="settings_entrymode"),
             ],
             [
                 InlineKeyboardButton("📈 POSITIONS", callback_data="positions"),
@@ -507,14 +552,24 @@ class TelegramController:
         lines.append(f"\n<i>Updated {_now()}</i>")
         return "\n".join(lines)
 
-    async def _panel_text(self):
+    async def _panel_text(self, banner=""):
         s = await asyncio.to_thread(self.engine.status)
         price = f"{s['bid']:.2f}" if s.get("bid") else "n/a"
+        mode = _entry_mode_label(s.get("entry_mode"))
+        cycle = ("WAITING FOR ENTRY" if not s.get("cycle_active")
+                 else f"#{s.get('cycle_id', 0)}")
         return "\n".join([
+            *( [banner, ""] if banner else [] ),
             f"🤖 <b>{s['symbol']} ROLLING LADDER</b>", "",
             f"State: {s['icon']} {s['state']}   [{s.get('mode', '?')}]",
             f"Symbol: {s['symbol']} {s.get('timeframe', '')}   Price: {price}",
             f"MT5: {'Connected' if s['mt5_connected'] else 'Disconnected'}",
+            "",
+            f"Entry mode: <b>{mode}</b>",
+            f"Spacing: {s.get('spacing')}   Lot: {s.get('lot')}",
+            f"Cycle: {cycle}",
+            f"M1 entry: {s.get('entry_timeframe', 'M1')} candle close",
+            f"Basket exit: target {_money(s.get('basket_profit_target', 0))}",
             "",
             f"Cycle #{s.get('cycle_id', 0)}  ·  "
             f"{s.get('buy_triggers', 0)}B/{s.get('sell_triggers', 0)}S  ·  "
@@ -522,7 +577,6 @@ class TelegramController:
             f" / {_money(s.get('basket_profit_target', 0))}",
             f"Positions: {s.get('positions', 0)}   "
             f"Pending: {s.get('orders', 0)}",
-            f"Spacing {s.get('spacing')} · Lot {s.get('lot')}",
             "",
             "Use the buttons below to control the bot.",
             f"\n<i>Updated {_now()}</i>",

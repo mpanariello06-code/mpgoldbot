@@ -241,15 +241,64 @@ class SettingsPanel:
         return text, _rows([_btn("✅ CONFIRM", f"apply:{key}:{value}")],
                            [_btn("❌ CANCEL", f"settings_cancel:{menu}")])
 
+    def _entry_mode_banner(self, mode):
+        """What actually happens now that the mode has been saved."""
+        s = self.settings.snapshot()
+        depth = s["ladder_depth"]
+        running = self._active_entry_mode()
+        pending = ("1" if mode == "SINGLE_PAIR" else str(depth))
+        lines = [
+            "✅ <b>ENTRY MODE UPDATED</b>", "",
+            f"Mode: <b>{ENTRY_MODE_LABELS.get(mode, mode)}</b>",
+            f"Initial pending:  BUY {pending}   SELL {pending}",
+            f"Spacing: {s['ladder_spacing']}",
+        ]
+        if mode == "SINGLE_PAIR":
+            lines.append("Fast rolling replacement enabled.")
+        if running:
+            lines += ["",
+                      f"The running cycle stays {ENTRY_MODE_LABELS.get(running, running)} "
+                      f"- its ladder is untouched.",
+                      "Applies to the NEXT cycle."]
+        else:
+            lines += ["", "Applies to the next cycle."]
+        return "\n".join(lines)
+
     def _apply(self, payload):
         key, _, value = payload.partition(":")
         if key == "reset":
             changed = self.settings.reset()
             return self.menu("main", banner=f"♻️ Settings reset to the original "
                                             f"configuration ({len(changed)} changed).")
+        previous = self.settings.get(key)
         changed, message, _old, _new = self.settings.set(key, value)
+        if key == "entry_mode":
+            if changed:
+                self._log_entry_mode_change(previous, self.settings.get(key))
+            return (self._entry_mode_banner(self.settings.get(key)),
+                    _rows([_btn(BACK, "settings_entrymode")],
+                          [_btn("🔙 MAIN MENU", "panel")]))
         banner = ("✅ " if changed else "ℹ️ ") + message
         return self.menu(self.KEY_MENU.get(key, "main"), banner=banner)
+
+    def _log_entry_mode_change(self, old_mode, new_mode):
+        """
+        Record who changed the mode and what it applies to.
+
+        Written through the ordinary event log, which is asynchronous, so this
+        cannot delay trading.
+        """
+        cycle_id = getattr(getattr(self.engine, "cycle", None), "cycle_id", "")
+        running = self._active_entry_mode()
+        applies = "NEXT_CYCLE" if running else "IMMEDIATELY"
+        try:
+            self.csv.log_event(
+                "ENTRY_MODE_CHANGE",
+                f"old_mode={old_mode} new_mode={new_mode} "
+                f"cycle_id={cycle_id} applies_to={applies}",
+                symbol=getattr(self.engine, "symbol", ""))
+        except Exception as exc:                  # logging never breaks the UI
+            print(f"[settings] entry mode log failed: {exc}")
 
     # ================================================================= menus
     def menu(self, name, banner=""):
@@ -492,12 +541,27 @@ class SettingsPanel:
         return text, _rows(row, [_btn("✏️ CUSTOM", "custom:first_level_offset")],
                            [_btn(BACK, "settings_ladder")])
 
+    def _active_entry_mode(self):
+        """The mode the RUNNING cycle was built with, if one is running."""
+        try:
+            if getattr(self.engine, "cycle_active", False):
+                return getattr(self.engine, "entry_mode_in_force")()
+        except Exception:
+            pass
+        return None
+
     def _menu_entrymode(self):
         s = self.settings.snapshot()
         mode = s["entry_mode"]
+        running = self._active_entry_mode()
         text = "\n".join([
             "🎚 <b>ENTRY MODE</b>", "",
-            f"Current: {ENTRY_MODE_LABELS.get(mode, mode)}", "",
+            *([f"Current cycle: {ENTRY_MODE_LABELS.get(running, running)}",
+               f"Next cycle: {ENTRY_MODE_LABELS.get(mode, mode)}", "",
+               "A change is saved for the NEXT cycle. The ladder that is "
+               "running now is left exactly as it is.", ""]
+              if running and running != mode else
+              [f"Current: {ENTRY_MODE_LABELS.get(mode, mode)}", ""]),
             "FULL LADDER places every level at once - "
             f"{s['ladder_depth']} per side, {s['ladder_depth'] * 2} orders.",
             "",

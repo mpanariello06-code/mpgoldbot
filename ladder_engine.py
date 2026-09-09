@@ -153,11 +153,18 @@ class Cycle:
     realized: float = 0.0
     base_buy_index: int = None      # static roll mode pins the ladder here
     base_sell_index: int = None
+    # The entry mode this cycle was BUILT with. Pinned here, not read live,
+    # so changing ENTRY_MODE while a ladder is running cannot reshape it:
+    # switching FULL_LADDER -> SINGLE_PAIR mid-cycle would otherwise leave the
+    # reconciler wanting one level per side and cancelling the other 20.
+    # A settings change takes effect on the NEXT cycle.
+    entry_mode: str = "FULL_LADDER"
 
     def to_dict(self):
         return {k: getattr(self, k) for k in
                 ("cycle_id", "anchor", "started_at", "trades",
-                 "realized", "base_buy_index", "base_sell_index")}
+                 "realized", "base_buy_index", "base_sell_index",
+                 "entry_mode")}
 
 
 class RollingLadderEngine:
@@ -482,7 +489,8 @@ class RollingLadderEngine:
         # started_at must come from the engine's clock, not the wall clock, or
         # cycle age (and therefore the timeout) is meaningless under replay.
         self.cycle = Cycle(cycle_id=cid, anchor=anchor,
-                           started_at=self.clock())
+                           started_at=self.clock(),
+                           entry_mode=str(self.settings.get("entry_mode")))
         self.sequence = CycleBasket(cid, anchor,
                                     float(self.settings.get("ladder_spacing")),
                                     started_at=self.clock())
@@ -615,7 +623,7 @@ class RollingLadderEngine:
                 nxt += direction
             return indexes
 
-        if snap.get("entry_mode") == "SINGLE_PAIR":
+        if self.entry_mode_in_force(snap) == "SINGLE_PAIR":
             # ONE pending per side. The next level on a side is the one after
             # the furthest level that side has already consumed, so the
             # sequence is +1, +2, +3 ... measured from the SAME immutable
@@ -669,6 +677,19 @@ class RollingLadderEngine:
     # order and position the ladder creates carries `RL<cycle><B|S><index>` in
     # its comment, and the broker adapters already filter by magic and symbol,
     # so a basket is identified by (symbol, magic, cycle_id).
+    def entry_mode_in_force(self, snap=None):
+        """
+        The entry mode THIS cycle is running under.
+
+        While a cycle is active that is the mode it was built with, pinned at
+        creation. Between cycles it is the live setting, which is what the next
+        cycle will use.
+        """
+        if self.cycle_active and getattr(self.cycle, "entry_mode", None):
+            return self.cycle.entry_mode
+        snap = snap if snap is not None else self.settings.snapshot()
+        return snap.get("entry_mode", "FULL_LADDER")
+
     def _next_single_index(self, side):
         """
         The next SINGLE_PAIR level index for one side.
@@ -1135,7 +1156,7 @@ class RollingLadderEngine:
             # that also tells us whether a level triggered, so the replacement
             # costs no extra market data - only the order_send itself. This is
             # deliberately AFTER the exit decision: the exit always wins.
-            if snap.get("entry_mode") == "SINGLE_PAIR":
+            if self.entry_mode_in_force(snap) == "SINGLE_PAIR":
                 self._roll_single_pair(snap, tick, positions)
             return None
 

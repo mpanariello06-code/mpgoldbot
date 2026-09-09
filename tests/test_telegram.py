@@ -208,11 +208,26 @@ async def run():
     data = buttons(markup)
     t.check("all controls present",
             data == ["start", "pause", "resume", "stop", "status", "account",
+                     "settings_entrymode",
                      "positions", "stats", "ladder", "settings", "refresh"],
+            str(data))
+    t.check("every existing control still works",
+            all(c in data for c in
+                ("start", "pause", "resume", "stop", "status", "account",
+                 "positions", "stats", "ladder", "settings", "refresh")),
             str(data))
     t.check("panel shows the cycle", "Cycle #183" in text)
     t.check("panel shows the sequence", "2B/5S" in text)
     t.check("panel shows the mode", "[PAPER]" in text)
+    t.check("panel shows the ENTRY MODE", "Entry mode:" in text,
+            text.replace("\n", " | ")[:220])
+    t.check("and names it in words, not the raw enum",
+            "SINGLE PAIR" in text, text.replace("\n", " | ")[:220])
+    t.check("panel shows the spacing and the M1 entry gate",
+            "Spacing:" in text and "M1 entry:" in text,
+            text.replace("\n", " | ")[:220])
+    t.check("panel shows the basket exit target",
+            "Basket exit:" in text, text.replace("\n", " | ")[:220])
 
     t.section("LIFECYCLE BUTTONS")
     for action, expect in [("start", "Trading Started"), ("pause", "Trading Paused"),

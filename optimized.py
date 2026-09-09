@@ -1188,7 +1188,7 @@ class Application:
                 self.telegram = TelegramController(self.bot, CSV, SETTINGS)
                 self.telegram.start()
                 self.bot.set_notifier(self.telegram.notify)
-                log("✓ Telegram controller started - send /start to your bot")
+                log("✓ Telegram controller started")
             except Exception as exc:
                 self.telegram = None
                 log(f"⚠ Telegram controller failed to start: {exc}")
@@ -1196,6 +1196,14 @@ class Application:
                 log_event("ERROR", f"Telegram start failed: {exc}", status="ERROR")
         else:
             log("⚠ TELEGRAM_BOT_TOKEN is not set in .env - remote control disabled.")
+
+        # THE STARTUP MENU. Until now the panel only ever existed as a reply to
+        # /start, so launching the bot sent nothing with buttons on it - the
+        # one proactive message (bot_started) goes through notify(), which has
+        # no reply_markup and so can never carry a keyboard. Pushed here,
+        # after Telegram is up and the engine can answer a status call, and
+        # fire-and-forget so a Telegram outage cannot delay or stop trading.
+        self._send_startup_menu()
 
         if cfg.AUTO_START_TRADING:
             ok, msg = self.bot.start()
@@ -1213,6 +1221,24 @@ class Application:
                 self._shutdown.wait(1.0)
         except KeyboardInterrupt:
             pass
+
+    def _send_startup_menu(self):
+        """Push the control panel to Telegram. Never raises, never blocks."""
+        if not self.telegram:
+            return False
+        try:
+            sent = self.telegram.send_menu(banner="🟢 <b>BOT ONLINE</b>")
+            if sent:
+                log("✓ Telegram startup menu sent")
+            else:
+                log("⚠ Telegram startup menu not sent - see the error above. "
+                    "Trading is unaffected; send /start to open the menu.")
+            return sent
+        except Exception as exc:
+            # A Telegram problem must never take the trading engine with it.
+            log(f"⚠ Telegram startup menu failed: {exc}")
+            log_event("ERROR", f"Startup menu failed: {exc}", status="ERROR")
+            return False
 
     def shutdown(self):
         log("Shutting down...")
