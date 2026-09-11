@@ -60,6 +60,9 @@ class SettingsPanel:
         "ladder_spacing": "spacing", "ladder_depth": "depth",
         "first_level_offset": "offset", "roll_mode": "roll",
         "entry_mode": "entrymode",
+        "step_distance": "entrymode", "spread_buffer": "entrymode",
+        "cancel_opposite_on_fill": "entrymode",
+        "check_on_new_bar_only": "entrymode",
         "rearm_levels": "roll", "m5_candle_reset": "roll",
         "cycle_close_positions": "cycle",
         "max_open_positions": "open", "max_pending_orders": "pending",
@@ -246,7 +249,8 @@ class SettingsPanel:
         s = self.settings.snapshot()
         depth = s["ladder_depth"]
         running = self._active_entry_mode()
-        pending = ("1" if mode == "SINGLE_PAIR" else str(depth))
+        pending = ("1" if mode in ("SINGLE_PAIR", "STEPPED_STRADDLE")
+                   else str(depth))
         lines = [
             "✅ <b>ENTRY MODE UPDATED</b>", "",
             f"Mode: <b>{ENTRY_MODE_LABELS.get(mode, mode)}</b>",
@@ -255,6 +259,13 @@ class SettingsPanel:
         ]
         if mode == "SINGLE_PAIR":
             lines.append("Fast rolling replacement enabled.")
+        elif mode == "STEPPED_STRADDLE":
+            lines[-2] = (f"Initial pending:  BUY 1   SELL 1  "
+                         f"(+/- {s['step_distance']:g})")
+            lines[-1] = f"Step distance: {s['step_distance']:g}"
+            lines += [f"Spread buffer: {s['spread_buffer']:g}",
+                      "One position, managed by a stepped stop loss.",
+                      "No basket target, recovery or profit protection."]
         if running:
             lines += ["",
                       f"The running cycle stays {ENTRY_MODE_LABELS.get(running, running)} "
@@ -573,10 +584,25 @@ class SettingsPanel:
             "exit engine, the same risk controls and the same lot size. The",
             "only difference is how many levels are pending at once.",
         ])
-        row = [_btn(f"{self._mark(mode == m)}{ENTRY_MODE_LABELS[m]}",
-                    f"confirm:entry_mode:{m}")
-               for m in ("FULL_LADDER", "SINGLE_PAIR")]
-        return text, _rows(row, [_btn(BACK, "settings_ladder")])
+        text += "\n".join([
+            "",
+            "",
+            "STEPPED STRADDLE places one buy stop and one sell stop "
+            f"{s['step_distance']:g} either side of the reference. When one",
+            "fills the other is cancelled and the single position is managed",
+            "by a stepped stop loss - no basket, no recovery, no target.",
+            "",
+            f"  Step distance: {s['step_distance']:g}",
+            f"  Spread buffer: {s['spread_buffer']:g}",
+            f"  Lot size: {s['lot_size']}",
+            f"  Check on new M1: {'ON' if s['check_on_new_bar_only'] else 'OFF'}",
+        ])
+        icons = {"FULL_LADDER": "🔵", "SINGLE_PAIR": "🟢",
+                 "STEPPED_STRADDLE": "🟠"}
+        rows = [[_btn(f"{self._mark(mode == m)}{icons[m]} "
+                      f"{ENTRY_MODE_LABELS[m]}", f"confirm:entry_mode:{m}")]
+                for m in ("FULL_LADDER", "SINGLE_PAIR", "STEPPED_STRADDLE")]
+        return text, _rows(*rows, [_btn(BACK, "settings_ladder")])
 
     def _menu_roll(self):
         s = self.settings.snapshot()

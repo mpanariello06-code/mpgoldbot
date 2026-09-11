@@ -24,6 +24,7 @@ SUITES = [
     "test_deep_ladder.py",
     "test_entry_mode.py",
     "test_startup_menu.py",
+    "test_stepped_straddle.py",
     "test_continuous.py",
     "test_notifications.py",
     "test_replay.py",

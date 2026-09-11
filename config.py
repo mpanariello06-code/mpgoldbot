@@ -157,7 +157,28 @@ ROLL_MODE = _get_str("ROLL_MODE", "static").lower()
 # Both use the same reference price, the same 0.30 geometry, the same exit
 # engine, the same risk controls and the same lot sizing. The only difference
 # is how many levels are pending at once.
+#   STEPPED_STRADDLE - ONE buy stop and ONE sell stop, STEP_DISTANCE either
+#                 side of the reference. When one fills the other is cancelled
+#                 and the single position is managed by a stepped stop loss.
+#                 No basket, no recovery, no profit target, no expansion.
 ENTRY_MODE = _get_str("ENTRY_MODE", "FULL_LADDER").upper()
+
+# --- STEPPED_STRADDLE ------------------------------------------------------
+# PRICE distances, not pips and not points. INITIAL TEST DEFAULTS.
+# Reference 3400.00 with STEP_DISTANCE 1.20 gives BUY STOP 3401.20 and
+# SELL STOP 3398.80.
+STEP_DISTANCE = _get_float("STEP_DISTANCE", 1.20)
+# How far beyond entry the stop sits once breakeven is reached, so a stop-out
+# at breakeven is not a small loss to the spread.
+SPREAD_BUFFER = _get_float("SPREAD_BUFFER", 0.30)
+# Cancel the opposite stop the instant one side fills.
+CANCEL_OPPOSITE_ON_FILL = _get_bool("CANCEL_OPPOSITE_ON_FILL", True)
+# true  = breakeven/trailing decisions are taken on closed M1 candles only,
+#         which keeps SL modification requests down.
+# false = they are taken on the live price, through the existing fast monitor.
+# Either way the INITIAL stop and the opposite-order cancellation are
+# immediate - neither is ever gated on a candle.
+CHECK_ON_NEW_BAR_ONLY = _get_bool("CHECK_ON_NEW_BAR_ONLY", True)
 # Re-arm a level whose position closed. Off: a consumed level stays consumed
 # for the life of the ladder.
 REARM_LEVELS = _get_bool("REARM_LEVELS", False)
@@ -392,6 +413,10 @@ def runtime_defaults():
         "first_level_offset": FIRST_LEVEL_OFFSET,
         "roll_mode": ROLL_MODE,
         "entry_mode": ENTRY_MODE,
+        "step_distance": STEP_DISTANCE,
+        "spread_buffer": SPREAD_BUFFER,
+        "cancel_opposite_on_fill": CANCEL_OPPOSITE_ON_FILL,
+        "check_on_new_bar_only": CHECK_ON_NEW_BAR_ONLY,
         "rearm_levels": REARM_LEVELS,
         # take profit
         "basket_profit_target": BASKET_PROFIT_TARGET,
@@ -528,9 +553,18 @@ def validate():
             f"{LADDER_DEPTH}+{LADDER_DEPTH} ladder per cycle")
     if POLL_SECONDS <= 0:
         errors.append("POLL_SECONDS must be greater than 0")
-    if ENTRY_MODE not in ("FULL_LADDER", "SINGLE_PAIR"):
-        errors.append(f"ENTRY_MODE must be FULL_LADDER or SINGLE_PAIR, "
-                      f"got {ENTRY_MODE!r}")
+    if ENTRY_MODE not in ("FULL_LADDER", "SINGLE_PAIR", "STEPPED_STRADDLE"):
+        errors.append(f"ENTRY_MODE must be FULL_LADDER, SINGLE_PAIR or "
+                      f"STEPPED_STRADDLE, got {ENTRY_MODE!r}")
+    if STEP_DISTANCE <= 0:
+        errors.append("STEP_DISTANCE must be greater than 0")
+    if SPREAD_BUFFER < 0:
+        errors.append("SPREAD_BUFFER cannot be negative")
+    if SPREAD_BUFFER >= STEP_DISTANCE:
+        warnings.append(
+            f"SPREAD_BUFFER ({SPREAD_BUFFER}) is not smaller than "
+            f"STEP_DISTANCE ({STEP_DISTANCE}) - the breakeven stop would sit "
+            f"at or beyond the first trailing step")
     if IMBALANCE_ACTION not in ("MONITOR", "STOP_NEW_EXPOSURE"):
         errors.append(
             f"IMBALANCE_ACTION must be MONITOR or STOP_NEW_EXPOSURE, "

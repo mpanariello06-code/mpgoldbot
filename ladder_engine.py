@@ -28,6 +28,9 @@ from pathlib import Path
 from broker import BUY, BUY_STOP, SELL, SELL_STOP
 from basket import (EXITING_STATE, RISK_DRAWDOWN, RISK_REASONS, RISK_TIMEOUT,
                     CycleBasket, ProfitRules)
+from straddle import (BREAKEVEN, POSITION_CLOSED, POSITION_OPEN,
+                      STEP_TRAILING, STOP_LOSS_HIT, StraddleCycle,
+                      StraddleRules, initial_sl, next_sl, sl_is_improvement)
 
 COMMENT_RE = re.compile(r"^RL(\d+)([BS])(-?\d+)")
 
@@ -242,6 +245,7 @@ class RollingLadderEngine:
         self.initial_pending_buys = 0
         self.initial_pending_sells = 0
         self._replacement_deferred = False
+        self.straddle = None
 
     # =================================================================== utils
     def _today(self):
@@ -506,6 +510,19 @@ class RollingLadderEngine:
         self.initial_pending_buys = 0
         self.initial_pending_sells = 0
         self._replacement_deferred = False
+        # STEPPED_STRADDLE owns its own small state; None in the other modes.
+        self.straddle = (StraddleCycle(cycle_id=cid, reference=anchor)
+                         if str(self.settings.get("entry_mode")) ==
+                         "STEPPED_STRADDLE" else None)
+        if self.straddle is not None:
+            rules = self.straddle_rules(self.settings.snapshot())
+            buy, sell = rules.levels(anchor)
+            self.straddle.intended_buy = buy
+            self.straddle.intended_sell = sell
+            self.straddle.m1_bar_time = self.last_entry_bar or 0
+            self.straddle.last_check_bar = None
+            self.straddle.opposite_cancelled = 0
+            self.straddle.stamp("reference_captured_at")
         self.cycle_active = True
         self.reentry_until = 0.0
         self._cycle_announced = False
@@ -623,7 +640,28 @@ class RollingLadderEngine:
                 nxt += direction
             return indexes
 
-        if self.entry_mode_in_force(snap) == "SINGLE_PAIR":
+        mode = self.entry_mode_in_force(snap)
+        if mode == "STEPPED_STRADDLE":
+            # ONE buy stop and ONE sell stop, STEP_DISTANCE either side of the
+            # captured reference. Nothing is replaced: when one fills the other
+            # is cancelled and the cycle is a single managed position.
+            rules = self.straddle_rules(snap)
+            buy_price, sell_price = rules.levels(anchor)
+            out = []
+            if allow_buy and (BUY, 1) not in self._levels_done:
+                out.append(DesiredLevel(
+                    side=BUY_STOP, index=1,
+                    price=spec.normalize_price(buy_price), tp=0.0, sl=0.0,
+                    comment=level_comment(self.cycle.cycle_id, BUY, 1),
+                    placeable=spec.normalize_price(buy_price) >= tick.ask + min_stop))
+            if allow_sell and (SELL, -1) not in self._levels_done:
+                out.append(DesiredLevel(
+                    side=SELL_STOP, index=-1,
+                    price=spec.normalize_price(sell_price), tp=0.0, sl=0.0,
+                    comment=level_comment(self.cycle.cycle_id, SELL, -1),
+                    placeable=spec.normalize_price(sell_price) <= tick.bid - min_stop))
+            return out
+        if mode == "SINGLE_PAIR":
             # ONE pending per side. The next level on a side is the one after
             # the furthest level that side has already consumed, so the
             # sequence is +1, +2, +3 ... measured from the SAME immutable
@@ -1156,8 +1194,11 @@ class RollingLadderEngine:
             # that also tells us whether a level triggered, so the replacement
             # costs no extra market data - only the order_send itself. This is
             # deliberately AFTER the exit decision: the exit always wins.
-            if self.entry_mode_in_force(snap) == "SINGLE_PAIR":
+            mode = self.entry_mode_in_force(snap)
+            if mode == "SINGLE_PAIR":
                 self._roll_single_pair(snap, tick, positions)
+            elif mode == "STEPPED_STRADDLE":
+                self._manage_straddle(snap, tick, positions)
             return None
 
         detected_at = time.time()
@@ -1317,6 +1358,240 @@ class RollingLadderEngine:
         self._replacement_deferred = deferred
         return placed
 
+    def _straddle_summary(self):
+        """The straddle's own record for the cycle row. {} in other modes."""
+        sd = self.straddle
+        if sd is None:
+            return {}
+        t = sd.timing
+        out = {
+            "straddle_direction": sd.direction,
+            "straddle_entry_price": sd.entry_price,
+            "straddle_initial_sl": sd.initial_sl,
+            "straddle_final_sl": sd.current_sl,
+            "straddle_breakeven_set": sd.breakeven_set,
+            "straddle_favorable_steps": sd.favorable_steps,
+            "straddle_sl_modifications": sd.sl_modifications,
+            "step_distance": self.settings.get("step_distance"),
+            "spread_buffer": self.settings.get("spread_buffer"),
+            "fill_to_cancel_ms": self._ms(t.get("fill_detected_at"),
+                                          t.get("opposite_cancel_confirmed_at")),
+            "fill_to_initial_sl_ms": self._ms(t.get("fill_detected_at"),
+                                              t.get("initial_sl_confirmed_at")),
+            "sl_modify_latency_ms": self._ms(t.get("sl_modify_request_at"),
+                                             t.get("sl_modify_confirmed_at")),
+        }
+        for key in ("reference_captured_at", "fill_detected_at",
+                    "opposite_cancel_request_at",
+                    "opposite_cancel_confirmed_at", "initial_sl_request_at",
+                    "initial_sl_confirmed_at", "breakeven_triggered_at",
+                    "sl_modify_request_at", "sl_modify_confirmed_at",
+                    "position_closed_at"):
+            value = t.get(key)
+            out[key] = round(value, 6) if value else ""
+        return out
+
+    def straddle_status(self):
+        """Everything the STEPPED_STRADDLE status screen needs. Empty in the
+        other modes, so nothing else has to know this strategy exists."""
+        sd = self.straddle
+        if sd is None:
+            return {}
+        return {
+            "straddle_state": sd.state,
+            "straddle_direction": sd.direction,
+            "straddle_entry": sd.entry_price,
+            "straddle_initial_sl": sd.initial_sl,
+            "straddle_current_sl": sd.current_sl,
+            "straddle_breakeven": sd.breakeven_set,
+            "straddle_steps": sd.favorable_steps,
+            "straddle_reference": sd.reference,
+            "straddle_sl_modifications": sd.sl_modifications,
+        }
+
+    def straddle_rules(self, snap):
+        """The STEPPED_STRADDLE settings, read live. One source of truth."""
+        return StraddleRules(
+            step_distance=float(snap["step_distance"]),
+            spread_buffer=float(snap["spread_buffer"]),
+            lot_size=float(snap["lot_size"]),
+            cancel_opposite_on_fill=bool(snap["cancel_opposite_on_fill"]),
+            check_on_new_bar_only=bool(snap["check_on_new_bar_only"]),
+        )
+
+    def _manage_straddle(self, snap, tick, positions):
+        """
+        THE STEPPED_STRADDLE MANAGER. Runs on the fast monitor thread.
+
+        Order matters, and it is the order of urgency:
+          1. a fill -> cancel the opposite stop and set the initial SL. Both
+             are immediate and are NEVER gated on a candle; an unprotected
+             position is the one thing this strategy must not have.
+          2. breakeven / step trailing -> gated on a closed M1 candle when
+             CHECK_ON_NEW_BAR_ONLY is on, live otherwise.
+
+        No basket logic is reachable from here: no target, no recovery, no
+        profit protection. The stop is the exit.
+        """
+        if self.exit_in_progress or self._closing_cycle is not None or \
+                not self.cycle_active or self.paused:
+            return
+        sd = self.straddle
+        if sd is None:
+            return
+        rules = self.straddle_rules(snap)
+        legs = self.cycle_positions(self.cycle.cycle_id, positions)
+
+        # --- 0. the position is gone: the stop took it (or something did) ---
+        # The cycle ends here, through the SAME exit path every other mode
+        # uses - cancel what is left, verify flat against MT5, record the
+        # realized result, then the cooldown and the wait for a new M1 candle.
+        if sd.position_ticket and not legs:
+            sd.stamp("position_closed_at")
+            sd.state = POSITION_CLOSED
+            sd.exit_reason = STOP_LOSS_HIT
+            floating = self.get_cycle_floating_pnl(self.cycle.cycle_id, legs)
+            self.commit_exit(
+                STOP_LOSS_HIT,
+                f"{sd.direction} closed at its stop "
+                f"(entry {sd.entry_price}, SL {sd.current_sl}, "
+                f"{sd.favorable_steps} favourable steps)",
+                tick, legs, (), floating)
+            return
+
+        # --- 1. a fill: cancel the opposite side, protect the position ------
+        if not sd.position_ticket and legs:
+            pos = legs[0]
+            sd.stamp("fill_detected_at")
+            sd.direction = pos.side
+            sd.entry_price = pos.price_open
+            sd.position_ticket = pos.ticket
+            sd.opened_at = pos.time_open or time.time()
+            sd.state = POSITION_OPEN
+            # BOTH sides are consumed by the fill: the filled one became this
+            # position, and the other is about to be cancelled. Marking them
+            # both stops the reconciler helpfully re-placing the opposite leg,
+            # which would put a second straddle order back on the book.
+            self._levels_done.add((BUY, 1))
+            self._levels_done.add((SELL, -1))
+            self._event("STRADDLE_FILLED",
+                        f"{pos.side} {pos.volume} @ {pos.price_open} - "
+                        f"cancelling the opposite stop and setting the "
+                        f"initial SL", cycle_id=self.cycle.cycle_id,
+                        direction=pos.side, entry_price=pos.price_open,
+                        position_ticket=pos.ticket, status="OK")
+
+            if rules.cancel_opposite_on_fill:
+                sd.stamp("opposite_cancel_request_at")
+                cancelled = 0
+                for order in self.cycle_orders(self.cycle.cycle_id,
+                                               self.broker.orders()):
+                    if self._cancel(order, "straddle filled: opposite side"):
+                        cancelled += 1
+                sd.stamp("opposite_cancel_confirmed_at")
+                sd.opposite_cancelled = cancelled
+
+            target = initial_sl(pos.side, pos.price_open, rules)
+            self._apply_straddle_sl(sd, pos, target, rules, snap,
+                                    "initial_sl_request_at",
+                                    "initial_sl_confirmed_at",
+                                    "STRADDLE_SL_SET",
+                                    f"initial SL {target} "
+                                    f"({rules.step_distance:g} behind entry)")
+            sd.initial_sl = sd.current_sl or target
+            return
+
+        if not legs:
+            return                      # nothing open: nothing to manage
+
+        # --- 2. breakeven and step trailing --------------------------------
+        if rules.check_on_new_bar_only:
+            bar = self._closed_bar()
+            if bar is not None and bar == sd.last_check_bar:
+                return                  # this candle has already been judged
+            if bar is not None:
+                sd.last_check_bar = bar
+
+        pos = legs[0]
+        price = tick.bid if sd.direction == BUY else tick.ask
+        target, steps, is_breakeven = next_sl(
+            sd.direction, sd.entry_price, price, rules,
+            current_sl=sd.current_sl or pos.sl,
+            breakeven_set=sd.breakeven_set)
+        sd.favorable_steps = max(sd.favorable_steps, steps)
+        if target is None:
+            return                      # the stop already protects more
+
+        if is_breakeven and not sd.breakeven_set:
+            sd.stamp("breakeven_triggered_at")
+        ok = self._apply_straddle_sl(
+            sd, pos, target, rules, snap,
+            "sl_modify_request_at", "sl_modify_confirmed_at",
+            "STRADDLE_BREAKEVEN" if is_breakeven else "STRADDLE_TRAIL",
+            (f"breakeven: SL to {target} (entry {sd.entry_price} "
+             f"+/- {rules.spread_buffer:g})" if is_breakeven
+             else f"step {steps}: SL to {target}"))
+        if ok and is_breakeven:
+            sd.breakeven_set = True
+            sd.state = BREAKEVEN
+        elif ok:
+            sd.state = STEP_TRAILING
+
+    def _apply_straddle_sl(self, sd, pos, target, rules, snap,
+                           request_key, confirm_key, event, message):
+        """
+        Move the stop, once, with one retry. Never backwards.
+
+        The ratchet is checked again here even though next_sl() already
+        enforced it: this is the last gate before the request goes out, and a
+        stop that loosens is the one mistake this strategy cannot make.
+        """
+        current = sd.current_sl or pos.sl
+        if not sl_is_improvement(sd.direction, target, current):
+            return False
+        normalized = self.spec.normalize_price(target) if self.spec else target
+        # the broker will not accept a stop inside its own minimum distance
+        if self.spec and self.last_tick:
+            gap = self.spec.min_stop_distance
+            if sd.direction == BUY and normalized >= self.last_tick.bid - gap:
+                self._event("STRADDLE_SL_DEFERRED",
+                            f"SL {normalized} is inside the broker minimum "
+                            f"stop distance ({gap:g}) - keeping {current} "
+                            f"and retrying later",
+                            cycle_id=self.cycle.cycle_id, status="DEFERRED")
+                return False
+            if sd.direction == SELL and normalized <= self.last_tick.ask + gap:
+                self._event("STRADDLE_SL_DEFERRED",
+                            f"SL {normalized} is inside the broker minimum "
+                            f"stop distance ({gap:g}) - keeping {current} "
+                            f"and retrying later",
+                            cycle_id=self.cycle.cycle_id, status="DEFERRED")
+                return False
+
+        sd.stamp(request_key)
+        ok, msg = self.broker.modify_sl(pos.ticket, normalized,
+                                        position=pos, spec=self.spec)
+        if not ok:
+            # one retry, then leave it alone - an unbounded retry loop on the
+            # fast thread would be worse than a stop that moves a pass later
+            ok, msg = self.broker.modify_sl(pos.ticket, normalized,
+                                            position=pos, spec=self.spec)
+        if not ok:
+            self._event("ERROR",
+                        f"SL modify failed twice for {pos.ticket} -> "
+                        f"{normalized}: {msg}. Keeping {current}.",
+                        cycle_id=self.cycle.cycle_id,
+                        position_ticket=pos.ticket, status="ERROR")
+            return False
+        sd.stamp(confirm_key)
+        sd.current_sl = normalized
+        sd.sl_modifications += 1
+        self._event(event, message, cycle_id=self.cycle.cycle_id,
+                    direction=sd.direction, entry_price=sd.entry_price,
+                    sl_if_used=normalized, position_ticket=pos.ticket,
+                    status="OK")
+        return True
+
     def commit_exit(self, reason_code, detail, tick, positions, orders,
                     floating, detected_at=None):
         """
@@ -1398,6 +1673,17 @@ class RollingLadderEngine:
 
         Returns (reason_code, detail) or (None, "") to keep the cycle running.
         """
+        # STEPPED_STRADDLE manages its single position with its own stepped
+        # stop loss. None of the CYCLE-level exits below apply to it - not the
+        # basket target, not recovery, not profit protection, and not the
+        # cycle drawdown or duration guards, which are sized for a basket and
+        # would close the position ahead of the stop that is supposed to be
+        # its exit. ACCOUNT-level protection is untouched: the daily drawdown
+        # guard, the losing-streak breaker and the spread filter all live in
+        # risk_check() and still stop NEW cycles in this mode.
+        if self.entry_mode_in_force(snap) == "STEPPED_STRADDLE":
+            return None, ""
+
         # --- 1. hard risk ----------------------------------------------------
         max_dd = float(snap["max_cycle_drawdown"])
         if max_dd > 0 and floating <= -abs(max_dd):
@@ -1579,6 +1865,7 @@ class RollingLadderEngine:
         timing.setdefault("fully_flat_at", time.time())
         info["context"].update(self._exit_latency(info, timing))
         info["context"].update(self.ladder_timing)
+        info["context"].update(self._straddle_summary())
         duration = self.clock() - self.cycle.started_at
         closed_cycle = self.cycle
         self._closing_cycle = None
@@ -2241,6 +2528,29 @@ class RollingLadderEngine:
                                                if o.side == SELL_STOP]),
             "replacements": self.replacements,
             **{k: v for k, v in self.replacement_timing.items()},
+            "straddle_state": (self.straddle.state if self.straddle else ""),
+            "straddle_direction": (self.straddle.direction
+                                   if self.straddle else ""),
+            "reference_price_straddle": (self.straddle.reference
+                                         if self.straddle else ""),
+            "intended_buy_price": (self.straddle.intended_buy
+                                   if self.straddle else ""),
+            "intended_sell_price": (self.straddle.intended_sell
+                                    if self.straddle else ""),
+            "entry_price": (self.straddle.entry_price if self.straddle else ""),
+            "direction": (self.straddle.direction if self.straddle else ""),
+            "step_distance": snap.get("step_distance", ""),
+            "spread_buffer": snap.get("spread_buffer", ""),
+            "initial_sl": (self.straddle.initial_sl if self.straddle else ""),
+            "current_sl": (self.straddle.current_sl if self.straddle else ""),
+            "breakeven_set": (self.straddle.breakeven_set
+                              if self.straddle else ""),
+            "favorable_steps": (self.straddle.favorable_steps
+                                if self.straddle else ""),
+            "sl_modifications": (self.straddle.sl_modifications
+                                 if self.straddle else ""),
+            "position_ticket": (self.straddle.position_ticket
+                                if self.straddle else ""),
             "basket_state": seq.state,
             "exit_decision": decision,
             "exit_reason": decision_reason or "",
@@ -2336,6 +2646,7 @@ class RollingLadderEngine:
                                        if self.sequence else ""),
             "entry_mode": snap.get("entry_mode", "FULL_LADDER"),
             "replacements": self.replacements,
+            **self.straddle_status(),
             "last_replacement_ms": self.replacement_timing.get(
                 "trigger_to_replacement_request_ms", ""),
             "buy_volume": (self.sequence.buy_volume if self.sequence else 0.0),

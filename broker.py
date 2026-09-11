@@ -305,6 +305,42 @@ class Mt5Broker:
             tick = Tick(bid=0.0, ask=0.0)
         return False, None, self._rejection_report(request, result, spec, tick)
 
+    def modify_sl(self, ticket, sl, tp=0.0, position=None, spec=None):
+        """
+        Move a live position's stop loss. Returns (ok, message).
+
+        `position` and `spec` let a caller that already read them hand them in,
+        the same way close_position does - stop management is time sensitive
+        and a round trip to re-read what we already know is pure delay.
+        """
+        if position is None:
+            with MT5_LOCK:
+                found = mt5.positions_get(ticket=int(ticket))
+            if not found:
+                return False, "position not found"
+            symbol = found[0].symbol
+            keep_tp = found[0].tp if tp is None else tp
+        else:
+            symbol = position.symbol
+            keep_tp = position.tp if tp is None else tp
+        spec = spec or self.symbol_spec()
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": symbol,
+            "position": int(ticket),
+            "sl": spec.normalize_price(sl) if sl else 0.0,
+            "tp": spec.normalize_price(keep_tp) if keep_tp else 0.0,
+            "magic": self.magic,
+        }
+        with MT5_LOCK:
+            result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            return True, "OK"
+        retcode = getattr(result, "retcode", None)
+        return False, (f"modify SL {ticket} failed: retcode={retcode} "
+                       f"({self.RETCODES.get(retcode, 'UNKNOWN')}) "
+                       f"{getattr(result, 'comment', '')}")
+
     def cancel_order(self, ticket):
         with MT5_LOCK:
             result = mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE,
@@ -589,6 +625,19 @@ class PaperBroker:
             if int(ticket) not in self._orders:
                 return False, "order not found"
             del self._orders[int(ticket)]
+            self._save()
+        return True, "OK (paper)"
+
+    def modify_sl(self, ticket, sl, tp=0.0, position=None, spec=None):
+        """Same signature as the live broker, so stop management is identical."""
+        with self._lock:
+            pos = self._positions.get(int(ticket))
+            if pos is None:
+                return False, "position not found"
+            spec = spec or self.symbol_spec()
+            pos.sl = spec.normalize_price(sl) if sl else 0.0
+            if tp is not None:
+                pos.tp = spec.normalize_price(tp) if tp else pos.tp
             self._save()
         return True, "OK (paper)"
 

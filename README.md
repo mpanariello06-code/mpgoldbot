@@ -289,11 +289,13 @@ our own arithmetic instead of guessing.
 reference price, 0.30 geometry, exit engine, risk controls, lot size — is
 shared.
 
-| | `FULL_LADDER` (default) | `SINGLE_PAIR` |
-|---|---|---|
-| initial orders | `LADDER_DEPTH` per side (11 + 11 = 22) | **1 BUY + 1 SELL** |
-| on a trigger | nothing; the ladder was placed once | the next level on **that side** goes out immediately |
-| pending per side | up to `LADDER_DEPTH` | never more than 1 |
+| | `FULL_LADDER` (default) | `SINGLE_PAIR` | `STEPPED_STRADDLE` |
+|---|---|---|---|
+| initial orders | `LADDER_DEPTH` per side (11 + 11 = 22) | **1 BUY + 1 SELL** | **1 BUY + 1 SELL** |
+| spacing | `LADDER_SPACING` | `LADDER_SPACING` | `STEP_DISTANCE` |
+| on a trigger | nothing; the ladder was placed once | the next level on **that side** goes out immediately | the **opposite** order is cancelled |
+| pending per side | up to `LADDER_DEPTH` | never more than 1 | none, once filled |
+| exit | basket engine | basket engine | **its own stepped stop loss** |
 
 ```
 reference R = 4422.00
@@ -325,6 +327,54 @@ engine allows expansion again.
 
 Ladder depth is the furthest level actually **triggered**, identical to
 `FULL_LADDER`. Placing a replacement never touches the trigger counters.
+
+## STEPPED_STRADDLE
+
+A deliberately small strategy, and deliberately separate from the basket. The
+logic lives in `straddle.py` — pure arithmetic, no MT5, no threads — so it can
+be tested on its own; the engine owns execution.
+
+```
+new closed M1 candle -> capture ONE reference price
+    BUY STOP  = reference + STEP_DISTANCE
+    SELL STOP = reference - STEP_DISTANCE
+one fills -> cancel the other, set SL one step behind entry
++1 step in favour -> SL to entry ± SPREAD_BUFFER      (breakeven)
++1 more step      -> SL forward one more step          (and so on)
+SL hit -> flat -> 10s cooldown -> wait for the next closed M1 candle
+```
+
+With `STEP_DISTANCE = 1.20`, `SPREAD_BUFFER = 0.30`, a BUY filled at 3401.20:
+
+| price | favourable steps | stop |
+|---|---|---|
+| fill | — | 3400.00 |
+| 3402.40 | 1 | **3401.50** (breakeven + buffer) |
+| 3403.60 | 2 | 3402.70 |
+| 3404.80 | 3 | 3403.90 |
+| 3406.00 | 4 | 3405.10 |
+
+**Breakeven is step 1, not an extra step on top of it** — counting it twice is
+the classic off-by-one here and would put the stop a whole step further
+forward than price has earned.
+
+**The stop only ratchets.** `next_sl()` refuses any target that is not
+strictly more protective, and the engine checks again immediately before the
+request goes out. A SELL is measured on the **ask**, a BUY on the **bid**.
+
+**The basket engine cannot reach these positions.** In this mode `_exit_reason`
+returns immediately — no target, no recovery, no profit protection, no
+give-back, and *also* no cycle drawdown or duration guard, since those are
+sized for a basket and would close the position ahead of the stop that is
+supposed to be its exit. Account-level protection is untouched: the daily
+drawdown guard, the losing-streak breaker and the spread filter all live in
+`risk_check()` and still gate new cycles.
+
+`CHECK_ON_NEW_BAR_ONLY` gates **only** breakeven/trailing. The initial stop and
+the opposite-order cancellation are always immediate.
+
+> `STEP_DISTANCE` and `SPREAD_BUFFER` are **price** distances, not pips or
+> points, and both are initial test defaults fitted to nothing.
 
 ## Exposure limits
 

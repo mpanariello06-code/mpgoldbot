@@ -197,6 +197,17 @@ def order_send(request):
                                comment="removed" if ok else "not found",
                                order=request["order"], deal=0)
 
+    if action == TRADE_ACTION_SLTP and "position" in request:
+        pos = next((p for p in STATE["positions"]
+                    if p.ticket == request["position"]), None)
+        if pos is None:
+            return SimpleNamespace(retcode=10013, comment="no position",
+                                   order=0, deal=0)
+        pos.sl = request.get("sl", pos.sl)
+        pos.tp = request.get("tp", pos.tp)
+        return SimpleNamespace(retcode=TRADE_RETCODE_DONE, comment="sltp set",
+                               order=pos.ticket, deal=0)
+
     if action == TRADE_ACTION_DEAL and "position" in request:
         pos = next((p for p in STATE["positions"]
                     if p.ticket == request["position"]), None)
@@ -251,6 +262,14 @@ def close_deal(pos, price, comment="tp"):
         volume=pos.volume, price=price, profit=round(profit, 2), commission=0.0,
         swap=0.0, comment=comment, time=time.time()))
     return profit
+
+
+def hit_sl(ticket):
+    """Close a position at its stop loss, as the broker would."""
+    pos = next((p for p in STATE["positions"] if p.ticket == ticket), None)
+    if pos is None or not pos.sl:
+        return None
+    return close_deal(pos, pos.sl, "sl")
 
 
 def hit_tp(ticket):

@@ -353,6 +353,17 @@ class TelegramController:
             f"Entry mode: {(s.get('entry_mode') or 'FULL_LADDER').replace('_', ' ')}"
             + (f"   ({s.get('replacements', 0)} replacements)"
                if s.get("entry_mode") == "SINGLE_PAIR" else ""),
+            *(["", "<b>STEPPED STRADDLE</b>",
+               f"State: {(s.get('straddle_state') or '').replace('_', ' ')}"
+               + (f"   {s.get('straddle_direction')}"
+                  if s.get("straddle_direction") else ""),
+               f"Entry: {s.get('straddle_entry') or '-'}   "
+               f"Reference: {s.get('straddle_reference') or '-'}",
+               f"Initial SL: {s.get('straddle_initial_sl') or '-'}   "
+               f"Current SL: {s.get('straddle_current_sl') or '-'}",
+               f"Breakeven: {'YES' if s.get('straddle_breakeven') else 'no'}   "
+               f"Trailing steps: {s.get('straddle_steps', 0)}"]
+              if s.get("entry_mode") == "STEPPED_STRADDLE" else []),
             f"Status: {s.get('ladder_status', 'CLOSED')}"
             + (f"   (cooldown {s.get('cooldown_left', 0):.1f}s)"
                if s.get("ladder_status") == "COOLDOWN" else ""),
