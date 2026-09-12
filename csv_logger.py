@@ -124,7 +124,9 @@ CYCLE_HEADER = [
     # --- STEPPED_STRADDLE cycle summary + its latency timestamps ----------
     "straddle_direction", "straddle_entry_price", "straddle_initial_sl",
     "straddle_final_sl", "straddle_breakeven_set", "straddle_favorable_steps",
-    "straddle_sl_modifications", "step_distance", "spread_buffer",
+    "straddle_sl_modifications", "entry_offset", "initial_sl_distance",
+    "trail_distance", "straddle_high_water", "straddle_low_water",
+    "straddle_trail_active", "trail_activated_at",
     "reference_captured_at", "fill_detected_at",
     "opposite_cancel_request_at", "opposite_cancel_confirmed_at",
     "initial_sl_request_at", "initial_sl_confirmed_at",
@@ -180,7 +182,8 @@ TELEMETRY_HEADER = [
     "straddle_state", "straddle_direction", "reference_price_straddle",
     "intended_buy_price", "intended_sell_price",
     "actual_buy_price", "actual_sell_price",
-    "entry_price", "direction", "step_distance", "spread_buffer",
+    "entry_price", "direction", "entry_offset", "initial_sl_distance",
+    "trail_distance", "high_price", "low_price", "trail_activated",
     "initial_sl", "current_sl", "breakeven_set", "favorable_steps",
     "sl_modifications", "position_ticket",
     # --- how well a basket that was underwater is climbing back -----------

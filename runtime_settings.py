@@ -92,10 +92,14 @@ VALIDATORS = {
     "first_level_offset":  (lambda v: _num(v, float, "First level offset", 0.0, 1000.0), "First Level Offset", False),
     "roll_mode":           (lambda v: _choice(v, ROLL_MODES, "Roll mode"), "Roll Mode", True),
     "entry_mode":          (lambda v: _upper_choice(v, ENTRY_MODES, "Entry mode"), "Entry Mode", True),
-    "step_distance":       (lambda v: _num(v, float, "Step distance", 0.01, 1000.0), "Step Distance", True),
-    "spread_buffer":       (lambda v: _num(v, float, "Spread buffer", 0.0, 1000.0), "Spread Buffer", True),
+    "entry_offset":        (lambda v: _num(v, float, "Entry offset", 0.01, 1000.0), "Entry Offset", True),
+    "initial_sl_distance": (lambda v: _num(v, float, "Initial SL distance", 0.01, 1000.0), "Initial SL", True),
+    "breakeven_trigger":   (lambda v: _num(v, float, "Breakeven trigger", 0.0, 1000.0), "Breakeven At", True),
+    "breakeven_offset":    (lambda v: _num(v, float, "Breakeven offset", 0.0, 1000.0), "Breakeven Offset", True),
+    "trail_trigger":       (lambda v: _num(v, float, "Trail trigger", 0.0, 1000.0), "Trail At", True),
+    "trail_distance":      (lambda v: _num(v, float, "Trail distance", 0.01, 1000.0), "Trail Distance", True),
     "cancel_opposite_on_fill": (lambda v: _flag(v, "Cancel opposite on fill"), "Cancel Opposite", True),
-    "check_on_new_bar_only": (lambda v: _flag(v, "Check on new bar only"), "Check On New Bar", True),
+    "use_new_m1_candle_entry": (lambda v: _flag(v, "New M1 candle entry"), "M1 Entry", True),
     "rearm_levels":        (lambda v: _flag(v, "Re-arm levels"), "Re-arm Levels", False),
     # --- take profit ---
     "stop_loss_distance":  (lambda v: _num(v, float, "Stop loss distance", 0.0, 10000.0), "Stop Loss", True),
@@ -161,7 +165,9 @@ VALIDATORS = {
 }
 
 PRICE_KEYS = ("ladder_spacing", "first_level_offset",
-              "step_distance", "spread_buffer",
+              "entry_offset", "initial_sl_distance",
+              "breakeven_trigger", "breakeven_offset",
+              "trail_trigger", "trail_distance",
               "stop_loss_distance", "max_spread")
 MONEY_KEYS = ("deep_ladder_max_drawdown",
               "max_daily_drawdown", "max_cycle_drawdown",

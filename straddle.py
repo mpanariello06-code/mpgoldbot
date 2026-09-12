@@ -53,19 +53,37 @@ class StraddleRules:
     """
     Everything the strategy reads, in one object, built from live settings.
 
+    Five INDEPENDENT price distances. They are deliberately not derived from
+    one another - how far the breakout sits from the reference, how much room
+    the trade is given, when it becomes free, and how tightly it is trailed
+    are four separate decisions.
+
+    All are XAUUSD PRICE UNITS. 0.50 means fifty cents of gold, never a
+    broker-defined pip and never points.
+
     INITIAL TEST DEFAULTS. Nothing here is fitted to anything.
     """
-    step_distance: float = 1.20       # STEP_DISTANCE, in PRICE units
-    spread_buffer: float = 0.30       # SPREAD_BUFFER, in PRICE units
-    lot_size: float = 0.01            # LOT_SIZE (the existing sizing setting)
+    entry_offset: float = 1.00          # ENTRY_OFFSET: breakout from reference
+    initial_sl_distance: float = 0.50   # INITIAL_SL_DISTANCE: room behind entry
+    breakeven_trigger: float = 0.50     # BREAKEVEN_TRIGGER: move in favour
+    breakeven_offset: float = 0.00      # BREAKEVEN_OFFSET: past entry, 0 = flat
+    trail_trigger: float = 1.00         # TRAIL_TRIGGER: when the trail arms
+    trail_distance: float = 0.50        # TRAIL_DISTANCE: behind the high water
+    lot_size: float = 0.01
     cancel_opposite_on_fill: bool = True
-    check_on_new_bar_only: bool = True
+    use_new_m1_candle_entry: bool = True
 
     def levels(self, reference):
-        """The two intended stop prices, symmetric about one reference."""
-        step = abs(float(self.step_distance))
+        """The two breakout prices, symmetric about one reference."""
+        offset = abs(float(self.entry_offset))
         ref = float(reference)
-        return ref + step, ref - step
+        return ref + offset, ref - offset
+
+    def pending_sl(self, direction, entry):
+        """The protective stop that rides with the pending order."""
+        room = abs(float(self.initial_sl_distance))
+        entry = float(entry)
+        return entry - room if direction == BUY else entry + room
 
 
 @dataclass
@@ -88,7 +106,12 @@ class StraddleCycle:
     initial_sl: float = 0.0
     current_sl: float = 0.0
     breakeven_set: bool = False
-    favorable_steps: int = 0
+    trail_active: bool = False
+    # The best price this trade has SEEN, which is what the trail hangs off.
+    # Not the current price: a pullback must never drag the stop back.
+    high_water: float = 0.0
+    low_water: float = 0.0
+    favorable_steps: int = 0        # kept for the status screen
     sl_modifications: int = 0
 
     m1_bar_time: int = 0
@@ -105,15 +128,8 @@ class StraddleCycle:
 
 
 def initial_sl(direction, entry_price, rules):
-    """
-    The protective stop that goes on immediately after the fill.
-
-    One full step behind entry - which, by construction, is the reference the
-    straddle was built around.
-    """
-    step = abs(float(rules.step_distance))
-    entry = float(entry_price)
-    return entry - step if direction == BUY else entry + step
+    """The protective stop that goes on with (or immediately after) the fill."""
+    return rules.pending_sl(direction, entry_price)
 
 
 def favorable_distance(direction, entry_price, price):
@@ -123,50 +139,58 @@ def favorable_distance(direction, entry_price, price):
     return max(0.0, move)
 
 
-def next_sl(direction, entry_price, price, rules, current_sl=None,
-            breakeven_set=False):
+def update_water(direction, price, high_water, low_water):
     """
-    Where the stop SHOULD be, given how far price has run in our favour.
+    Track the best price this trade has seen.
 
-    Returns (sl, steps, is_breakeven) - or (None, steps, False) when the stop
-    should not move at all.
-
-        0 full steps   ->  leave the initial stop alone
-        1 full step    ->  breakeven: entry +/- SPREAD_BUFFER
-        n full steps   ->  that, plus (n-1) further steps
-
-    The breakeven move is step 1, NOT an extra step on top of it: counting it
-    twice is the classic off-by-one in this kind of trail, and it would put
-    the stop a whole step further forward than the price has actually earned.
-
-    The caller supplies `current_sl` so the ratchet is enforced here, in one
-    place: the returned stop is never worse than the one already in place.
+    The trail hangs off THIS, not off the current price - that is the whole
+    difference between a ratchet and a stop that follows price back down.
     """
-    step = abs(float(rules.step_distance))
-    if step <= 0:
-        return None, 0, False
-    buffer_ = abs(float(rules.spread_buffer))
-    entry = float(entry_price)
-
-    moved = favorable_distance(direction, entry, price)
-    steps = int(math.floor(moved / step + 1e-9))
-    if steps < 1:
-        return None, 0, False
-
-    # step 1 IS breakeven; every step after it adds one more step of distance
-    extra = (steps - 1) * step
+    price = float(price)
     if direction == BUY:
-        target = entry + buffer_ + extra
-    else:
-        target = entry - buffer_ - extra
+        return (max(price, high_water) if high_water else price), low_water
+    return high_water, (min(price, low_water) if low_water else price)
 
-    # --- the ratchet: a stop only ever moves the protective way ------------
-    if current_sl:
-        if direction == BUY and target <= float(current_sl) + 1e-9:
-            return None, steps, False
-        if direction == SELL and target >= float(current_sl) - 1e-9:
-            return None, steps, False
-    return target, steps, (steps == 1 and not breakeven_set)
+
+def next_sl(direction, entry_price, price, rules, current_sl=None,
+            breakeven_set=False, high_water=0.0, low_water=0.0):
+    """
+    Where the stop SHOULD be right now. Returns (sl, stage) or (None, stage).
+
+    Three stages, in order of how much the trade has earned:
+
+        moved < BREAKEVEN_TRIGGER   ->  leave the initial stop alone
+        moved >= BREAKEVEN_TRIGGER  ->  entry +/- BREAKEVEN_OFFSET
+        moved >= TRAIL_TRIGGER      ->  high_water -/+ TRAIL_DISTANCE
+
+    The trail is CONTINUOUS, not stepped: every new extreme the trade reaches
+    drags the stop with it, and nothing else does. A pullback moves the stop
+    nowhere, because the water mark it hangs off has not moved.
+
+    `current_sl` is passed in so the ratchet is enforced HERE, in one place:
+    the returned stop is never less protective than the one already set.
+    """
+    entry = float(entry_price)
+    moved = favorable_distance(direction, entry, price)
+    water = high_water if direction == BUY else low_water
+
+    stage = "INITIAL"
+    target = None
+    if moved >= abs(float(rules.trail_trigger)) and water:
+        # trailing: hang the stop off the best price SEEN, not the price now
+        gap = abs(float(rules.trail_distance))
+        target = (water - gap) if direction == BUY else (water + gap)
+        stage = "TRAILING"
+    elif moved >= abs(float(rules.breakeven_trigger)):
+        off = abs(float(rules.breakeven_offset))
+        target = (entry + off) if direction == BUY else (entry - off)
+        stage = "BREAKEVEN"
+
+    if target is None:
+        return None, stage
+    if current_sl and not sl_is_improvement(direction, target, current_sl):
+        return None, stage
+    return target, stage
 
 
 def sl_is_improvement(direction, new_sl, current_sl):

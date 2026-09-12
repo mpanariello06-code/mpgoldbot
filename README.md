@@ -330,51 +330,63 @@ Ladder depth is the furthest level actually **triggered**, identical to
 
 ## STEPPED_STRADDLE
 
-A deliberately small strategy, and deliberately separate from the basket. The
-logic lives in `straddle.py` — pure arithmetic, no MT5, no threads — so it can
-be tested on its own; the engine owns execution.
+A breakout straddle ridden by a ratcheting trailing stop. The logic lives in
+`straddle.py` — pure arithmetic, no MT5, no threads — so it can be tested on
+its own; the engine owns execution.
 
 ```
 new closed M1 candle -> capture ONE reference price
-    BUY STOP  = reference + STEP_DISTANCE
-    SELL STOP = reference - STEP_DISTANCE
-one fills -> cancel the other, set SL one step behind entry
-+1 step in favour -> SL to entry ± SPREAD_BUFFER      (breakeven)
-+1 more step      -> SL forward one more step          (and so on)
-SL hit -> flat -> 10s cooldown -> wait for the next closed M1 candle
+    BUY  STOP = reference + ENTRY_OFFSET,  SL = entry - INITIAL_SL_DISTANCE
+    SELL STOP = reference - ENTRY_OFFSET,  SL = entry + INITIAL_SL_DISTANCE
+one fills -> cancel the other
++BREAKEVEN_TRIGGER in favour -> SL to entry ± BREAKEVEN_OFFSET
++TRAIL_TRIGGER     in favour -> trail arms; SL = best price SEEN ∓ TRAIL_DISTANCE
+stop hit -> flat -> COOLDOWN_SECONDS -> next closed M1 candle -> new straddle
 ```
 
-With `STEP_DISTANCE = 1.20`, `SPREAD_BUFFER = 0.30`, a BUY filled at 3401.20:
+Reference 4500.00 with the shipped defaults, BUY side:
 
-| price | favourable steps | stop |
+| price | stop | |
 |---|---|---|
-| fill | — | 3400.00 |
-| 3402.40 | 1 | **3401.50** (breakeven + buffer) |
-| 3403.60 | 2 | 3402.70 |
-| 3404.80 | 3 | 3403.90 |
-| 3406.00 | 4 | 3405.10 |
+| fill 4501.00 | 4500.50 | initial |
+| 4501.50 | **4501.00** | breakeven |
+| 4502.00 | 4501.50 | trail arms |
+| 4503.00 | 4502.50 | |
+| 4504.00 | 4503.50 | |
+| 4502.80 | **4503.50** | pullback — the stop does not move |
 
-**Breakeven is step 1, not an extra step on top of it** — counting it twice is
-the classic off-by-one here and would put the stop a whole step further
-forward than price has earned.
+**The trail is continuous, not stepped.** It hangs off the best price the trade
+has *seen* (`high_water` / `low_water`), not the current price — that is the
+whole difference between a ratchet and a stop that follows price back down. A
+0.10 move up moves the stop 0.10.
 
-**The stop only ratchets.** `next_sl()` refuses any target that is not
-strictly more protective, and the engine checks again immediately before the
-request goes out. A SELL is measured on the **ask**, a BUY on the **bid**.
+**The stop only ratchets**, enforced in two independent places: `next_sl()`
+refuses any target that is not strictly more protective, and the engine checks
+again immediately before the modify request goes out.
 
-**The basket engine cannot reach these positions.** In this mode `_exit_reason`
-returns immediately — no target, no recovery, no profit protection, no
-give-back, and *also* no cycle drawdown or duration guard, since those are
-sized for a basket and would close the position ahead of the stop that is
-supposed to be its exit. Account-level protection is untouched: the daily
-drawdown guard, the losing-streak breaker and the spread filter all live in
-`risk_check()` and still gate new cycles.
+**Trailing is always live.** `USE_NEW_M1_CANDLE_ENTRY` gates *only* the start of
+a new cycle — a trail that waited for a candle close would not be riding the
+move, which is the point. The tests run the trailing path with the candle feed
+poisoned to raise on any read.
 
-`CHECK_ON_NEW_BAR_ONLY` gates **only** breakeven/trailing. The initial stop and
-the opposite-order cancellation are always immediate.
+**No take profit, no basket.** In this mode `_exit_reason` returns immediately —
+no target, recovery, profit protection, give-back, *or* cycle drawdown/duration
+guard, since those are sized for a basket and would close the position ahead of
+the stop that is meant to be its exit. Account-level protection is untouched
+(daily drawdown, losing-streak breaker, spread filter all live in `risk_check()`
+and still gate new cycles).
 
-> `STEP_DISTANCE` and `SPREAD_BUFFER` are **price** distances, not pips or
-> points, and both are initial test defaults fitted to nothing.
+The pending orders carry their own stop, so a position is protected from the
+instant it exists; if the broker refuses the stop at placement it goes on
+immediately after the fill instead.
+
+> `TRAIL_DISTANCE` must exceed the broker's minimum stop distance or the trail
+> can never be accepted. The bot logs `STRADDLE_TRAIL_UNREACHABLE` once if it
+> is not, and keeps the last valid stop rather than leaving the trade
+> unprotected.
+
+> All six distances are **price** units and are initial test defaults fitted to
+> nothing.
 
 ## Exposure limits
 

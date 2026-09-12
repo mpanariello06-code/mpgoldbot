@@ -164,21 +164,28 @@ ROLL_MODE = _get_str("ROLL_MODE", "static").lower()
 ENTRY_MODE = _get_str("ENTRY_MODE", "FULL_LADDER").upper()
 
 # --- STEPPED_STRADDLE ------------------------------------------------------
-# PRICE distances, not pips and not points. INITIAL TEST DEFAULTS.
-# Reference 3400.00 with STEP_DISTANCE 1.20 gives BUY STOP 3401.20 and
-# SELL STOP 3398.80.
-STEP_DISTANCE = _get_float("STEP_DISTANCE", 1.20)
-# How far beyond entry the stop sits once breakeven is reached, so a stop-out
-# at breakeven is not a small loss to the spread.
-SPREAD_BUFFER = _get_float("SPREAD_BUFFER", 0.30)
+# Five INDEPENDENT distances, all XAUUSD PRICE UNITS - 0.50 means fifty cents
+# of gold, never a broker pip and never points. They are deliberately not
+# derived from one another. INITIAL TEST DEFAULTS, fitted to nothing.
+#
+#   Reference 4500.00 gives BUY STOP 4501.00 (SL 4500.50)
+#                       and SELL STOP 4499.00 (SL 4499.50)
+ENTRY_OFFSET = _get_float("ENTRY_OFFSET", 1.00)
+# Room behind entry for the protective stop.
+INITIAL_SL_DISTANCE = _get_float("INITIAL_SL_DISTANCE", 0.50)
+# Favourable move that frees the trade; the stop then goes to entry +/- the
+# offset below (0.00 = exactly breakeven).
+BREAKEVEN_TRIGGER = _get_float("BREAKEVEN_TRIGGER", 0.50)
+BREAKEVEN_OFFSET = _get_float("BREAKEVEN_OFFSET", 0.00)
+# Favourable move that arms the trail, and how far behind the best price seen
+# the stop then rides. The trail is CONTINUOUS: every new extreme drags the
+# stop with it, and a pullback moves it nowhere.
+TRAIL_TRIGGER = _get_float("TRAIL_TRIGGER", 1.00)
+TRAIL_DISTANCE = _get_float("TRAIL_DISTANCE", 0.50)
 # Cancel the opposite stop the instant one side fills.
 CANCEL_OPPOSITE_ON_FILL = _get_bool("CANCEL_OPPOSITE_ON_FILL", True)
-# true  = breakeven/trailing decisions are taken on closed M1 candles only,
-#         which keeps SL modification requests down.
-# false = they are taken on the live price, through the existing fast monitor.
-# Either way the INITIAL stop and the opposite-order cancellation are
-# immediate - neither is ever gated on a candle.
-CHECK_ON_NEW_BAR_ONLY = _get_bool("CHECK_ON_NEW_BAR_ONLY", True)
+# M1 gating applies ONLY to starting a new cycle. Trailing is always live.
+USE_NEW_M1_CANDLE_ENTRY = _get_bool("USE_NEW_M1_CANDLE_ENTRY", True)
 # Re-arm a level whose position closed. Off: a consumed level stays consumed
 # for the life of the ladder.
 REARM_LEVELS = _get_bool("REARM_LEVELS", False)
@@ -413,10 +420,14 @@ def runtime_defaults():
         "first_level_offset": FIRST_LEVEL_OFFSET,
         "roll_mode": ROLL_MODE,
         "entry_mode": ENTRY_MODE,
-        "step_distance": STEP_DISTANCE,
-        "spread_buffer": SPREAD_BUFFER,
+        "entry_offset": ENTRY_OFFSET,
+        "initial_sl_distance": INITIAL_SL_DISTANCE,
+        "breakeven_trigger": BREAKEVEN_TRIGGER,
+        "breakeven_offset": BREAKEVEN_OFFSET,
+        "trail_trigger": TRAIL_TRIGGER,
+        "trail_distance": TRAIL_DISTANCE,
         "cancel_opposite_on_fill": CANCEL_OPPOSITE_ON_FILL,
-        "check_on_new_bar_only": CHECK_ON_NEW_BAR_ONLY,
+        "use_new_m1_candle_entry": USE_NEW_M1_CANDLE_ENTRY,
         "rearm_levels": REARM_LEVELS,
         # take profit
         "basket_profit_target": BASKET_PROFIT_TARGET,
@@ -556,15 +567,23 @@ def validate():
     if ENTRY_MODE not in ("FULL_LADDER", "SINGLE_PAIR", "STEPPED_STRADDLE"):
         errors.append(f"ENTRY_MODE must be FULL_LADDER, SINGLE_PAIR or "
                       f"STEPPED_STRADDLE, got {ENTRY_MODE!r}")
-    if STEP_DISTANCE <= 0:
-        errors.append("STEP_DISTANCE must be greater than 0")
-    if SPREAD_BUFFER < 0:
-        errors.append("SPREAD_BUFFER cannot be negative")
-    if SPREAD_BUFFER >= STEP_DISTANCE:
+    if ENTRY_OFFSET <= 0:
+        errors.append("ENTRY_OFFSET must be greater than 0")
+    if INITIAL_SL_DISTANCE <= 0:
+        errors.append("INITIAL_SL_DISTANCE must be greater than 0")
+    if TRAIL_DISTANCE <= 0:
+        errors.append("TRAIL_DISTANCE must be greater than 0")
+    if BREAKEVEN_OFFSET < 0:
+        errors.append("BREAKEVEN_OFFSET cannot be negative")
+    if TRAIL_TRIGGER < BREAKEVEN_TRIGGER:
         warnings.append(
-            f"SPREAD_BUFFER ({SPREAD_BUFFER}) is not smaller than "
-            f"STEP_DISTANCE ({STEP_DISTANCE}) - the breakeven stop would sit "
-            f"at or beyond the first trailing step")
+            f"TRAIL_TRIGGER ({TRAIL_TRIGGER}) is below BREAKEVEN_TRIGGER "
+            f"({BREAKEVEN_TRIGGER}) - the trail would arm before breakeven")
+    if TRAIL_DISTANCE > TRAIL_TRIGGER:
+        warnings.append(
+            f"TRAIL_DISTANCE ({TRAIL_DISTANCE}) is wider than TRAIL_TRIGGER "
+            f"({TRAIL_TRIGGER}) - the first trailing stop would sit behind "
+            f"the entry price")
     if IMBALANCE_ACTION not in ("MONITOR", "STOP_NEW_EXPOSURE"):
         errors.append(
             f"IMBALANCE_ACTION must be MONITOR or STOP_NEW_EXPOSURE, "

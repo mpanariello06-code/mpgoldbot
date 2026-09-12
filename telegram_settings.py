@@ -60,9 +60,11 @@ class SettingsPanel:
         "ladder_spacing": "spacing", "ladder_depth": "depth",
         "first_level_offset": "offset", "roll_mode": "roll",
         "entry_mode": "entrymode",
-        "step_distance": "entrymode", "spread_buffer": "entrymode",
+        "entry_offset": "entrymode", "initial_sl_distance": "entrymode",
+        "breakeven_trigger": "entrymode", "breakeven_offset": "entrymode",
+        "trail_trigger": "entrymode", "trail_distance": "entrymode",
         "cancel_opposite_on_fill": "entrymode",
-        "check_on_new_bar_only": "entrymode",
+        "use_new_m1_candle_entry": "entrymode",
         "rearm_levels": "roll", "m5_candle_reset": "roll",
         "cycle_close_positions": "cycle",
         "max_open_positions": "open", "max_pending_orders": "pending",
@@ -261,11 +263,15 @@ class SettingsPanel:
             lines.append("Fast rolling replacement enabled.")
         elif mode == "STEPPED_STRADDLE":
             lines[-2] = (f"Initial pending:  BUY 1   SELL 1  "
-                         f"(+/- {s['step_distance']:g})")
-            lines[-1] = f"Step distance: {s['step_distance']:g}"
-            lines += [f"Spread buffer: {s['spread_buffer']:g}",
-                      "One position, managed by a stepped stop loss.",
-                      "No basket target, recovery or profit protection."]
+                         f"(+/- {s['entry_offset']:g})")
+            lines[-1] = (f"Entry offset: {s['entry_offset']:g}   "
+                         f"Initial SL: {s['initial_sl_distance']:g}")
+            lines += [f"Breakeven at: {s['breakeven_trigger']:g} "
+                      f"(offset {s['breakeven_offset']:g})",
+                      f"Trail at: {s['trail_trigger']:g}   "
+                      f"distance {s['trail_distance']:g}",
+                      "One position, ridden by a trailing stop.",
+                      "No take profit, no basket, no recovery."]
         if running:
             lines += ["",
                       f"The running cycle stays {ENTRY_MODE_LABELS.get(running, running)} "
@@ -588,14 +594,18 @@ class SettingsPanel:
             "",
             "",
             "STEPPED STRADDLE places one buy stop and one sell stop "
-            f"{s['step_distance']:g} either side of the reference. When one",
-            "fills the other is cancelled and the single position is managed",
-            "by a stepped stop loss - no basket, no recovery, no target.",
+            f"{s['entry_offset']:g} either side of the reference. When one",
+            "fills the other is cancelled and the single position rides a",
+            "trailing stop - no take profit, no basket, no recovery.",
             "",
-            f"  Step distance: {s['step_distance']:g}",
-            f"  Spread buffer: {s['spread_buffer']:g}",
+            f"  Entry offset: {s['entry_offset']:g}",
+            f"  Initial SL: {s['initial_sl_distance']:g}",
+            f"  Breakeven at: {s['breakeven_trigger']:g} "
+            f"(offset {s['breakeven_offset']:g})",
+            f"  Trail at: {s['trail_trigger']:g}, "
+            f"distance {s['trail_distance']:g}",
             f"  Lot size: {s['lot_size']}",
-            f"  Check on new M1: {'ON' if s['check_on_new_bar_only'] else 'OFF'}",
+            f"  New M1 entry: {'ON' if s['use_new_m1_candle_entry'] else 'OFF'}",
         ])
         icons = {"FULL_LADDER": "🔵", "SINGLE_PAIR": "🟢",
                  "STEPPED_STRADDLE": "🟠"}

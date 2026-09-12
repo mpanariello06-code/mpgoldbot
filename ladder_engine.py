@@ -30,7 +30,8 @@ from basket import (EXITING_STATE, RISK_DRAWDOWN, RISK_REASONS, RISK_TIMEOUT,
                     CycleBasket, ProfitRules)
 from straddle import (BREAKEVEN, POSITION_CLOSED, POSITION_OPEN,
                       STEP_TRAILING, STOP_LOSS_HIT, StraddleCycle,
-                      StraddleRules, initial_sl, next_sl, sl_is_improvement)
+                      StraddleRules, initial_sl, next_sl, sl_is_improvement,
+                      update_water)
 
 COMMENT_RE = re.compile(r"^RL(\d+)([BS])(-?\d+)")
 
@@ -647,19 +648,25 @@ class RollingLadderEngine:
             # is cancelled and the cycle is a single managed position.
             rules = self.straddle_rules(snap)
             buy_price, sell_price = rules.levels(anchor)
+            buy_price = spec.normalize_price(buy_price)
+            sell_price = spec.normalize_price(sell_price)
+            # The stop rides WITH the pending order, so the position is
+            # protected from the instant it exists. If the broker refuses the
+            # stop at placement the order still goes out and _manage_straddle
+            # puts the stop on immediately after the fill - never unprotected.
             out = []
             if allow_buy and (BUY, 1) not in self._levels_done:
                 out.append(DesiredLevel(
-                    side=BUY_STOP, index=1,
-                    price=spec.normalize_price(buy_price), tp=0.0, sl=0.0,
+                    side=BUY_STOP, index=1, price=buy_price, tp=0.0,
+                    sl=spec.normalize_price(rules.pending_sl(BUY, buy_price)),
                     comment=level_comment(self.cycle.cycle_id, BUY, 1),
-                    placeable=spec.normalize_price(buy_price) >= tick.ask + min_stop))
+                    placeable=buy_price >= tick.ask + min_stop))
             if allow_sell and (SELL, -1) not in self._levels_done:
                 out.append(DesiredLevel(
-                    side=SELL_STOP, index=-1,
-                    price=spec.normalize_price(sell_price), tp=0.0, sl=0.0,
+                    side=SELL_STOP, index=-1, price=sell_price, tp=0.0,
+                    sl=spec.normalize_price(rules.pending_sl(SELL, sell_price)),
                     comment=level_comment(self.cycle.cycle_id, SELL, -1),
-                    placeable=spec.normalize_price(sell_price) <= tick.bid - min_stop))
+                    placeable=sell_price <= tick.bid - min_stop))
             return out
         if mode == "SINGLE_PAIR":
             # ONE pending per side. The next level on a side is the one after
@@ -1372,8 +1379,12 @@ class RollingLadderEngine:
             "straddle_breakeven_set": sd.breakeven_set,
             "straddle_favorable_steps": sd.favorable_steps,
             "straddle_sl_modifications": sd.sl_modifications,
-            "step_distance": self.settings.get("step_distance"),
-            "spread_buffer": self.settings.get("spread_buffer"),
+            "entry_offset": self.settings.get("entry_offset"),
+            "initial_sl_distance": self.settings.get("initial_sl_distance"),
+            "trail_distance": self.settings.get("trail_distance"),
+            "straddle_high_water": sd.high_water,
+            "straddle_low_water": sd.low_water,
+            "straddle_trail_active": sd.trail_active,
             "fill_to_cancel_ms": self._ms(t.get("fill_detected_at"),
                                           t.get("opposite_cancel_confirmed_at")),
             "fill_to_initial_sl_ms": self._ms(t.get("fill_detected_at"),
@@ -1386,7 +1397,7 @@ class RollingLadderEngine:
                     "opposite_cancel_confirmed_at", "initial_sl_request_at",
                     "initial_sl_confirmed_at", "breakeven_triggered_at",
                     "sl_modify_request_at", "sl_modify_confirmed_at",
-                    "position_closed_at"):
+                    "trail_activated_at", "position_closed_at"):
             value = t.get(key)
             out[key] = round(value, 6) if value else ""
         return out
@@ -1404,6 +1415,9 @@ class RollingLadderEngine:
             "straddle_initial_sl": sd.initial_sl,
             "straddle_current_sl": sd.current_sl,
             "straddle_breakeven": sd.breakeven_set,
+            "straddle_trail_active": sd.trail_active,
+            "straddle_high_water": sd.high_water,
+            "straddle_low_water": sd.low_water,
             "straddle_steps": sd.favorable_steps,
             "straddle_reference": sd.reference,
             "straddle_sl_modifications": sd.sl_modifications,
@@ -1412,11 +1426,15 @@ class RollingLadderEngine:
     def straddle_rules(self, snap):
         """The STEPPED_STRADDLE settings, read live. One source of truth."""
         return StraddleRules(
-            step_distance=float(snap["step_distance"]),
-            spread_buffer=float(snap["spread_buffer"]),
+            entry_offset=float(snap["entry_offset"]),
+            initial_sl_distance=float(snap["initial_sl_distance"]),
+            breakeven_trigger=float(snap["breakeven_trigger"]),
+            breakeven_offset=float(snap["breakeven_offset"]),
+            trail_trigger=float(snap["trail_trigger"]),
+            trail_distance=float(snap["trail_distance"]),
             lot_size=float(snap["lot_size"]),
             cancel_opposite_on_fill=bool(snap["cancel_opposite_on_fill"]),
-            check_on_new_bar_only=bool(snap["check_on_new_bar_only"]),
+            use_new_m1_candle_entry=bool(snap["use_new_m1_candle_entry"]),
         )
 
     def _manage_straddle(self, snap, tick, positions):
@@ -1492,50 +1510,71 @@ class RollingLadderEngine:
                 sd.opposite_cancelled = cancelled
 
             target = initial_sl(pos.side, pos.price_open, rules)
-            self._apply_straddle_sl(sd, pos, target, rules, snap,
-                                    "initial_sl_request_at",
-                                    "initial_sl_confirmed_at",
-                                    "STRADDLE_SL_SET",
-                                    f"initial SL {target} "
-                                    f"({rules.step_distance:g} behind entry)")
+            sd.high_water, sd.low_water = update_water(
+                pos.side, pos.price_open, 0.0, 0.0)
+            # The stop may already be on, carried by the pending order. Only
+            # set it when it is missing or not yet protective enough.
+            if sl_is_improvement(pos.side, target, pos.sl):
+                self._apply_straddle_sl(sd, pos, target, rules, snap,
+                                        "initial_sl_request_at",
+                                        "initial_sl_confirmed_at",
+                                        "STRADDLE_SL_SET",
+                                        f"initial SL {target} "
+                                        f"({rules.initial_sl_distance:g} "
+                                        f"behind entry)")
+            else:
+                sd.stamp("initial_sl_request_at")
+                sd.stamp("initial_sl_confirmed_at")
+                sd.current_sl = pos.sl
             sd.initial_sl = sd.current_sl or target
             return
 
         if not legs:
             return                      # nothing open: nothing to manage
 
-        # --- 2. breakeven and step trailing --------------------------------
-        if rules.check_on_new_bar_only:
-            bar = self._closed_bar()
-            if bar is not None and bar == sd.last_check_bar:
-                return                  # this candle has already been judged
-            if bar is not None:
-                sd.last_check_bar = bar
-
+        # --- 2. breakeven, then the continuous trail ------------------------
+        # ALWAYS live. The M1 gate applies only to starting a new cycle; a
+        # trail that waited for a candle close would not be riding the move,
+        # which is the entire point of this strategy.
         pos = legs[0]
         price = tick.bid if sd.direction == BUY else tick.ask
-        target, steps, is_breakeven = next_sl(
+        sd.high_water, sd.low_water = update_water(
+            sd.direction, price, sd.high_water, sd.low_water)
+
+        target, stage = next_sl(
             sd.direction, sd.entry_price, price, rules,
             current_sl=sd.current_sl or pos.sl,
-            breakeven_set=sd.breakeven_set)
-        sd.favorable_steps = max(sd.favorable_steps, steps)
+            breakeven_set=sd.breakeven_set,
+            high_water=sd.high_water, low_water=sd.low_water)
         if target is None:
             return                      # the stop already protects more
 
-        if is_breakeven and not sd.breakeven_set:
+        first_breakeven = stage == "BREAKEVEN" and not sd.breakeven_set
+        first_trail = stage == "TRAILING" and not sd.trail_active
+        if first_breakeven:
             sd.stamp("breakeven_triggered_at")
+        if first_trail:
+            sd.stamp("trail_activated_at")
+        water = sd.high_water if sd.direction == BUY else sd.low_water
         ok = self._apply_straddle_sl(
             sd, pos, target, rules, snap,
             "sl_modify_request_at", "sl_modify_confirmed_at",
-            "STRADDLE_BREAKEVEN" if is_breakeven else "STRADDLE_TRAIL",
-            (f"breakeven: SL to {target} (entry {sd.entry_price} "
-             f"+/- {rules.spread_buffer:g})" if is_breakeven
-             else f"step {steps}: SL to {target}"))
-        if ok and is_breakeven:
+            ("STRADDLE_BREAKEVEN" if first_breakeven else
+             "STRADDLE_TRAIL_ON" if first_trail else "STRADDLE_TRAIL"),
+            (f"breakeven: SL to {target} (entry {sd.entry_price})"
+             if stage == "BREAKEVEN"
+             else f"trailing: SL to {target} "
+                  f"({rules.trail_distance:g} behind {water})"))
+        if not ok:
+            return
+        if stage == "BREAKEVEN":
             sd.breakeven_set = True
             sd.state = BREAKEVEN
-        elif ok:
+        else:
+            sd.breakeven_set = True     # the trail supersedes it
+            sd.trail_active = True
             sd.state = STEP_TRAILING
+        sd.favorable_steps = sd.sl_modifications
 
     def _apply_straddle_sl(self, sd, pos, target, rules, snap,
                            request_key, confirm_key, event, message):
@@ -1553,6 +1592,18 @@ class RollingLadderEngine:
         # the broker will not accept a stop inside its own minimum distance
         if self.spec and self.last_tick:
             gap = self.spec.min_stop_distance
+            # A structural impossibility worth saying out loud once: if the
+            # trail rides closer than the broker will ever accept, it can
+            # never be placed and the trade keeps whatever stop it has.
+            if (rules.trail_distance <= gap and
+                    not getattr(self, "_trail_gap_warned", False)):
+                self._trail_gap_warned = True
+                self._event("STRADDLE_TRAIL_UNREACHABLE",
+                            f"TRAIL_DISTANCE ({rules.trail_distance:g}) is not "
+                            f"greater than the broker's minimum stop distance "
+                            f"({gap:g}) - the trailing stop can never be "
+                            f"accepted. Raise TRAIL_DISTANCE above {gap:g}.",
+                            cycle_id=self.cycle.cycle_id, status="WARNING")
             if sd.direction == BUY and normalized >= self.last_tick.bid - gap:
                 self._event("STRADDLE_SL_DEFERRED",
                             f"SL {normalized} is inside the broker minimum "
@@ -2539,8 +2590,13 @@ class RollingLadderEngine:
                                     if self.straddle else ""),
             "entry_price": (self.straddle.entry_price if self.straddle else ""),
             "direction": (self.straddle.direction if self.straddle else ""),
-            "step_distance": snap.get("step_distance", ""),
-            "spread_buffer": snap.get("spread_buffer", ""),
+            "entry_offset": snap.get("entry_offset", ""),
+            "initial_sl_distance": snap.get("initial_sl_distance", ""),
+            "trail_distance": snap.get("trail_distance", ""),
+            "high_price": (self.straddle.high_water if self.straddle else ""),
+            "low_price": (self.straddle.low_water if self.straddle else ""),
+            "trail_activated": (self.straddle.trail_active
+                                if self.straddle else ""),
             "initial_sl": (self.straddle.initial_sl if self.straddle else ""),
             "current_sl": (self.straddle.current_sl if self.straddle else ""),
             "breakeven_set": (self.straddle.breakeven_set
